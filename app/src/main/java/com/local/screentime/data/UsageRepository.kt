@@ -44,6 +44,8 @@ data class BatteryParsed(
     val globals: Map<String, Pair<Double, Long>>,
     val computedDrain: Double,
     val actualDrainLow: Double,
+    /** 「自上次充电」统计窗口的起点（dump 里的 Start clock time），窗口可跨天甚至跨多天 */
+    val windowStartTs: Long? = null,
 )
 
 /**
@@ -421,7 +423,14 @@ class UsageRepository(private val context: Context) {
         return events.isNotEmpty()
     }
 
-    /** root 读取 batterystats：每 UID 与整机组件耗电，快照差分累计（充满自动重置） */
+    /**
+     * root 读取 batterystats：每 UID 与整机组件耗电，快照差分累计（充满自动重置）。
+     *
+     * 归属规则（重要）：`--charged` 是「自上次充电以来」的窗口，起点通常不是当天 0 点，且会跨越
+     * 午夜甚至多天（本机实测 2026-09-17 18:05 才重置，上一个窗口跨了 09-16 整个晚上）。
+     * 累计计数器的两次观测之差 = 该时间段内真实发生的用量，所以按「上次快照 → 本次」区间与各
+     * 本地日的重叠比例归属；否则会把昨天的耗电整体记到今天（曾表现为「今天没拍照却 988mAh」）。
+     */
     private suspend fun syncBattery(now: Long): Boolean {
         val lines = try {
             Shell.cmd("dumpsys batterystats --charged").exec().out
@@ -431,7 +440,6 @@ class UsageRepository(private val context: Context) {
         val parsed = parseBatteryPower(lines)
         if (parsed.uids.isEmpty() && parsed.globals.isEmpty()) return false
         val zone = ZoneId.systemDefault()
-        val today = LocalDate.now(zone).toEpochDay()
         val pm = context.packageManager
 
         val rows = ArrayList<BatteryDailyEntity>()
@@ -459,36 +467,38 @@ class UsageRepository(private val context: Context) {
                 )
             )
             if (totalDelta <= 0.01) continue
-            val ex = dao.getBatteryDaily(u.uidKey, today)
             val uid = uidOf(u.uidKey)
             val pkg = if (uid >= 10000) try {
                 pm.getPackagesForUid(uid)?.firstOrNull { !it.isNullOrBlank() }
             } catch (e: Exception) {
                 null
             } else null  // 系统 UID（<10000）是共享的，随便挂某个包名会误导（如 UID 1000 显示成“安全中心”），交给 systemUidLabel
-            rows.add(
-                BatteryDailyEntity(
-                    uidKey = u.uidKey,
-                    day = today,
-                    packageName = pkg,
-                    totalMah = (ex?.totalMah ?: 0.0) + totalDelta,
-                    fgMah = (ex?.fgMah ?: 0.0) + compDelta("fg"),
-                    bgMah = (ex?.bgMah ?: 0.0) + compDelta("bg"),
-                    screenMah = (ex?.screenMah ?: 0.0) + compDelta("screen"),
-                    cpuMah = (ex?.cpuMah ?: 0.0) + compDelta("cpu"),
-                    audioMah = (ex?.audioMah ?: 0.0) + compDelta("audio"),
-                    videoMah = (ex?.videoMah ?: 0.0) + compDelta("video"),
-                    cameraMah = (ex?.cameraMah ?: 0.0) + compDelta("camera"),
-                    gnssMah = (ex?.gnssMah ?: 0.0) + compDelta("gnss"),
-                    wifiMah = (ex?.wifiMah ?: 0.0) + compDelta("wifi"),
-                    btMah = (ex?.btMah ?: 0.0) + compDelta("bluetooth"),
-                    wakelockMah = (ex?.wakelockMah ?: 0.0) + compDelta("wakelock"),
-                    sensorsMah = (ex?.sensorsMah ?: 0.0) + compDelta("sensors"),
-                    otherMah = (ex?.otherMah ?: 0.0) + u.comps.keys
-                        .filter { it !in KNOWN_COMPS }
-                        .sumOf { compDelta(it) },
+            for ((day, w) in dayWeights(deltaFrom(last?.updatedTs, reset, parsed.windowStartTs, now), now, zone)) {
+                val ex = dao.getBatteryDaily(u.uidKey, day)
+                rows.add(
+                    BatteryDailyEntity(
+                        uidKey = u.uidKey,
+                        day = day,
+                        packageName = pkg,
+                        totalMah = (ex?.totalMah ?: 0.0) + totalDelta * w,
+                        fgMah = (ex?.fgMah ?: 0.0) + compDelta("fg") * w,
+                        bgMah = (ex?.bgMah ?: 0.0) + compDelta("bg") * w,
+                        screenMah = (ex?.screenMah ?: 0.0) + compDelta("screen") * w,
+                        cpuMah = (ex?.cpuMah ?: 0.0) + compDelta("cpu") * w,
+                        audioMah = (ex?.audioMah ?: 0.0) + compDelta("audio") * w,
+                        videoMah = (ex?.videoMah ?: 0.0) + compDelta("video") * w,
+                        cameraMah = (ex?.cameraMah ?: 0.0) + compDelta("camera") * w,
+                        gnssMah = (ex?.gnssMah ?: 0.0) + compDelta("gnss") * w,
+                        wifiMah = (ex?.wifiMah ?: 0.0) + compDelta("wifi") * w,
+                        btMah = (ex?.btMah ?: 0.0) + compDelta("bluetooth") * w,
+                        wakelockMah = (ex?.wakelockMah ?: 0.0) + compDelta("wakelock") * w,
+                        sensorsMah = (ex?.sensorsMah ?: 0.0) + compDelta("sensors") * w,
+                        otherMah = (ex?.otherMah ?: 0.0) + u.comps.keys
+                            .filter { it !in KNOWN_COMPS }
+                            .sumOf { compDelta(it) } * w,
+                    )
                 )
-            )
+            }
         }
         if (rows.isNotEmpty()) dao.upsertBatteryDaily(rows)
 
@@ -501,25 +511,60 @@ class UsageRepository(private val context: Context) {
             )
             val prevComps = decodeComps(gLast?.compsText ?: "")
             val grow = ArrayList<BatteryGlobalEntity>()
+            val weights = dayWeights(deltaFrom(gLast?.updatedTs, reset, parsed.windowStartTs, now), now, zone)
             for ((comp, pair) in parsed.globals) {
                 val nowV = pair.first
                 val prevV = if (gLast == null || reset) 0.0 else (prevComps[comp] ?: 0.0)
                 val delta = (nowV - prevV).coerceAtLeast(0.0)
                 if (delta <= 0.01) continue
-                val ex = dao.getBatteryGlobal(comp, today)
-                grow.add(
-                    BatteryGlobalEntity(
-                        component = comp,
-                        day = today,
-                        mah = (ex?.mah ?: 0.0) + delta,
-                        durationMs = if (ex == null) pair.second else ex.durationMs,
+                for ((day, w) in weights) {
+                    val ex = dao.getBatteryGlobal(comp, day)
+                    grow.add(
+                        BatteryGlobalEntity(
+                            component = comp,
+                            day = day,
+                            mah = (ex?.mah ?: 0.0) + delta * w,
+                            durationMs = if (ex == null) pair.second else ex.durationMs,
+                        )
                     )
-                )
+                }
             }
             if (grow.isNotEmpty()) dao.upsertBatteryGlobal(grow)
         }
-        Log.d(TAG, "battery: uids=${parsed.uids.size} globals=${parsed.globals.size} drain=${parsed.computedDrain}")
+        Log.d(
+            TAG,
+            "battery: uids=${parsed.uids.size} globals=${parsed.globals.size} drain=${parsed.computedDrain} " +
+                "window=${parsed.windowStartTs?.let { Instant.ofEpochMilli(it).atZone(zone).toLocalDateTime() } ?: "?"}",
+        )
         return true
+    }
+
+    /** 增量对应的观测区间起点：常规用上次快照时间；重置/首次用统计窗口起点（更贴近真实发生时间） */
+    private fun deltaFrom(lastTs: Long?, reset: Boolean, windowStartTs: Long?, now: Long): Long {
+        val w = windowStartTs ?: 0L
+        val validW = if (w in 1 until now) w else null
+        return when {
+            lastTs == null -> validW ?: now
+            reset -> maxOf(lastTs, validW ?: lastTs)
+            else -> lastTs
+        }
+    }
+
+    /** 把区间 [from,to] 按本地日重叠比例拆成 (epochDay, 权重)；from 非法时全归到 to 所在日 */
+    private fun dayWeights(from: Long, to: Long, zone: ZoneId): List<Pair<Long, Double>> {
+        val start = if (from in 1 until to) from else to
+        val end = if (to > start) to else start + 1
+        val total = (end - start).coerceAtLeast(1L)
+        val out = ArrayList<Pair<Long, Double>>(2)
+        var cursor = start
+        while (cursor < end) {
+            val date = Instant.ofEpochMilli(cursor).atZone(zone).toLocalDate()
+            val nextMidnight = date.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
+            val seg = (minOf(nextMidnight, end) - cursor).coerceAtLeast(1L)
+            out.add(date.toEpochDay() to seg.toDouble() / total)
+            cursor += seg
+        }
+        return out
     }
 
     /** 拿起次数（KEYGUARD_HIDDEN 计数）与“解锁后 15 秒内首个应用”统计 */
@@ -720,8 +765,11 @@ class UsageRepository(private val context: Context) {
             var inPower = false
             var computedDrain = 0.0
             var actualLow = 0.0
+            var windowStartTs: Long? = null
             val uids = ArrayList<UidPower>()
             val globals = LinkedHashMap<String, Pair<Double, Long>>()
+            // 统计窗口起点：本机 dump 形如 "  Start clock time: 2026-09-17-18-05-06"（本地时间）
+            val windowRe = Regex("""Start clock time:\s*(\d{4})-(\d{2})-(\d{2})-(\d{2})-(\d{2})-(\d{2})""")
             val compRe = Regex("""^\s+([a-z_]+): ([0-9.]+)(?: apps: ([0-9.]+))?(?: duration: (.+))?\s*$""")
             val uidRe = Regex(
                 """^\s*UID (\S+): ([0-9.]+)(?: fg: ([0-9.]+))?(?: bg: ([0-9.]+))?(?: cached: ([0-9.]+))?\s*\((.*)\)\s*$"""
@@ -730,6 +778,19 @@ class UsageRepository(private val context: Context) {
             val detailRe = Regex("""(?:^|\s)([a-z_]+)=([0-9.]+)(?: \(([^)]*)\))?""")
             for (raw in lines) {
                 val line = raw.trimEnd()
+                if (windowStartTs == null) {
+                    val wm = windowRe.find(line)
+                    if (wm != null) {
+                        windowStartTs = try {
+                            LocalDateTime.of(
+                                wm.groupValues[1].toInt(), wm.groupValues[2].toInt(), wm.groupValues[3].toInt(),
+                                wm.groupValues[4].toInt(), wm.groupValues[5].toInt(), wm.groupValues[6].toInt(),
+                            ).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+                        } catch (e: Exception) {
+                            null
+                        }
+                    }
+                }
                 if (line.contains("Estimated power use (mAh)")) {
                     inPower = true
                     continue
@@ -771,7 +832,7 @@ class UsageRepository(private val context: Context) {
                     globals[cm.groupValues[1]] = Pair(mah, parseDurationMs(cm.groupValues[4]))
                 }
             }
-            return BatteryParsed(uids, globals, computedDrain, actualLow)
+            return BatteryParsed(uids, globals, computedDrain, actualLow, windowStartTs)
         }
 
         private val DUMP_EVENT_TYPES = mapOf(
