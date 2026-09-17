@@ -7,7 +7,7 @@
 一台一加 13（ColorOS 15）上用"冰箱"冻结应用后，**系统自带屏幕使用时间不再显示这些应用的时长**（展示层过滤）。本项目自建记录器：跨三层混合数据源重建完整的使用时长 + 耗电统计，**冻结应用照样显示**，并逐步加入 iOS 屏幕时间风格的可视化。
 
 - 目标设备：OnePlus 13（PJZ110），ColorOS 15 / Android 15（API 35），KernelSU root，屏幕 1440×3168
-- 包名：`com.local.screentime`，应用名“屏幕时间”，当前 v0.16.4（versionCode 20）
+- 包名：`com.local.screentime`，应用名“屏幕时间”，当前 v0.16.5（versionCode 21）
 - 工程：本仓库根目录；技术栈 Kotlin + Compose(M3) + Room + WorkManager + libsu，无 NDK
 - minSdk/targetSdk/compileSdk = 35；数据库 Room v3（destructive migration）
 
@@ -63,6 +63,18 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/debug/app-debug.apk
 - 每 6h WorkManager 后台对账；打开即先读本地库秒出、再后台同步（同步已去掉无用的 --checkin 解析，~1-2s）；Doze 白名单（root 自动添加）
 - 诊断导出（菜单）：当天会话+聚合+分类 JSON 复制到剪贴板
 - 应用名"屏幕时间"，自适应图标（蓝底白时钟+黄色弧）
+
+## 4.0.5 v0.16.5 变更（启动闪屏跟随 app 内主题 + 真机 UI 回归）
+
+- **彻底修复启动闪屏颜色（v0.16.4 只修了一半）**：v0.16.4 把 manifest 主题从固定暗色的 `Theme.DeviceDefault` 换成 `Theme.ScreenTime`（`values/` 亮、`values-night/` 暗）后，闪屏底色变成**跟随「系统」明暗**——但 Android 12+ 的启动闪屏是**系统在进程启动之前**就按资源限定符 `-night` 解析好的，`-night` 只认系统设置，与 app 内的「白天/黑夜」选择无关。于是：
+  - 系统亮 + app 设白天 → 闪屏亮（正确，v0.16.4 已修好的那一半）
+  - **系统暗 + app 设白天 → 闪屏仍是 `#1C1B1F` 黑底（错）**
+  - **系统亮 + app 设黑夜 → 闪屏仍是 `#FFFBFE` 白底（错）**
+  真机抓帧实测：冷启动首帧角落色 = `(28,27,31)` = `values-night/colors.xml` 的 `#1C1B1F`，与 app 内的白天设定不符。
+- **修法**：`App.onCreate()` 调 `UiModeManager.setApplicationNightMode(...)`（API 31+，本项目 minSdk 35），把 app 内选的主题告诉系统；在设置页切换主题时也调一次（`MainActivity` 的主题回调里），使**下次冷启动**的闪屏立即正确。映射：`light → MODE_NIGHT_NO`、`dark → MODE_NIGHT_YES`、`system → MODE_NIGHT_AUTO`（经真机验证 `MODE_NIGHT_AUTO` 在本 API 上的语义是「跟随系统」，符合预期）。官方文档明确推荐该 API 用于「让系统在启动画面期间匹配主题」。
+- **注意**：`MainActivity.applyTheme()` 里的 `window.setBackgroundDrawable(...)` 对启动闪屏**无效**（闪屏由系统绘制、且早于 `onCreate`），它只影响闪屏消失后到首帧 Compose 之间的窗口底色。真正决定闪屏颜色的是 `UiModeManager` 的应用级夜间模式 + `values`/`values-night` 的 `window_background`。
+- **真机 UI 回归结论（一加 13 / PJZ110，ColorOS，系统亮色）**：四种组合的闪屏颜色已全部实测通过（白天/黑夜 × 系统亮/暗）；右上角刷新键有效（点击后图标切换为进度弧，约 5s 后恢复，且时长数据由 5小时55分 → 6小时1分，证明确实拉到了新数据）；设置页三档主题切换正常、无崩溃；小时图/分类占比/最常使用/逐应用时长与耗电各模块渲染正常。
+- **重新确认的遗留问题**：标题栏 ⋮ 按钮点击后**无任何菜单弹出**（`menuOpen` 仍只赋值、从未渲染 `DropdownMenu`），`diagnosticJson()` 仍是死代码。
 
 ## 4.0.4 v0.16.4 变更（启动闪暗色修复 + 右上角手动刷新 + 补回缺失构建文件）
 

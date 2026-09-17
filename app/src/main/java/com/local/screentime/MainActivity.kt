@@ -235,6 +235,8 @@ class MainActivity : ComponentActivity() {
                     UsageApp(repo, dark, themeMode) { m ->
                         themeMode = m
                         prefs.edit().putString("theme_mode", m).apply()
+                        // 同时告诉系统，这样**下次冷启动的闪屏**也会用对底色（见 App.applyAppNightMode）
+                        App.applyAppNightMode(this@MainActivity)
                     }
                 }
             }
