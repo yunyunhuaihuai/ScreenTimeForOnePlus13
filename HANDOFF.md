@@ -23,6 +23,7 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/debug/app-debug.apk
 - 无 wrapper，直接用本机 Gradle 8.9 安装路径（见上）
 - 真机 adb 序列号由机主本机记录（`adb devices` 查询）；模拟器 AVD `OP13_API35`（google_apis，可 `adb root`，**用于回归测试**）
 - ColorOS 安装需要"USB 安装"开关（已开）；`adb shell appops set` 被 ColorOS 拒绝（shell 无 MANAGE_APP_OPS_MODES）
+- ⚠️ **升完版本号必须重新构建 + 复核产物版本**：产物版本只以 `app/build/outputs/apk/debug/output-metadata.json`（或 `adb shell dumpsys package com.local.screentime`）为准，`build.gradle.kts` 改完不重建就会打出旧版本号的包（曾踩，详见 4.0.7）
 
 ## 3. 架构：三层数据源（核心设计）
 
@@ -48,7 +49,7 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/debug/app-debug.apk
 ### 分类
 `repo.categoryOf(pkg)`：手动覆盖（SharedPreferences `cat_overrides` JSON）→ 系统 `ApplicationInfo.category` → 内置中国应用字典（`categoryDict`，微信/QQ→通讯社交、抖音/B站→影音娱乐、DeepSeek/豆包→AI 助手…）→ 兜底"其他"。修改入口：应用明细弹窗"修改"。
 
-## 4. 已实现功能（v0.10.0，versionCode 10）
+## 4. 已实现功能（截至 v0.16.6，versionCode 22；各版本变更按时间倒序见下方 4.0.x）
 
 - 每日总量大数字 + 左右箭头/**列表左右滑动**切日期（周一开始的周图：灰柱+今天蓝+虚线均值+右轴刻度右对齐，星期画进图内对齐柱子）
 - 小时柱状图：**按分类堆叠**（社交蓝/娱乐橙/AI 紫…，底部图例）；**点任意柱子弹出该小时分类构成 + 应用明细**
@@ -61,8 +62,36 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/debug/app-debug.apk
 - 电量去向卡：整机组件 mAh 排名
 - 设置（齿轮）：模块显示顺序 ↑↓（SharedPreferences `module_order` 持久化，模块：weekly/hourly/timeline/pickup/battery/apps/reports/ranking）
 - 每 6h WorkManager 后台对账；打开即先读本地库秒出、再后台同步（同步已去掉无用的 --checkin 解析，~1-2s）；Doze 白名单（root 自动添加）
-- 诊断导出（菜单）：当天会话+聚合+分类 JSON 复制到剪贴板
+- ~~诊断导出（菜单）~~：**实际不可达**——`UsageRepository.diagnosticJson(day)` 实现完整（当天会话+聚合+root/权限状态 JSON），但标题栏 ⋮ 按钮没有任何弹窗入口，属死代码。详见 4.0.7。
 - 应用名"屏幕时间"，自适应图标（蓝底白时钟+黄色弧）
+
+## 4.0.7 2026-09-17 工程化与取证记录（不含代码变更）
+
+### Git / GitHub 接入（本工程首次入库）
+- 此前工程**没有 git**。本日建立仓库并推送到 GitHub（公开）：`git@github.com:yunyunhuaihuai/ScreenTimeForOnePlus13.git`，默认分支 `main`。
+- 新增 `.gitignore`（排除 `build/`、`.gradle/`、`.kotlin/`、`local.properties`、`.workbuddy/`、`HANDOFF.local.md`）、`.gitattributes`（行尾规范化）、`README.md`。
+- **公开前脱敏**：`HANDOFF.md` 已移除真机 adb 序列号与本机绝对路径（JDK/Gradle/SDK 安装路径、`analysis/` 证据目录），构建命令改为 `<占位符>`；未脱敏原件保留在 `HANDOFF.local.md`（已 gitignore，不入库）。**后续提交请沿用此约定：不写设备序列号、不写本机绝对路径。**
+- **认证方式**：仓库级**部署密钥**（只授权这一个仓库）+ 仓库级 `core.sshCommand` 指向该私钥；全局 `core.sshCommand` 不再绑定具体密钥，只保留 known_hosts 处理。**不要**拿账号级 SSH 私钥用于本项目。
+  - 坑：本机用户名含中文 → 私钥不能放默认 `~/.ssh`（HOME 编码问题），必须放**纯 ASCII 路径**（具体路径见机主本机交接说明，不入库）。
+  - 坑：该密钥目录原 ACL 为 `Everyone:(F)`（任何本机账户可读私钥），已收紧为「用户 + SYSTEM + Administrators」。
+  - 坑（环境副作用，非仓库问题）：本沙箱里 `git fetch`/`update-ref` 写 `.git/refs/remotes/origin/main` 会静默失败（reflog 有记录、ref 文件不存在 → `git status` 显示 `[gone]`），但 `push`/`fetch`/`ls-remote` 均正常。
+- 约定：此后每次代码改动都 commit + push。
+
+### ⋮ 菜单按钮取证（已确认是死按钮）
+- 标题栏右上角一排四个 `HeaderAction`（`MainActivity.kt:485-506`），**从右往左**依次为：**菜单（⋮ / `Icons.Filled.MoreVert`）→ 设置（⚙）→ 通知（🔔）→ 刷新（↻）**。
+- 除 ⋮ 外三个均有实现：刷新 → `sync()`（同步中原地换成转圈，尺寸不变）；设置 → `AlertDialog`（715 行起，模块排序 + 主题三档）；通知 → `AlertDialog`（773 行起，历史报告列表 + 手动生成）。
+- ⋮ 是死的：`menuOpen` 仅在 340 行声明、505 行赋值 `true`，**全工程再无第三处引用**，没有对应的 `DropdownMenu(expanded = menuOpen, ...)`（879 行那个 `DropdownMenu` 属于分类筛选的 `catMenu`，与之无关）。
+- 真机复现（v0.16.6 装机后）：`adb shell input tap 1313 282` 后间隔 1 秒截图，与点击前做**像素级 diff** —— 差异区域仅 `y 54~106` 一条（状态栏时钟秒数在跳），**全程无弹窗**。证据图见机主本机 `uitest-out/`（`v166_menu_where.png` 标注图 / `v166_home.png` / `v166_after_tap.png`，均不入库）。
+- 下一步（尚未实现）：给 505 行那颗按钮挂 `DropdownMenu`，第一项调 `repo.diagnosticJson(selectedDay.toEpochDay())` → 写剪贴板 → Toast 提示；可再加一项「导出原始 batterystats」。
+
+### 构建产物版本号坑（重要，别再踩）
+- **现象**：`app/build.gradle.kts` 已改成 `versionCode 22 / versionName 0.16.6` 且已提交，但那次 `assembleDebug` 产出的 APK 里仍是 `versionCode 21 / versionName 0.16.5`（`output-metadata.json` 与 `adb shell dumpsys package` 都是 21/0.16.5）——因为**版本号是在构建之后才改的**，二进制没带上。
+- **规则**：升完 `versionCode`/`versionName` **必须重新构建**，并用 `app/build/outputs/apk/debug/output-metadata.json` 或 `dumpsys package` **复核**；只看 `build.gradle.kts` 或 git log 会误判版本。重新构建后已确认设备上为 22 / 0.16.6。
+
+### 真机取证环境发现（可复用）
+- **ColorOS 不把三方 App 的 `Log.d` 写进 logcat 缓冲区** → 真机上拿不到 app 自身日志，调试要改用「同步前后拉 DB 做前后对比」或 root 侧取证。
+- **拉数据库必须 `adb exec-out run-as <pkg> cat databases/screentime.db > db.db`**；用 `adb shell cat` 经管道会被 CRLF 破坏，得到 `database disk image is malformed`。
+- `.workbuddy/` 目录下写入的文件**跨命令不持久** → 测试产物一律放仓库外目录（本机 `uitest-out`，不入库）。
 
 ## 4.0.6 v0.16.6 变更（耗电日归属修复：跨天窗口不再整体记到今天）
 
@@ -197,12 +226,26 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/debug/app-debug.apk
 8. **手机有 PIN 锁屏**：自动化（截图/点击）在锁屏下不可用，需机主解锁。
 9. 模拟器 queryEvents 不裁剪（可回 57686 条），用于功能回归；模拟器无 su，root 路径在模拟器不可测。
 10. 用户反馈过的 UI 问题均已修：滚动位置跨日保留（切日回顶）、右轴文字换行/裁剪（maxLines=1 + 右对齐 + 加宽轴区）、周图星期对齐（画进图内）、周从周一开始。
+11. **耗电统计是"窗口口径"，不是"自然日口径"**：`dumpsys batterystats --charged` = 「自上次充电以来」，起点不是当天 0 点、可跨午夜甚至跨多天 → 任何「按今天」的聚合都必须按窗口时间轴分摊（v0.16.6 已修，见 4.0.6）。且各组件耗电全是**模型估算**：`组件 mAh = 该组件计时器时长 × power_profile.xml 里的固定电流常数`；相机的"计时器"= **相机子系统被占用时长**，所以**视频通话、扫码、前后台取景都会计入「相机」**，不只是拍照。
+12. 真机取证的两个环境坑（调试时必踩）：ColorOS **不把三方 App 的 `Log.d` 写进 logcat 缓冲区**；拉数据库必须用 `adb exec-out`（用 `adb shell cat` 会被 CRLF 破坏成 `database disk image is malformed`）。详见 4.0.7。
 
-## 6. 已知问题 / 待办
+## 6. 已知问题 / 待办（2026-09-17 更新）
 
-- **[待确认] 真机上小时图分类颜色**：用户反馈"拖动看每小时构成似乎没实现"。实为静态彩色段，无交互。计划：点某根柱子弹出该小时分类构成；并核查真机上分类色是否正确显示（如大面积灰色=字典外应用落"其他"）。
-- **[建议] release 签名包**：debug 包是滚动卡顿的主因之一。
-- CSV/JSON 导出到下载目录；Gradle wrapper；速览插件专项（需欢太账号+个人开发者认证申请 Card 权限，见与用户的讨论）。
+### 确认存在、待修（大致按性价比排序）
+1. **标题栏 ⋮ 按钮无响应** —— `menuOpen` 只赋值不渲染弹窗，导致「诊断导出」不可达（v0.16.6 真机已复现，取证见 4.0.7）。修法已明确、工作量小，建议下一版直接做。
+2. **`syncNow()` 无 Mutex** —— UI 手动刷新与 6h WorkManager 对账可能并发，耗电增量会**双计**。
+3. **`dragTotal` 用 Compose state 做手势累加** —— 拖动（左右滑切日）时整棵树重组，是滚动卡顿来源之一。
+4. **`loadDayAsync()` 无取消机制** —— 快速连续切日可能乱序覆盖，显示到错误的日期数据。
+5. **`day_stats` / `unlock_stats` 用 REPLACE 写"当前窗口"计数** —— root 不可用时会偏小。
+6. **`battery_global` 同行内口径不一致** —— `mah` 是累加值，`durationMs` 只在当天首次插入时写一次（目前 UI 未展示 duration）。若日后要展示"相机开启时长"，需把 duration 也改成增量累加。
+7. **Room `fallbackToDestructiveMigration()` + `exportSchema=false`** —— 任何表结构变更都会**清空历史数据**，改表前务必先导出。
+8. **死代码清单** —— `weeklyTotals()` / `dao.sessionsSumsSince()`、`DonutChart()`、`parseCheckinAggregates()`、`dao.earliestSessionTs()`、`dao.dayTotalMs()`、`AppDisplay.stateDesc`、`UidPower.durs`、`UsageRepository.diagnosticJson()`（最后这个接上菜单即可复活）。
+9. **[建议] release 签名包** —— debug 包是滚动卡顿的主因之一。
+10. CSV/JSON 导出到下载目录；Gradle wrapper；速览插件专项（需欢太账号 + 个人开发者认证申请 Card 权限）。
+11. **文档整理** —— 本文件 4.x 章节编号有重复与乱序（`4.2` 出现 3 次，`4.9/4.10/4.11/4.12` 排序颠倒），且"v0.13.0 及更早"的内容在两节里近乎重复；建议下次顺一遍（只动标题与去重，不改内容）。
+
+### 已澄清 / 已过期的旧待办
+- 原「[待确认] 真机上小时图分类颜色 + 拖动看每小时构成没实现」**与第 4 节功能列表冲突**：小时柱自 v0.11.0 起已实现"按分类堆叠 + 点柱子弹出该小时构成与明细"（用 24 个透明点按格覆盖解手势失效）。v0.16.5 真机回归时小时图渲染正常，但**未单独测过"点柱子"这条路**，若仍有问题请按新 bug 重开。
 - 手动改分类后小时图立即变色已实现（categories 状态即时更新）；排行里新增应用需重新进入当日。
 
 ## 8. 2026-09-13 「列表时长虚高、明细反而准」根因分析（✅ 已在 v0.16.0 修复）
@@ -230,4 +273,14 @@ adb shell pm list packages -d
 adb shell dumpsys deviceidle whitelist | grep screentime
 # 数据库（拉到本机用模拟器 sqlite3 查，或 run-as）
 adb exec-out run-as com.local.screentime cat databases/screentime.db > db.db
+
+# 耗电：「自上次充电」统计窗口的起点（判断"今天"聚合是否跨天，见 4.0.6）
+adb shell dumpsys batterystats --charged | grep -m1 "Start clock time"
+# 逐 UID 相机计时器（单位 ms，需 root）+ 设备级相机组件 mAh
+adb shell "su -c 'dumpsys batterystats --checkin'" | grep -E ",cam,|,pwi,camera"
+# 相机服务 CONNECT/DISCONNECT 事件日志（与上面的计时器互相印证）
+adb shell "su -c 'dumpsys media.camera'" | grep -i "CONNECT\|DISCONNECT"
+
+# 验证某个按钮"点了到底有没有反应"：点击后截图做像素 diff（比肉眼可靠）
+adb shell input tap <x> <y> && sleep 1 && adb exec-out screencap -p > after.png
 ```
