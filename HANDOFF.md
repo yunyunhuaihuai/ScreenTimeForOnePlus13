@@ -7,7 +7,7 @@
 一台一加 13（ColorOS 15）上用"冰箱"冻结应用后，**系统自带屏幕使用时间不再显示这些应用的时长**（展示层过滤）。本项目自建记录器：跨三层混合数据源重建完整的使用时长 + 耗电统计，**冻结应用照样显示**，并逐步加入 iOS 屏幕时间风格的可视化。
 
 - 目标设备：OnePlus 13（PJZ110），ColorOS 15 / Android 15（API 35），KernelSU root，屏幕 1440×3168
-- 包名：`com.local.screentime`，应用名“屏幕时间”，当前 v0.16.3（versionCode 19）
+- 包名：`com.local.screentime`，应用名“屏幕时间”，当前 v0.16.4（versionCode 20）
 - 工程：本仓库根目录；技术栈 Kotlin + Compose(M3) + Room + WorkManager + libsu，无 NDK
 - minSdk/targetSdk/compileSdk = 35；数据库 Room v3（destructive migration）
 
@@ -63,6 +63,16 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/debug/app-debug.apk
 - 每 6h WorkManager 后台对账；打开即先读本地库秒出、再后台同步（同步已去掉无用的 --checkin 解析，~1-2s）；Doze 白名单（root 自动添加）
 - 诊断导出（菜单）：当天会话+聚合+分类 JSON 复制到剪贴板
 - 应用名"屏幕时间"，自适应图标（蓝底白时钟+黄色弧）
+
+## 4.0.4 v0.16.4 变更（启动闪暗色修复 + 右上角手动刷新 + 补回缺失构建文件）
+
+- **修复冷启动闪暗色（根因）**：`AndroidManifest.xml` 原用 `@android:style/Theme.DeviceDefault.NoActionBar`，而 **`Theme.DeviceDefault` 是固定暗色主题**（不是 DayNight）→ 启动窗口底色恒为黑，与 app 内"白天/黑夜"设定完全无关。改为项目自建 `Theme.ScreenTime`：`values/themes.xml` 父主题取 `Theme.DeviceDefault.Light.NoActionBar`，`values-night/themes.xml` 取暗色变体，二者 `android:windowBackground` 均指向 `@color/window_background`（`values/colors.xml` = `#FFFBFE`，`values-night/colors.xml` = `#1C1B1F`，与 M3 colorScheme 的 surface 一致）。
+- **首帧即按 app 内主题取色**：新增 `MainActivity.applyTheme(dark)`，把系统栏样式与 `window.setBackgroundDrawable(...)` 提到 **`setContent` 之前**调用。原实现是在 `setContent` 里裸调 `enableEdgeToEdge()`，它按**系统**明暗取色——当 app 内设定与系统相反时首帧会被画成暗色，要等 `LaunchedEffect` 才纠正（这就是"启动过程是暗色"的第二层原因）。另新增 `resolveDark(mode)` 供非 Compose 环境（onCreate 早期）判断明暗；Compose 内仍保留可观察的 `isSystemInDarkTheme()` 以便系统主题变化时重组。
+- **新增右上角手动刷新键**：标题栏最左侧加 `Icons.Filled.Refresh`（`HeaderAction` 同款 36dp 命中区），点击调 `sync()`；同步中原地替换为 16dp `CircularProgressIndicator`（尺寸相同，图标不跳动）。底部原有"同步"按钮与状态文字保留。
+- **补回两个缺失的构建必需文件**（此前该工程在**任何**机器上都无法构建）：
+  - `settings.gradle.kts`：`pluginManagement` + `dependencyResolutionManagement` 仓库（google + mavenCentral + **JitPack**——libsu 只发布在 JitPack，缺它会报 `Could not find com.github.topjohnwu.libsu:core`）、`rootProject.name`、`include(":app")`。
+  - `gradle.properties`：`android.useAndroidX=true`（**缺失则构建直接失败**）、`android.nonTransitiveRClass=true`、`org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8`（本机用户名与路径含中文，显式指定编码）。
+- **遗留未修（下一版处理）**：标题栏 ⋮ 按钮的 `menuOpen` 只被赋值为 `true`、**从未渲染任何 DropdownMenu** → 按钮点了没反应；第 4 节功能列表中所称"诊断导出（菜单）"实际**不可达**，`UsageRepository.diagnosticJson()` 成为死代码。同批死代码还有：`weeklyTotals()`/`dao.sessionsSumsSince()`、`DonutChart()`、`parseCheckinAggregates()`、`dao.earliestSessionTs()`、`dao.dayTotalMs()`、`AppDisplay.stateDesc`、`UidPower.durs`。
 
 ## 4.0.3 v0.16.3 变更（UI 微调 + 系统 UID 耗电命名修正）
 - 小时图与"拿起"卡片之间补 12dp 间距；每张卡自带顶距，标题区冗余 Spacer 移除

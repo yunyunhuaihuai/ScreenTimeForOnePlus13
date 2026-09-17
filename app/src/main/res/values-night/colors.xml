@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 黑夜模式的启动窗口底色（与 M3 darkColorScheme().surface 一致） -->
+<resources>
+    <color name="window_background">#1C1B1F</color>
+</resources>

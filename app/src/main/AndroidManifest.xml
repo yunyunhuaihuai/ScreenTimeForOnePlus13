@@ -24,7 +24,7 @@
         android:name=".App"
         android:label="屏幕时间"
         android:icon="@mipmap/ic_launcher"
-        android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
+        android:theme="@style/Theme.ScreenTime"
         android:allowBackup="false">
 
     <activity

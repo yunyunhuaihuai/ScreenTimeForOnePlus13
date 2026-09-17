@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  启动窗口主题（白天）。
+  注意：这里必须用 Light 变体，不能用 @android:style/Theme.DeviceDefault
+  —— Theme.DeviceDefault 是固定暗色，会导致冷启动瞬间闪一层黑底，
+  与 app 内设定的“白天模式”不符（v0.16.4 修复）。
+
+  该主题只负责两件事：去掉 ActionBar、给出启动窗口底色。
+  实际界面色彩完全由 Compose 的 MaterialTheme 决定；
+  若 app 内主题与系统明暗不一致，MainActivity.onCreate 会用
+  window.setBackgroundDrawable 覆盖这里的底色。
+-->
+<resources>
+    <style name="Theme.ScreenTime" parent="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+        <item name="android:windowBackground">@color/window_background</item>
+    </style>
+</resources>

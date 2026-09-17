@@ -4,6 +4,8 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
 import android.os.Bundle
 import android.provider.Settings
@@ -46,10 +48,12 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
@@ -211,23 +215,21 @@ private fun formatMinutes(ms: Long): String {
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
         val repo = UsageRepository(applicationContext)
         val prefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
+        val savedMode = prefs.getString("theme_mode", "system") ?: "system"
+        // 在 setContent 之前就把系统栏样式与窗口底色按“app 内设定的主题”定好。
+        // 此前是裸调 enableEdgeToEdge()：它按系统明暗取色，与 app 内设定相反时
+        // 第一帧会被画成暗色（启动闪黑），要等 LaunchedEffect 生效才纠正 → 现在提前到首帧之前。
+        applyTheme(resolveDark(savedMode))
         setContent {
-            var themeMode by remember { mutableStateOf(prefs.getString("theme_mode", "system") ?: "system") }
+            var themeMode by remember { mutableStateOf(savedMode) }
             val dark = when (themeMode) {
                 "dark" -> true
                 "light" -> false
                 else -> isSystemInDarkTheme()
             }
-            LaunchedEffect(dark) {
-                val scrim = Color.Transparent.toArgb()
-                enableEdgeToEdge(
-                    statusBarStyle = if (dark) SystemBarStyle.dark(scrim) else SystemBarStyle.light(scrim, scrim),
-                    navigationBarStyle = if (dark) SystemBarStyle.dark(scrim) else SystemBarStyle.light(scrim, scrim),
-                )
-            }
+            LaunchedEffect(dark) { applyTheme(dark) }
             MaterialTheme(colorScheme = if (dark) darkColorScheme() else lightColorScheme()) {
                 Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.surface) {
                     UsageApp(repo, dark, themeMode) { m ->
@@ -237,6 +239,26 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    /** 非 Compose 环境（onCreate 早期）下判断是否暗色；Compose 内仍用可观察的 isSystemInDarkTheme() */
+    private fun resolveDark(mode: String): Boolean = when (mode) {
+        "dark" -> true
+        "light" -> false
+        else -> (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+            Configuration.UI_MODE_NIGHT_YES
+    }
+
+    /** 系统栏样式 + 窗口底色，二者都必须跟随 app 内的主题设定 */
+    private fun applyTheme(dark: Boolean) {
+        val scrim = Color.Transparent.toArgb()
+        enableEdgeToEdge(
+            statusBarStyle = if (dark) SystemBarStyle.dark(scrim) else SystemBarStyle.light(scrim, scrim),
+            navigationBarStyle = if (dark) SystemBarStyle.dark(scrim) else SystemBarStyle.light(scrim, scrim),
+        )
+        window.setBackgroundDrawable(
+            ColorDrawable(if (dark) darkColorScheme().surface.toArgb() else lightColorScheme().surface.toArgb())
+        )
     }
 }
 
@@ -464,6 +486,18 @@ fun UsageApp(
                 horizontalArrangement = Arrangement.End,
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                // 手动刷新：同步中原地换成转圈，尺寸保持一致，避免整行图标跳动
+                if (syncing) {
+                    Box(Modifier.size(36.dp), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                } else {
+                    HeaderAction(Icons.Filled.Refresh, "刷新") { sync() }
+                }
                 HeaderAction(Icons.Filled.Notifications, "通知") { showNotifs = true }
                 HeaderAction(Icons.Filled.Settings, "设置") { showSettings = true }
                 HeaderAction(Icons.Filled.MoreVert, "菜单") { menuOpen = true }
