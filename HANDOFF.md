@@ -248,18 +248,6 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/debug/app-debug.apk
 - 原「[待确认] 真机上小时图分类颜色 + 拖动看每小时构成没实现」**与第 4 节功能列表冲突**：小时柱自 v0.11.0 起已实现"按分类堆叠 + 点柱子弹出该小时构成与明细"（用 24 个透明点按格覆盖解手势失效）。v0.16.5 真机回归时小时图渲染正常，但**未单独测过"点柱子"这条路**，若仍有问题请按新 bug 重开。
 - 手动改分类后小时图立即变色已实现（categories 状态即时更新）；排行里新增应用需重新进入当日。
 
-## 8. 2026-09-13 「列表时长虚高、明细反而准」根因分析（✅ 已在 v0.16.0 修复）
-
-用户报告：列表行时长明显大于实际，明细弹窗的合计才和 ColorOS 屏幕使用时长对得上。取手机 DB + `dumpsys usagestats` 三方对账（证据文件在机主本机 `analysis/` 目录，不入库：st.db、dumpsys_usagestats.txt），结论是**两个独立 bug + 一个放大器**：
-
-- **根因 A（明细少算）**：`buildSessions()` 把 `ACTIVITY_STOPPED` 当关会话条件。ColorOS 应用内切 Activity 恒为 `PAUSED(旧)→RESUMED(新)→STOPPED(旧)` 同戳三连，STOPPED(旧) 与 openPkg 同包 → 把刚开的会话 0 秒关闭，后续该 Activity 的 PAUSED 又因 openPkg=null 被忽略 → **多 Activity 应用（知乎/小红书/淘宝/美团/B站/微信…）整段整段丢时长**（知乎丢 ~90%，B站丢 ~64%，单 Activity 应用如抖音主界面/DeepSeek 无损）。实测：仅认 PAUSED 重建 24h 窗口，与系统 `totalTimeUsed` 桶逐包一致（B站 28.4=28.4、知乎 9.6≈9.7、美团 2.2=2.2）。
-- **根因 B（列表错日）**：ColorOS 的 `queryUsageStats(INTERVAL_DAILY)` 返回的是**以 ~16:40 为锚点的滚动 24h 桶**（dumpsys "daily stats files" 文件名铁证：2026-09-03 16:39:21、09-04 16:39:21…），不是自然日桶。`syncAggregatesViaApi()` 按桶中点归日 → `usage_daily[某天]` 实际是 [前一天16:40 → 当天16:40] 的量。9/13 实测列表 6.5h 中有 **184 分钟是 9/12 傍晚 16:49–24:00 的使用**被并进了"今天"；usage_daily[9/13] 与该滚动桶逐包精确相等（知乎 9.7=9.7、微信 37.4=37.45、抖音 29.7=29.8）。
-- **放大器 C**：`dailyRows()` 逐包取 max(会话合计, usage_daily)。A 使会话偏小、B 使聚合错日偏大 → max 恒取聚合值 → 列表=错日的桶值、明细=少算的会话，正是用户看到的现象。
-- 连带污染：`dayTotal` 大数字、应用占比、报告（`usageSumBetween`/`topAppsBetween` 全读 usage_daily）；yearly 桶（4/19 起）也会被中点归日写进 6 月某天。
-- **修复方向**：A) buildSessions 删掉 ACTIVITY_STOPPED 分支（STOPPED 恒随 PAUSED 之后，不需要它关会话；仅 force-stop 无 PAUSED 时会话顺延到下一个 RESUMED/息屏，可接受）；B) 列表/大数字/占比/报告一律以会话表为唯一权威，`usage_daily` 仅作无 root 兜底并标注口径，删除中点归日；C) dailyRows 去 max。存量 usage_daily 404 行全是错位桶值应清空；存量会话中被 A 丢掉的时长无法恢复（事件日志仅留 24h），修复只对之后的日期生效。
-- 修复后预期：列表=明细=系统 totalTimeUsed 口径（±2s 碎片过滤差 1~3%）。注意：多 Activity 应用的明细合计会**变大**，若届时仍与 ColorOS UI 有差，则说明 ColorOS UI 自身也少算，以系统桶为准。
-- （2026-09-13 后续）历史日已用系统桶数据回补，见 4.0.2；当日之后新算法会话即为准确口径。
-
 ## 7. 验证命令速查
 
 ```bash
@@ -284,3 +272,15 @@ adb shell "su -c 'dumpsys media.camera'" | grep -i "CONNECT\|DISCONNECT"
 # 验证某个按钮"点了到底有没有反应"：点击后截图做像素 diff（比肉眼可靠）
 adb shell input tap <x> <y> && sleep 1 && adb exec-out screencap -p > after.png
 ```
+
+## 8. 2026-09-13 「列表时长虚高、明细反而准」根因分析（✅ 已在 v0.16.0 修复）
+
+用户报告：列表行时长明显大于实际，明细弹窗的合计才和 ColorOS 屏幕使用时长对得上。取手机 DB + `dumpsys usagestats` 三方对账（证据文件在机主本机 `analysis/` 目录，不入库：st.db、dumpsys_usagestats.txt），结论是**两个独立 bug + 一个放大器**：
+
+- **根因 A（明细少算）**：`buildSessions()` 把 `ACTIVITY_STOPPED` 当关会话条件。ColorOS 应用内切 Activity 恒为 `PAUSED(旧)→RESUMED(新)→STOPPED(旧)` 同戳三连，STOPPED(旧) 与 openPkg 同包 → 把刚开的会话 0 秒关闭，后续该 Activity 的 PAUSED 又因 openPkg=null 被忽略 → **多 Activity 应用（知乎/小红书/淘宝/美团/B站/微信…）整段整段丢时长**（知乎丢 ~90%，B站丢 ~64%，单 Activity 应用如抖音主界面/DeepSeek 无损）。实测：仅认 PAUSED 重建 24h 窗口，与系统 `totalTimeUsed` 桶逐包一致（B站 28.4=28.4、知乎 9.6≈9.7、美团 2.2=2.2）。
+- **根因 B（列表错日）**：ColorOS 的 `queryUsageStats(INTERVAL_DAILY)` 返回的是**以 ~16:40 为锚点的滚动 24h 桶**（dumpsys "daily stats files" 文件名铁证：2026-09-03 16:39:21、09-04 16:39:21…），不是自然日桶。`syncAggregatesViaApi()` 按桶中点归日 → `usage_daily[某天]` 实际是 [前一天16:40 → 当天16:40] 的量。9/13 实测列表 6.5h 中有 **184 分钟是 9/12 傍晚 16:49–24:00 的使用**被并进了"今天"；usage_daily[9/13] 与该滚动桶逐包精确相等（知乎 9.7=9.7、微信 37.4=37.45、抖音 29.7=29.8）。
+- **放大器 C**：`dailyRows()` 逐包取 max(会话合计, usage_daily)。A 使会话偏小、B 使聚合错日偏大 → max 恒取聚合值 → 列表=错日的桶值、明细=少算的会话，正是用户看到的现象。
+- 连带污染：`dayTotal` 大数字、应用占比、报告（`usageSumBetween`/`topAppsBetween` 全读 usage_daily）；yearly 桶（4/19 起）也会被中点归日写进 6 月某天。
+- **修复方向**：A) buildSessions 删掉 ACTIVITY_STOPPED 分支（STOPPED 恒随 PAUSED 之后，不需要它关会话；仅 force-stop 无 PAUSED 时会话顺延到下一个 RESUMED/息屏，可接受）；B) 列表/大数字/占比/报告一律以会话表为唯一权威，`usage_daily` 仅作无 root 兜底并标注口径，删除中点归日；C) dailyRows 去 max。存量 usage_daily 404 行全是错位桶值应清空；存量会话中被 A 丢掉的时长无法恢复（事件日志仅留 24h），修复只对之后的日期生效。
+- 修复后预期：列表=明细=系统 totalTimeUsed 口径（±2s 碎片过滤差 1~3%）。注意：多 Activity 应用的明细合计会**变大**，若届时仍与 ColorOS UI 有差，则说明 ColorOS UI 自身也少算，以系统桶为准。
+- （2026-09-13 后续）历史日已用系统桶数据回补，见 4.0.2；当日之后新算法会话即为准确口径。
