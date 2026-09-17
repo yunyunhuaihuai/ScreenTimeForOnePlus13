@@ -7,7 +7,7 @@
 一台一加 13（ColorOS 15）上用"冰箱"冻结应用后，**系统自带屏幕使用时间不再显示这些应用的时长**（展示层过滤）。本项目自建记录器：跨三层混合数据源重建完整的使用时长 + 耗电统计，**冻结应用照样显示**，并逐步加入 iOS 屏幕时间风格的可视化。
 
 - 目标设备：OnePlus 13（PJZ110），ColorOS 15 / Android 15（API 35），KernelSU root，屏幕 1440×3168
-- 包名：`com.local.screentime`，应用名“屏幕时间”，当前 v0.16.6（versionCode 22）
+- 包名：`com.local.screentime`，应用名“屏幕时间”，当前 v0.16.7（versionCode 23）
 - 工程：本仓库根目录；技术栈 Kotlin + Compose(M3) + Room + WorkManager + libsu，无 NDK
 - minSdk/targetSdk/compileSdk = 35；数据库 Room v3（destructive migration）
 
@@ -64,6 +64,24 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/debug/app-debug.apk
 - 每 6h WorkManager 后台对账；打开即先读本地库秒出、再后台同步（同步已去掉无用的 --checkin 解析，~1-2s）；Doze 白名单（root 自动添加）
 - ~~诊断导出（菜单）~~：**实际不可达**——`UsageRepository.diagnosticJson(day)` 实现完整（当天会话+聚合+root/权限状态 JSON），但标题栏 ⋮ 按钮没有任何弹窗入口，属死代码。详见 4.0.7。
 - 应用名"屏幕时间"，自适应图标（蓝底白时钟+黄色弧）
+
+## 4.0.8 v0.16.7 变更（五项用户反馈修复：同步互斥/拿起口径/bilibili 耗电真相/⋮菜单/打开次数）
+
+**数据层（UsageRepository / UsageDao）**
+1. **同步加 Mutex**：UI 手动刷新与 WorkManager 6h 对账并发时，会话/耗电增量会双计或交错（此前 `syncNow()` 无锁，已修）。
+2. **API 兜底降级**：ColorOS 裁剪 `queryEvents`（丢 PAUSED 事件 → 会话跨息屏虚高），API 事件流现在**只在 root 没拿到事件时**才用于重建会话与 day_stats/unlock_stats（它们是整行 REPLACE，残缺数据覆盖 root 完整数据是倒退）。
+3. **fg/bg 耗电差分修复**：`fg:`/`bg:` 在 batterystats UID 行**括号之外**，此前误从括号内组件表取值恒得 0 → battery_daily 全表 fg/bg 恒 0。现在快照里单独存 fg/bg 并正确差分（装机验证：知乎 fg=0.5）。
+4. **多用户 UID 解析**：`uidKeyOf/uidOf` 只认 `u0a*` 前缀，ColorOS 分身用户 `u999a*` 解析成 0 → 分身应用耗电行 packageName 恒 null。支持 `u<user>a<index>`。
+5. 耗电记录阈值 0.01→0.001 mAh；删除死代码 `parseCheckinAggregates`/`dao.dayTotalMs`/`earliestSessionTs`/`sessionsSumsSince`。
+
+**UI 层（MainActivity）**
+6. **「拿起 N 次」口径说明**：拿起 = KEYGUARD_HIDDEN 总数；Top 分项只统计"解锁后 15 秒内打开应用"的解锁（现在加载全量算总和）。卡片显示"其中 X 次解锁后 15 秒内打开了应用，其余多为亮屏看桌面/通知"——290 次拿起 vs Top3 之和 67 次不是数据错误，是口径不同。
+7. **详情页「打开 N 次」按轮次合并**：相邻会话间隔 ≤90 秒合并为一次打开（此前直接数会话段数，碎片化下知乎 19.9 分钟被拆 321 段 → 显示"打开 321 次"）。明细列表同样按轮次展示。
+8. **电量去向 mAh 数值不再换行**：38dp 固定宽度 → 44dp + maxLines=1；卡片加口径说明"自上次充满电以来，充电即重置"。
+9. **⋮ 菜单接通**：此前 `menuOpen` 只赋值从未渲染，按钮无响应、诊断导出不可达。现在渲染 DropdownMenu + 「导出诊断（当日 JSON）」（ACTION_SEND 分享 `diagnosticJson`）。
+10. **bilibili 不显示耗电 = 机制性真相，非 bug**：取证确认 bilibili=u0a182，当天使用全部在 17:09–17:18，而 18:05 充电触发 batterystats 窗口重置（上次同步 16:18）→ 那 8.8 分钟的估算耗电被**永久丢弃**（系统口径"自上次充满电"的盲区）。数据链路本身是通的（历史行存在，仅 0.02mAh 量级）。UI 改为如实告知：耗电 <0.5mAh 显示"可忽略"；完全无记录时显示"耗电：无记录（充电重置会丢失未被同步时段的估算）"。
+
+**装机验证**（真机 e4e1b43e，2026-09-17）：day_stats 今日 296 次实时更新（此前卡在 09-03）；知乎 fg=0.5 非零；⋮ 菜单弹出正常；bilibili 详情页显示 8分45秒 / 打开 1 次 / 无记录说明。
 
 ## 4.0.7 2026-09-17 工程化与取证记录（不含代码变更）
 

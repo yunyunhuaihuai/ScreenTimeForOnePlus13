@@ -212,6 +212,29 @@ private fun formatMinutes(ms: Long): String {
     return if (h > 0) "${h}小时${m}分钟" else "${m}分钟"
 }
 
+/** 把碎片化会话折叠成“使用轮次”：相邻会话间隔 ≤ gapMs 视为同一次打开。
+ *  事件流会把一次使用拆成几十段（推送/切 Activity），直接数段数会严重虚高
+ *  “打开 N 次”（实测知乎 19.9 分钟被拆成 321 段）（v0.16.7）。 */
+private fun mergeSessionRounds(sessions: List<UsageSession>, gapMs: Long = 90_000L): List<Pair<Long, Long>> {
+    if (sessions.isEmpty()) return emptyList()
+    val sorted = sessions.sortedBy { it.startTs }
+    val out = ArrayList<Pair<Long, Long>>()
+    var cs = sorted[0].startTs
+    var ce = sorted[0].endTs
+    for (i in 1 until sorted.size) {
+        val s = sorted[i]
+        if (s.startTs - ce <= gapMs) {
+            ce = maxOf(ce, s.endTs)
+        } else {
+            out.add(cs to ce)
+            cs = s.startTs
+            ce = s.endTs
+        }
+    }
+    out.add(cs to ce)
+    return out
+}
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -363,7 +386,7 @@ fun UsageApp(
                     batteryAll = repo.batteryDailyRows(day),
                     batteryGlobal = repo.batteryGlobalRows(day),
                     dayStats = repo.dayStats(day),
-                    unlockTop = repo.unlockTop(day, 3),
+                    unlockTop = repo.unlockTop(day, 100),
                     reports = repo.latestReports(),
                 )
             }
@@ -502,7 +525,36 @@ fun UsageApp(
                 }
                 HeaderAction(Icons.Filled.Notifications, "通知") { showNotifs = true }
                 HeaderAction(Icons.Filled.Settings, "设置") { showSettings = true }
-                HeaderAction(Icons.Filled.MoreVert, "菜单") { menuOpen = true }
+                // ⋮ 菜单此前只赋值 menuOpen 从未渲染（诊断导出因此不可达），v0.16.7 补上
+                Box {
+                    HeaderAction(Icons.Filled.MoreVert, "菜单") { menuOpen = true }
+                    DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                        DropdownMenuItem(
+                            text = { Text("导出诊断（当日 JSON）") },
+                            onClick = {
+                                menuOpen = false
+                                scope.launch {
+                                    statusText = "生成诊断…"
+                                    val json = withContext(Dispatchers.IO) {
+                                        runCatching { repo.diagnosticJson(selectedDay.toEpochDay()) }
+                                            .getOrElse { "export failed: $it" }
+                                    }
+                                    statusText = "就绪"
+                                    val send = Intent(Intent.ACTION_SEND).apply {
+                                        type = "text/plain"
+                                        putExtra(Intent.EXTRA_SUBJECT, "ScreenTime 诊断 $selectedDay")
+                                        putExtra(Intent.EXTRA_TEXT, json)
+                                    }
+                                    runCatching {
+                                        context.startActivity(Intent.createChooser(send, "导出诊断"))
+                                    }.onFailure {
+                                        Toast.makeText(context, "无法打开分享", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            }
+                        )
+                    }
+                }
             }
         }
 
@@ -546,9 +598,26 @@ fun UsageApp(
                     fontSize = 15.sp,
                     fontWeight = FontWeight.SemiBold
                 )
+                // 口径说明：拿起次数 = 解锁(KEYGUARD_HIDDEN)总数；下面的分项只统计
+                // “解锁后 15 秒内打开了某个应用”的那部分解锁——多数拿起停留在桌面，
+                // 所以分项之和远小于拿起总数是正常现象（v0.16.7 补充说明）
+                val unlockedTotal = unlockTop3.sumOf { it.count }
+                Text(
+                    if (unlockedTotal > 0) "其中 $unlockedTotal 次解锁后 15 秒内打开了应用，其余多为亮屏看桌面/通知"
+                    else "拿起 = 息屏后点亮屏幕的次数；多数拿起只停留在桌面，不打开应用",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
                 if (unlockTop3.isNotEmpty()) {
                     Spacer(Modifier.height(8.dp))
-                    unlockTop3.forEach { u ->
+                    Text(
+                        "解锁后首开 Top 3",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    unlockTop3.take(3).forEach { u ->
                         Row(
                             Modifier.fillMaxWidth().padding(vertical = 3.dp),
                             verticalAlignment = Alignment.CenterVertically
@@ -567,6 +636,12 @@ fun UsageApp(
         item(key = "battery") {
             Spacer(Modifier.height(12.dp))
             UsageCard(title = "电量去向（毫安时 · 估算）") {
+                Text(
+                    "口径：自上次充满电以来的估算，充电即重置；跨窗口时段可能缺失",
+                    fontSize = 10.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(6.dp))
                 if (batteryGlobal.isEmpty()) {
                     Text(
                         "耗电数据积累中",
@@ -591,7 +666,14 @@ fun UsageApp(
                                     )
                                 }
                                 Spacer(Modifier.width(8.dp))
-                                Text(String.format(Locale.US, "%.1f", g.mah), fontSize = 11.sp, modifier = Modifier.width(38.dp))
+                                // maxLines=1 防止 "340.6" 这类数值在 38dp 固定宽度里折成两行（v0.16.7）
+                                Text(
+                                    String.format(Locale.US, "%.1f", g.mah),
+                                    fontSize = 11.sp,
+                                    modifier = Modifier.width(44.dp),
+                                    maxLines = 1,
+                                    softWrap = false,
+                                )
                             }
                         }
                     }
@@ -918,13 +1000,33 @@ fun UsageApp(
                                 "耗电 " + String.format(Locale.US, "%.1f mAh", b.totalMah) + bgTxt,
                                 fontSize = 13.sp
                             )
+                        } else {
+                            // 系统确实记了但数值极小（如被冻结应用仅零星后台），如实展示而不是隐藏（v0.16.7）
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                "耗电 " + String.format(Locale.US, "%.2f mAh（可忽略）", b.totalMah),
+                                fontSize = 13.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
                         }
+                    }
+                    if (info.battery == null && (info.timeMs ?: 0L) > 0) {
+                        // 耗电统计窗口是「自上次充满电」，充电即重置；使用若发生在
+                        // 上次同步之后、充电重置之前，那部分耗电永久缺失
+                        // （实测：bilibili 17 点用 8.8 分钟，18:05 充电重置 → 数据丢失）（v0.16.7）
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "耗电：无记录（耗电统计自上次充满电起算，充电重置会丢失未被同步时段的估算）",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
                     Spacer(Modifier.height(8.dp))
                     if (appSessions.isEmpty()) {
                         Text("无会话明细（超过事件流保留期，仅保留每日总量）", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     } else {
-                        Text("打开 ${appSessions.size} 次", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                        val rounds = remember(appSessions) { mergeSessionRounds(appSessions) }
+                        Text("打开 ${rounds.size} 次", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                         Spacer(Modifier.height(4.dp))
                         val sessSum = appSessions.sumOf { it.endTs - it.startTs }
                         if (info.timeMs != null && info.timeMs - sessSum > 60_000) {
@@ -940,11 +1042,11 @@ fun UsageApp(
                                 .heightIn(max = 320.dp)
                                 .verticalScroll(rememberScrollState())
                         ) {
-                            appSessions.forEach { s ->
-                                val st = Instant.ofEpochMilli(s.startTs).atZone(ZoneId.systemDefault()).format(timeFmt)
-                                val en = Instant.ofEpochMilli(s.endTs).atZone(ZoneId.systemDefault()).format(timeFmt)
+                            rounds.forEach { (rs, re) ->
+                                val st = Instant.ofEpochMilli(rs).atZone(ZoneId.systemDefault()).format(timeFmt)
+                                val en = Instant.ofEpochMilli(re).atZone(ZoneId.systemDefault()).format(timeFmt)
                                 Text(
-                                    "$st – $en · ${formatShort(s.endTs - s.startTs)}",
+                                    "$st – $en · ${formatShort(re - rs)}",
                                     fontSize = 11.sp,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.padding(vertical = 2.dp)
@@ -1128,27 +1230,6 @@ fun HourlyChart(
                     Text(cat, fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
-        }
-    }
-}
-
-/** 环形图 */
-@Composable
-fun DonutChart(parts: List<Pair<String, Long>>, modifier: Modifier) {
-    val total = parts.sumOf { it.second }.coerceAtLeast(1)
-    Canvas(modifier) {
-        val stroke = 20.dp.toPx()
-        var start = -90f
-        for ((pkg, ms) in parts) {
-            val sweep = ms.toFloat() / total * 360f
-            drawArc(
-                color = appColor(pkg),
-                startAngle = start,
-                sweepAngle = sweep.coerceAtLeast(0.5f),
-                useCenter = false,
-                style = Stroke(stroke)
-            )
-            start += sweep
         }
     }
 }

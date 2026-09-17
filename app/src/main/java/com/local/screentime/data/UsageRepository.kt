@@ -8,6 +8,8 @@ import android.util.Log
 import androidx.room.withTransaction
 import com.topjohnwu.superuser.Shell
 import com.local.screentime.Notifications
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.Instant
@@ -28,7 +30,7 @@ sealed class SyncResult {
     ) : SyncResult()
 }
 
-data class AppDisplay(val label: String, val frozen: Boolean, val stateDesc: String?)
+data class AppDisplay(val label: String, val frozen: Boolean)
 
 data class UidPower(
     val uidKey: String,
@@ -36,7 +38,6 @@ data class UidPower(
     val fg: Double,
     val bg: Double,
     val comps: Map<String, Double>,
-    val durs: Map<String, Long>,
 )
 
 data class BatteryParsed(
@@ -71,17 +72,6 @@ class UsageRepository(private val context: Context) {
             context.packageManager.getPackageUid(pkg, 0)
         } catch (e: Exception) {
             -1
-        }
-    }
-
-    suspend fun weeklyTotals(): List<Pair<LocalDate, Long>> {
-        val zone = ZoneId.systemDefault()
-        val today = LocalDate.now(zone)
-        val monday = today.with(java.time.temporal.TemporalAdjusters.previousOrSame(java.time.DayOfWeek.MONDAY))
-        val sums = dao.sessionsSumsSince(monday.toEpochDay()).associate { it.day to it.totalMs }
-        return (0..6).map { i ->
-            val d = monday.plusDays(i.toLong())
-            d to (sums[d.toEpochDay()] ?: 0L)
         }
     }
 
@@ -173,8 +163,15 @@ class UsageRepository(private val context: Context) {
         return table.firstOrNull { p.contains(it.first) }?.second
     }
 
+    /** 同步互斥：UI 手动刷新与 WorkManager 6h 对账并发时，会话/耗电增量会双计或交错留脏数据 */
+    private val syncMutex = Mutex()
+
     suspend fun syncNow(): SyncResult {
         if (!reader.hasPermission()) return SyncResult.NoPermission
+        return syncMutex.withLock { syncNowLocked() }
+    }
+
+    private suspend fun syncNowLocked(): SyncResult {
         val now = System.currentTimeMillis()
 
         // 一次性修正：存量耗电行里系统 UID 被写上了共享包名，清空交给 systemUidLabel 命名
@@ -183,28 +180,7 @@ class UsageRepository(private val context: Context) {
             dao.putState(SyncStateEntity(KEY_SYSUID_FIX, 1))
         }
 
-        // 1) API 事件流：时间线尽力而为
-        val watermark = dao.getState(KEY_WATERMARK) ?: 0L
-        val windowStart = (watermark - OVERLAP_MS).coerceAtLeast(0L)
-        val events = reader.queryEvents(windowStart, now)
-        val sessions = buildSessions(events, windowStart, now)
-        db.withTransaction {
-            dao.deleteSessionsEndedAfter(windowStart)
-            if (sessions.isNotEmpty()) dao.insertSessions(sessions)
-            dao.putState(SyncStateEntity(KEY_WATERMARK, now))
-        }
-        runCatching { syncDayEventStats(events, ZoneId.systemDefault()) }
-        runCatching { dao.deleteUnlockLauncherRows() }
-        // 2) 一次性清理 usage_daily：ColorOS 的 API 日聚合是 ~16:40 锚点的滚动 24h 桶，
-        //    无法按自然日拆分，v0.16 起展示只认会话表，历史桶值全部作废
-        if (dao.getState(KEY_AGG_WIPED) == null) {
-            db.withTransaction {
-                dao.clearUsageDaily()
-                dao.putState(SyncStateEntity(KEY_AGG_WIPED, 1))
-            }
-        }
-
-        // 3) root 全量 + 耗电
+        // 1) root 全量 + 耗电（权威路径，见类头注释）
         var rootUsed = false
         try {
             if (Shell.isAppGrantedRoot() == true) {
@@ -215,10 +191,38 @@ class UsageRepository(private val context: Context) {
             Log.w(TAG, "root sync failed", e)
         }
 
+        // 2) API 事件流兜底：仅当 root 没拿到事件时才用它重建（ColorOS 会裁剪 queryEvents，
+        //    丢 PAUSED 事件会使会话跨息屏虚高；root 正常时绝不能让裁剪数据入库/覆盖）
+        val watermark = dao.getState(KEY_WATERMARK) ?: 0L
+        val windowStart = (watermark - OVERLAP_MS).coerceAtLeast(0L)
+        val events = if (rootUsed) emptyList() else reader.queryEvents(windowStart, now)
+        var sessionCount = 0
+        if (!rootUsed) {
+            val sessions = buildSessions(events, windowStart, now)
+            sessionCount = sessions.size
+            db.withTransaction {
+                dao.deleteSessionsEndedAfter(windowStart)
+                if (sessions.isNotEmpty()) dao.insertSessions(sessions)
+                dao.putState(SyncStateEntity(KEY_WATERMARK, now))
+            }
+            // day_stats/unlock_stats 是整行 REPLACE：API 事件残缺时算出的拿起/首开次数偏小，
+            // 只有 root 路径没拿到事件时才允许 API 兜底（v0.16.7）
+            runCatching { syncDayEventStats(events, ZoneId.systemDefault()) }
+        }
+        runCatching { dao.deleteUnlockLauncherRows() }
+        // 3) 一次性清理 usage_daily：ColorOS 的 API 日聚合是 ~16:40 锚点的滚动 24h 桶，
+        //    无法按自然日拆分，v0.16 起展示只认会话表，历史桶值全部作废
+        if (dao.getState(KEY_AGG_WIPED) == null) {
+            db.withTransaction {
+                dao.clearUsageDaily()
+                dao.putState(SyncStateEntity(KEY_AGG_WIPED, 1))
+            }
+        }
+
         refreshAppRegistry()
         runCatching { generateDueReports(force = false) }
-        Log.d(TAG, "sync: apiEvents=${events.size} sessions=${sessions.size} root=$rootUsed")
-        return SyncResult.Ok(windowStart, now, events.size, sessions.size, rootUsed)
+        Log.d(TAG, "sync: root=$rootUsed apiEvents=${events.size} fallbackSessions=$sessionCount")
+        return SyncResult.Ok(windowStart, now, events.size, sessionCount, rootUsed)
     }
 
     /** 展示用：会话表为主；usage_daily 若有历史自然日回补值（source=2，系统桶按会话分布切分）则逐包取较大值。
@@ -285,14 +289,14 @@ class UsageRepository(private val context: Context) {
                 false
             }
             when {
-                !ai.enabled -> AppDisplay(label, true, "已冻结")
-                suspended -> AppDisplay(label, true, "已冻结(挂起)")
-                else -> AppDisplay(label, false, null)
+                !ai.enabled -> AppDisplay(label, true)
+                suspended -> AppDisplay(label, true)
+                else -> AppDisplay(label, false)
             }
         } catch (e: PackageManager.NameNotFoundException) {
             // 包不可见（可见性过滤/已卸载）：回退到注册表快照
             val cached = dao.appInfo(packageName)
-            AppDisplay(cached?.label ?: packageName, true, "已卸载/不可见")
+            AppDisplay(cached?.label ?: packageName, true)
         }
     }
 
@@ -449,7 +453,13 @@ class UsageRepository(private val context: Context) {
             val prevComps = decodeComps(last?.compsText ?: "")
 
             fun compDelta(key: String): Double {
-                val nowV = u.comps[key] ?: 0.0
+                // fg/bg 在 dump 的 UID 行括号之外（“… fg: 25.1 bg: 1.04 (…)”），
+                // 不在 comps（括号内组件表）里 —— 此前误从 u.comps 取值恒得 0（v0.16.7 修复）
+                val nowV = when (key) {
+                    "fg" -> u.fg
+                    "bg" -> u.bg
+                    else -> u.comps[key] ?: 0.0
+                }
                 val prevV = if (last == null || reset) 0.0 else (prevComps[key] ?: 0.0)
                 return (nowV - prevV).coerceAtLeast(0.0)
             }
@@ -466,7 +476,9 @@ class UsageRepository(private val context: Context) {
                     updatedTs = now,
                 )
             )
-            if (totalDelta <= 0.01) continue
+            // 阈值从 0.01 收紧到 0.001：视频类应用一次亮屏几分钟的估算耗电可能只有几十 mAh，
+            // 但被冰箱冻结后仅剩零星后台增量，0.01 会把整段使用期之间的微小增量整段丢弃（v0.16.7）
+            if (totalDelta <= 0.001) continue
             val uid = uidOf(u.uidKey)
             val pkg = if (uid >= 10000) try {
                 pm.getPackagesForUid(uid)?.firstOrNull { !it.isNullOrBlank() }
@@ -717,15 +729,24 @@ class UsageRepository(private val context: Context) {
             "wakelock", "sensors", "mobile_radio", "ambient_display", "idle", "flashlight", "phone",
         )
 
-        fun uidKeyOf(uid: Int): String =
-            if (uid >= 10000) "u0a" + (uid - 10000) else uid.toString()
-
-        fun uidOf(uidKey: String): Int =
-            if (uidKey.startsWith("u0a")) {
-                10000 + (uidKey.removePrefix("u0a").toIntOrNull() ?: 0)
+        /** uid ↔ uidKey 支持多用户：ColorOS 分身/隐私空间是 u999a*（曾因只认 u0a 前缀，
+         *  分身应用的耗电行 packageName 恒为 null，UI 永远映射不到包）。 */
+        fun uidKeyOf(uid: Int): String {
+            val user = uid / 100_000
+            val appId = uid % 100_000
+            return if (appId >= 10000) {
+                if (user == 0) "u0a" + (appId - 10000) else "u${user}a" + (appId - 10000)
             } else {
-                uidKey.toIntOrNull() ?: 0
+                appId.toString()
             }
+        }
+
+        fun uidOf(uidKey: String): Int {
+            val m = Regex("""^u(\d+)a(\d+)$""").find(uidKey) ?: return uidKey.toIntOrNull() ?: 0
+            val user = m.groupValues[1].toIntOrNull() ?: 0
+            val idx = m.groupValues[2].toIntOrNull() ?: return 0
+            return user * 100_000 + 10_000 + idx
+        }
 
         fun encodeComps(comps: Map<String, Double>): String =
             comps.entries.joinToString("|") { "${it.key}=${it.value}" }
@@ -806,13 +827,11 @@ class UsageRepository(private val context: Context) {
                 val um = uidRe.find(line)
                 if (um != null) {
                     val comps = HashMap<String, Double>()
-                    val durs = HashMap<String, Long>()
                     val details = um.groupValues[6]
                     for (dm in detailRe.findAll(details)) {
                         val k = dm.groupValues[1]
                         val v = dm.groupValues[2].toDoubleOrNull() ?: continue
                         comps[k] = v
-                        dm.groupValues[3]?.let { durs[k] = parseDurationMs(it) }
                     }
                     uids.add(
                         UidPower(
@@ -821,7 +840,6 @@ class UsageRepository(private val context: Context) {
                             fg = um.groupValues[3].toDoubleOrNull() ?: 0.0,
                             bg = um.groupValues[4].toDoubleOrNull() ?: 0.0,
                             comps = comps,
-                            durs = durs,
                         )
                     )
                     continue
@@ -909,22 +927,6 @@ class UsageRepository(private val context: Context) {
             }
             out.sortBy { it.ts }
             return out
-        }
-
-        /** 解析 checkin 的按天聚合行：package=X totalTimeUsed=<ms> lastTimeUsed=<epoch>。
-         *  只匹配裸数字形式（In-memory 段是带引号的 HH:MM:SS，天然跳过）；
-         *  日期按 lastTimeUsed 归属（已用抖音周累计 383 分钟精确校验过）。 */
-        fun parseCheckinAggregates(lines: List<String>, zone: ZoneId): List<DailyUsageEntity> {
-            val re = Regex("""package=(\S+) totalTimeUsed=(\d+) lastTimeUsed=(\d+)""")
-            val rows = ArrayList<DailyUsageEntity>()
-            for (line in lines) {
-                val m = re.find(line) ?: continue
-                val ms = m.groupValues[2].toLong()
-                if (ms <= 0) continue
-                val day = Instant.ofEpochMilli(m.groupValues[3].toLong()).atZone(zone).toLocalDate().toEpochDay()
-                rows.add(DailyUsageEntity(m.groupValues[1], day, ms, SOURCE_ROOT))
-            }
-            return rows
         }
     }
 }

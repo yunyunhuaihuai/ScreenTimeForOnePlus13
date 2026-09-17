@@ -8,8 +8,6 @@ import androidx.room.Upsert
 
 data class DailyRow(val packageName: String, val day: Long, val totalMs: Long)
 
-data class DaySum(val day: Long, val totalMs: Long)
-
 @Dao
 interface UsageDao {
 
@@ -26,17 +24,8 @@ interface UsageDao {
     )
     suspend fun dailyUsage(day: Long): List<DailyRow>
 
-    @Query("SELECT COALESCE(SUM(endTs - startTs), 0) FROM sessions WHERE day = :day")
-    suspend fun dayTotalMs(day: Long): Long
-
     @Query("SELECT * FROM sessions WHERE day = :day ORDER BY startTs")
     suspend fun sessionsOfDay(day: Long): List<UsageSession>
-
-    @Query("SELECT MIN(startTs) FROM sessions")
-    suspend fun earliestSessionTs(): Long?
-
-    @Query("SELECT day, SUM(endTs - startTs) AS totalMs FROM sessions WHERE day >= :since GROUP BY day")
-    suspend fun sessionsSumsSince(since: Long): List<DaySum>
 
     @Query("SELECT COALESCE(SUM(endTs - startTs), 0) FROM sessions WHERE day BETWEEN :from AND :to")
     suspend fun sessionsSumBetween(from: Long, to: Long): Long
