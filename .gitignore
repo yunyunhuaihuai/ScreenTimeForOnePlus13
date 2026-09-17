@@ -1,0 +1,37 @@
+# --- Android / Gradle 构建产物 ---
+build/
+*/build/
+.gradle/
+.kotlin/
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+*.log
+
+# --- 本机专属配置（含 SDK 绝对路径，不要提交）---
+local.properties
+gradle.properties.local
+
+# --- IDE ---
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+
+# --- Agent 工作目录（含会话记忆、本机路径、设备信息）---
+.workbuddy/
+
+# --- 本机隐私副本（未脱敏文档）---
+*.local.md
+HANDOFF.local.md
+
+# --- 系统文件 ---
+.DS_Store
+Thumbs.db
+desktop.ini

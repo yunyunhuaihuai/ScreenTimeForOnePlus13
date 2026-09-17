@@ -1,0 +1,19 @@
+# 行尾规范化：仓库内统一存 LF，检出时按平台还原
+* text=auto
+
+# Windows 批处理必须是 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# shell 脚本必须保持 LF
+*.sh text eol=lf
+
+# 二进制文件不做行尾转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.apk binary
+*.jar binary
+*.keystore binary
+*.jks binary
