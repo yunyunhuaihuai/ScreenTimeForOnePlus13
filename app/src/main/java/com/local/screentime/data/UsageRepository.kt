@@ -202,9 +202,18 @@ class UsageRepository(private val context: Context) {
         }
 
         // 1) root 全量 + 耗电（权威路径，见类头注释）
+        //    getShell() 才会真正建立 su 通道：新进程首同步时 isAppGrantedRoot() 尚为 null
+        //    （unknown），会被误判为无 root 而降级到 API/DUMP 兜底（真机实测：冷启动首同步
+        //    恒降级、同进程第二次起才走 root，v0.16.10 修复）。这里同步等待 shell 建立后
+        //    读权威状态；su 不可用时 getShell() 返回非 root shell，isRoot=false 正常降级。
         var rootUsed = false
         try {
-            if (Shell.isAppGrantedRoot() == true) {
+            val rootOk = try {
+                Shell.getShell().isRoot
+            } catch (e: Exception) {
+                false
+            }
+            if (rootOk) {
                 rootUsed = syncViaRoot()
                 syncBattery(now)
             } else if (hasDumpAccess()) {

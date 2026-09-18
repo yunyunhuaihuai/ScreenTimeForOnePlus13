@@ -65,6 +65,14 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/debug/app-debug.apk
 - ~~诊断导出（菜单）~~：**实际不可达**——`UsageRepository.diagnosticJson(day)` 实现完整（当天会话+聚合+root/权限状态 JSON），但标题栏 ⋮ 按钮没有任何弹窗入口，属死代码。详见 4.0.7。
 - 应用名"屏幕时间"，自适应图标（蓝底白时钟+黄色弧）
 
+## 4.0.11 v0.16.10 变更（修复冷启动首同步恒降级：`isAppGrantedRoot()` 在 shell 建立前为 null）
+
+- **现象（0.16.9 真机部署时发现）**：冷启动（force-stop 后打开/进程被杀后重建）后的**第一次**同步恒走 API/DUMP 兜底（`rootUsed=false`），同进程第二次同步才走 root。装机当晚实测：首同步写水位线（API 兜底分支）、点刷新（同进程）立刻走 root。
+- **根因**：`MainActivity.LaunchedEffect` 里 `Shell.getShell()` warm-up 与 `sync()` 并发；`syncNowLocked` 的 `Shell.isAppGrantedRoot()` 在 su 通道尚未建立时返回 **null（unknown）**，`== true` 判 false → 降级。旧版进程存活期长，首同步之后一切正常，故从未暴露；0.16.9 部署当晚进程频繁重建才现形。
+- **修复**：root 检查改为 `Shell.getShell().isRoot`（同步等待 su 握手完成后读权威状态；su 不可用时 getShell() 返回非 root shell，自然降级，无副作用）。warm-up 保留（并行握手）。
+- **判别手法（可复用）**：root 路径不写 `event_watermark`（仅 API 兜底分支写）→ 对比 `battery_snapshot.updatedTs` 与水位线时间即可判定某次同步走了哪条路；点刷新按钮（真机坐标 ≈ 920,282，列表需先滑回顶部）可在同进程触发二次同步而不重建进程。
+- 部署当晚真机验证：root 路径与 DUMP 路径均解析出 **150 个 UID**（旧解析器只会得到 103 个），bilibili（u0a334，297mAh）与 u0a351（585mAh，含相机 417mAh 视频通话耗电）全额入库，跨午夜增量按 dayWeights 分摊（9-18/9-19 两行），昨日丢失的耗电按机制部分追回。
+
 ## 4.0.10 v0.16.9 变更（修复耗电"消失"根因：UID 行含 `fgs:` 字段被正则整行丢弃）
 
 **背景**：v0.16.7 曾把 bilibili 当天耗电缺失定性为「充电重置盲区」，v0.16.8 落地三层抢拍后用户仍反馈 bilibili 等应用耗电消失。2026-09-18 真机取证（DB + `dumpsys batterystats --charged` 对账）找到真正的根因——**解析层静默丢行**，三层抢拍同源致盲：
