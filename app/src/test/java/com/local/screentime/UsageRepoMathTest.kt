@@ -3,6 +3,7 @@ package com.local.screentime
 import com.local.screentime.data.UsageRepository
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.time.Instant
 import java.time.LocalDate
@@ -102,17 +103,34 @@ class UsageRepoMathTest {
     }
 
     @Test
-    fun staleSnapshotThenChargeReset_dropsDelta_documentation() {
-        // 语义钉死：v0.16.8 及之前 bilibili 丢失的机制 ——
-        // fgs 致盲使快照长期停在 20:58 的 0.0831mAh，当晚真实累计 ~247mAh；
-        // 夜里充电窗口重置后新值 ≈0.0005，reset 判定 (new < old-0.5) 不成立（旧快照本身就小），
-        // 差分为负被 coerceAtLeast(0) 丢弃 → 整晚耗电无法入库。
-        // 正则修复后快照每轮都会更新，此路径只影响 0.5mAh 以内的抖动，不再丢大额增量。
-        val lastCum = 0.0831
-        val afterReset = 0.0005
-        val reset = afterReset < lastCum - 0.5
-        val totalDelta = (afterReset - lastCum).coerceAtLeast(0.0)
+    fun rescaleDip_doesNotTriggerReset_ratioRule() {
+        // 语义钉死（v0.16.11 起的判据）：系统会对估算值整体重算/smeer（真机实测
+        // u0a330 9.9→9.67、u0a333 279→274，-1.8~-2.3%）。旧绝对值判据 (new < old-0.5)
+        // 把这种抖动误判成充电重置 → 全额累计被再记一遍（真机实测：抖音两天被记出
+        // 1143mAh，而窗口真实累计只有 274）。比例判据：跌幅过半才算重置。
+        val last = 279.0
+        val afterRescale = 274.0
+        val reset = afterRescale < last * 0.5
         assertFalse(reset)
-        assertEquals(0.0, totalDelta, 1e-12)
+    }
+
+    @Test
+    fun realChargeReset_firesUnderRatioRule() {
+        // 真实重置：新窗口起点接近 0，远小于旧累计的一半 → 判为 reset，
+        // totalDelta = 重置后的新值（新窗口的真实用量），不再依赖负差分
+        val last = 0.0831
+        val afterReset = 0.0005
+        val reset = afterReset < last * 0.5
+        assertTrue(reset)
+        val totalDelta = if (reset) afterReset else (afterReset - last).coerceAtLeast(0.0)
+        assertEquals(0.0005, totalDelta, 1e-12)
+    }
+
+    @Test
+    fun tinyValueRealReset_firesUnderRatioRule() {
+        // 小数值应用：last=0.02，重置后 0.0001 → 0.0001 < 0.01 判 reset ✓；
+        // 而 -5% 的重算抖动（0.019）不会误判
+        assertTrue(0.0001 < 0.02 * 0.5)
+        assertFalse(0.019 < 0.02 * 0.5)
     }
 }

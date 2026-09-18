@@ -1322,6 +1322,14 @@ private fun UsageRow(
                             fontSize = 10.sp,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
+                    } else {
+                        // 系统确实记了但数值很小（几秒的使用、后台零星），如实显示而不是
+                        // 静默隐藏——此前 <0.5 mAh 不渲染，用户看到的是“压根没有耗电”（v0.16.11）
+                        Text(
+                            String.format(Locale.US, "%.2f mAh", b.totalMah),
+                            fontSize = 10.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
                 }
             }

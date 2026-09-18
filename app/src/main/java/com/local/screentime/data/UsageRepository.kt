@@ -483,7 +483,12 @@ class UsageRepository(private val context: Context) {
         val rows = ArrayList<BatteryDailyEntity>()
         for (u in parsed.uids) {
             val last = dao.getBatterySnapshot(u.uidKey)
-            val reset = last != null && u.totalMah < last.cumMah - 0.5
+            // 重置判据用「比例」而不是绝对值：真实充电重置会把累计值打到接近 0，
+            // 而系统的估算值在两次 dump 之间会被整体重算/smeer（真机实测 u0a330 9.9→9.67、
+            // u0a333 279→274，-1.8~-2.3%）。旧判据 new < old-0.5 把这种抖动误判成重置，
+            // 全额累计被再记一遍（真机实测：抖音两天被记出 1143mAh，窗口真实只有 274）。
+            // 跌幅过半才认定重置；0.16.11 起生效。
+            val reset = last != null && u.totalMah < last.cumMah * 0.5
             val prevComps = decodeComps(last?.compsText ?: "")
 
             fun compDelta(key: String): Double {
@@ -551,7 +556,8 @@ class UsageRepository(private val context: Context) {
         // 全局组件：以模型估算总量为重置信号
         if (parsed.computedDrain > 0) {
             val gLast = dao.getBatterySnapshot(GLOBAL_SNAPSHOT_KEY)
-            val reset = gLast != null && parsed.computedDrain < gLast.cumMah - 0.5
+            // 同 UID 行：整机重算/校准也会让 computedDrain 小幅回落，比例判据防误判（v0.16.11）
+            val reset = gLast != null && parsed.computedDrain < gLast.cumMah * 0.5
             dao.putBatterySnapshot(
                 BatterySnapshotEntity(GLOBAL_SNAPSHOT_KEY, parsed.computedDrain, encodeComps(parsed.globals.mapValues { it.value.first }), now)
             )
