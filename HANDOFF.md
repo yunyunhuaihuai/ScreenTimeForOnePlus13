@@ -83,7 +83,13 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/debug/app-debug.apk
 - ⚠️ **插电接收器在此镜像上无法验证**：API 35 模拟器镜像系统性拦截 manifest 广播（`skipped by policy: Background execution not allowed`，连 Google Play 服务自己的接收器都被拦，前台/bucket=ACTIVE/appops allow 均无效）→ **待真机验证**（POWER_CONNECTED 是豁免广播，生产镜像对正常应用应无此限制）
 - 模拟器耗电数值 0.0000x mAh 量级低于 0.001 记录阈值，日聚合行不写入属正确防垃圾行为（真机 285mAh 量级无此问题）
 
-**真机部署（待手机连接）**
+**真机验证（OnePlus 13 / ColorOS，2026-09-18 16:26，端到端通过 ✅）**
+- v0.16.8 已装机（versionName=0.16.8 确认），root 全量同步正常
+- 用 `dumpsys battery unplug` → `set ac 1`（测后 `reset` 恢复）模拟拔插电：`dumpsys activity broadcasts` 派发记录显示 `#70 DELIVERED terminal +857ms com.local.screentime.PowerEventReceiver` —— **真机未被后台策略拦截**（与模拟器镜像行为相反）
+- 端到端证据：`battery_snapshot` 全部 223 行的 `updatedTs = 16:26:24.241`，与广播派发时刻（16:26:24.213）吻合 → 接收器触发 → dumpsys 解析 → 差分入库，整链路在插电瞬间完成
+- 排查手法沉淀：接收器触发的最硬证据看 **DB 时间戳**，logcat 缓冲区会被 ColorOS 海量日志快速轮转覆盖，不可靠
+
+**真机部署**
 - 直接安装即可，root 路径无需任何授权动作
 - 可选：`adb shell pm grant com.local.screentime android.permission.DUMP` + `pm grant android.permission.PACKAGE_USAGE_STATS`（debug 构建可授）启用无 root 备用通道
 
