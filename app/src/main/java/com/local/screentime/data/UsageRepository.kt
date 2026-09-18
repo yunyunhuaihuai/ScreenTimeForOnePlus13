@@ -576,34 +576,6 @@ class UsageRepository(private val context: Context) {
         return true
     }
 
-    /** 增量对应的观测区间起点：常规用上次快照时间；重置/首次用统计窗口起点（更贴近真实发生时间） */
-    private fun deltaFrom(lastTs: Long?, reset: Boolean, windowStartTs: Long?, now: Long): Long {
-        val w = windowStartTs ?: 0L
-        val validW = if (w in 1 until now) w else null
-        return when {
-            lastTs == null -> validW ?: now
-            reset -> maxOf(lastTs, validW ?: lastTs)
-            else -> lastTs
-        }
-    }
-
-    /** 把区间 [from,to] 按本地日重叠比例拆成 (epochDay, 权重)；from 非法时全归到 to 所在日 */
-    private fun dayWeights(from: Long, to: Long, zone: ZoneId): List<Pair<Long, Double>> {
-        val start = if (from in 1 until to) from else to
-        val end = if (to > start) to else start + 1
-        val total = (end - start).coerceAtLeast(1L)
-        val out = ArrayList<Pair<Long, Double>>(2)
-        var cursor = start
-        while (cursor < end) {
-            val date = Instant.ofEpochMilli(cursor).atZone(zone).toLocalDate()
-            val nextMidnight = date.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
-            val seg = (minOf(nextMidnight, end) - cursor).coerceAtLeast(1L)
-            out.add(date.toEpochDay() to seg.toDouble() / total)
-            cursor += seg
-        }
-        return out
-    }
-
     /** 拿起次数（KEYGUARD_HIDDEN 计数）与“解锁后 15 秒内首个应用”统计 */
     private suspend fun syncDayEventStats(events: List<RawEvent>, zone: ZoneId) {
         if (events.isEmpty()) return
@@ -806,6 +778,35 @@ class UsageRepository(private val context: Context) {
             return ms
         }
 
+        /** 增量对应的观测区间起点：常规用上次快照时间；重置/首次用统计窗口起点（更贴近真实发生时间）。
+         *  纯函数，移入 companion 以便 JVM 单测覆盖（v0.16.9）。 */
+        fun deltaFrom(lastTs: Long?, reset: Boolean, windowStartTs: Long?, now: Long): Long {
+            val w = windowStartTs ?: 0L
+            val validW = if (w in 1 until now) w else null
+            return when {
+                lastTs == null -> validW ?: now
+                reset -> maxOf(lastTs, validW ?: lastTs)
+                else -> lastTs
+            }
+        }
+
+        /** 把区间 [from,to] 按本地日重叠比例拆成 (epochDay, 权重)；from 非法时全归到 to 所在日 */
+        fun dayWeights(from: Long, to: Long, zone: ZoneId): List<Pair<Long, Double>> {
+            val start = if (from in 1 until to) from else to
+            val end = if (to > start) to else start + 1
+            val total = (end - start).coerceAtLeast(1L)
+            val out = ArrayList<Pair<Long, Double>>(2)
+            var cursor = start
+            while (cursor < end) {
+                val date = Instant.ofEpochMilli(cursor).atZone(zone).toLocalDate()
+                val nextMidnight = date.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
+                val seg = (minOf(nextMidnight, end) - cursor).coerceAtLeast(1L)
+                out.add(date.toEpochDay() to seg.toDouble() / total)
+                cursor += seg
+            }
+            return out
+        }
+
         /** 解析 batterystats 的 “Estimated power use (mAh)” 段 */
         fun parseBatteryPower(lines: List<String>): BatteryParsed {
             var inPower = false
@@ -817,9 +818,14 @@ class UsageRepository(private val context: Context) {
             // 统计窗口起点：本机 dump 形如 "  Start clock time: 2026-09-17-18-05-06"（本地时间）
             val windowRe = Regex("""Start clock time:\s*(\d{4})-(\d{2})-(\d{2})-(\d{2})-(\d{2})-(\d{2})""")
             val compRe = Regex("""^\s+([a-z_]+): ([0-9.]+)(?: apps: ([0-9.]+))?(?: duration: (.+))?\s*$""")
-            val uidRe = Regex(
-                """^\s*UID (\S+): ([0-9.]+)(?: fg: ([0-9.]+))?(?: bg: ([0-9.]+))?(?: cached: ([0-9.]+))?\s*\((.*)\)\s*$"""
-            )
+            // UID 行 total 之后、括号之前是可选标注字段序列（本机实测顺序 fg:/bg:/fgs:/cached:，
+            // 子集与顺序不保证）。旧正则只认 fg/bg/cached 三个，含 fgs:（前台服务耗电）的行
+            // 整行失配被静默丢弃 → bilibili 等前台服务应用的快照停更，夜间充电重置后差分变负
+            // 被丢，表现为“耗电消失”（v0.16.9 修复，附真机原始行回放测试 BatteryParseTest）。
+            // 因此把 total 后到 "(" 之间的标注序列整体捕获，再按 label 提取 fg/bg。
+            val uidRe = Regex("""^\s*UID (\S+): ([0-9.]+)([^()]*)\((.*)\)\s*$""")
+            val fgRe = Regex("""(?:^|\s)fg: ([0-9.]+)""")
+            val bgRe = Regex("""(?:^|\s)bg: ([0-9.]+)""")
             val drainRe = Regex("""Capacity:\s*[0-9.]+,\s*Computed drain:\s*([0-9.]+),\s*actual drain:\s*([0-9.]+)""")
             val detailRe = Regex("""(?:^|\s)([a-z_]+)=([0-9.]+)(?: \(([^)]*)\))?""")
             for (raw in lines) {
@@ -852,18 +858,19 @@ class UsageRepository(private val context: Context) {
                 val um = uidRe.find(line)
                 if (um != null) {
                     val comps = HashMap<String, Double>()
-                    val details = um.groupValues[6]
+                    val details = um.groupValues[4]
                     for (dm in detailRe.findAll(details)) {
                         val k = dm.groupValues[1]
                         val v = dm.groupValues[2].toDoubleOrNull() ?: continue
                         comps[k] = v
                     }
+                    val headerTags = um.groupValues[3]
                     uids.add(
                         UidPower(
                             uidKey = um.groupValues[1],
                             totalMah = um.groupValues[2].toDoubleOrNull() ?: 0.0,
-                            fg = um.groupValues[3].toDoubleOrNull() ?: 0.0,
-                            bg = um.groupValues[4].toDoubleOrNull() ?: 0.0,
+                            fg = fgRe.find(headerTags)?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0,
+                            bg = bgRe.find(headerTags)?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0,
                             comps = comps,
                         )
                     )

@@ -7,7 +7,7 @@
 一台一加 13（ColorOS 15）上用"冰箱"冻结应用后，**系统自带屏幕使用时间不再显示这些应用的时长**（展示层过滤）。本项目自建记录器：跨三层混合数据源重建完整的使用时长 + 耗电统计，**冻结应用照样显示**，并逐步加入 iOS 屏幕时间风格的可视化。
 
 - 目标设备：OnePlus 13（PJZ110），ColorOS 15 / Android 15（API 35），KernelSU root，屏幕 1440×3168
-- 包名：`com.local.screentime`，应用名“屏幕时间”，当前 v0.16.8（versionCode 24）
+- 包名：`com.local.screentime`，应用名“屏幕时间”，当前 v0.16.9（versionCode 25）
 - 工程：本仓库根目录；技术栈 Kotlin + Compose(M3) + Room + WorkManager + libsu，无 NDK
 - minSdk/targetSdk/compileSdk = 35；数据库 Room v3（destructive migration）
 
@@ -65,7 +65,29 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/debug/app-debug.apk
 - ~~诊断导出（菜单）~~：**实际不可达**——`UsageRepository.diagnosticJson(day)` 实现完整（当天会话+聚合+root/权限状态 JSON），但标题栏 ⋮ 按钮没有任何弹窗入口，属死代码。详见 4.0.7。
 - 应用名"屏幕时间"，自适应图标（蓝底白时钟+黄色弧）
 
+## 4.0.10 v0.16.9 变更（修复耗电"消失"根因：UID 行含 `fgs:` 字段被正则整行丢弃）
+
+**背景**：v0.16.7 曾把 bilibili 当天耗电缺失定性为「充电重置盲区」，v0.16.8 落地三层抢拍后用户仍反馈 bilibili 等应用耗电消失。2026-09-18 真机取证（DB + `dumpsys batterystats --charged` 对账）找到真正的根因——**解析层静默丢行**，三层抢拍同源致盲：
+
+- `parseBatteryPower` 的 UID 行正则只认 `fg:`/`bg:`/`cached:` 三个可选字段，而 dump 实际可输出 `fgs:`（前台服务耗电，位于 bg 与 cached 之间）：`UID u0a334: 247 fg: 28.8 bg: 132 fgs: 16.9 cached: 12.5 (…)` → 整行失配被静默丢弃。
+- 真机当前 dump 有 **46 个 UID 行含 `fgs:`**，与当轮（23:45）成功更新快照的 101 个 UID **交集为空**；每轮只更新 1~3 行的小轮次，更新的都是当时恰好没有前台服务的应用。当前窗口耗电第一的 u0a351（586mAh，fgs: 116）同样在丢弃之列。
+- 后果链：应用带前台服务期间（视频播放/下载/导航…）快照停更 → 真实累计持续增长而快照停在旧小值（bilibili 当晚停在 20:58 的 0.0831mAh，真实已 ~247mAh）→ 夜间充电窗口重置后新值 < 旧快照-0.5 不成立（旧快照本身就小，reset 误判 false）→ 差分为负被 `coerceAtLeast(0)` 丢弃 → 该段耗电永久丢失。
+- **v0.16.8 的三层抢拍（插电接收器/15 分钟采样/全量同步）共用同一解析器，全部同时致盲**——这就是 v0.16.8 之后问题仍在的原因。
+- 附带更正：4.0.8 的「bilibili=u0a182」取证结论有误。DB 里 u0a182 自 09-12 起一直是 `com.coloros.ocs.opencapabilityservice`；bilibili 实际是 u0a334，且其耗电行在 09-18 之前一条都不存在（而会话每天都有）——丢失是长期的，不是 09-17 一天。
+
+**修复**：
+- UID 正则改为把 total 之后到 `(` 之间的标注序列整体捕获（`([^()]*)`），再按 label 提取 fg/bg——对字段子集/顺序变化及未来新增字段稳健。
+- `deltaFrom`/`dayWeights` 移入 companion object（纯函数，行为不变），使 JVM 可单测；新增 `testImplementation junit`。
+- 新增单测：`BatteryParseTest`（真机 dump 原始行逐字节回放；修复前 3 用例失败=bug 钉死，修复后全过）+ `UsageRepoMathTest`（跨午夜/多天/重置/首次同步的日归属分摊 + 「快照过期+充电重置」丢失机制的语义钉死）。
+
+**验证（2026-09-18/19）**：
+- 单测 20/20 通过；`assembleDebug` 产物复核 versionCode=25/versionName=0.16.9。
+- 模拟器 e2e（OP13_API35，无 root 走 DUMP 兜底路径）：dump 中全部 9 个含 `fgs:` 的 UID 均入快照表（修复前为 0），第二轮差分连续无双计（增量低于 0.001 阈值被正确跳过），API 兜底会话 43 条入库，15min 采样 + 6h 对账双任务注册正常。
+- root 与 shell 的 `--charged` 输出格式一致（`fgs:` 字段两种格式都在），修复对两种格式同样生效。
+- **待真机验证**：装 0.16.9 后观察 bilibili/抖音等前台服务应用插电过夜后耗电是否留存；预期 u0a334/u0a351 等的快照每 15 分钟都刷新。
+
 ## 4.0.9 v0.16.8 变更（耗电自动存档：插电抢拍 + 15 分钟兜底采样，补齐「充电重置丢数据」盲区）
+
 
 **背景**：v0.16.7 取证定案——`batterystats --charged` 在充电开始时被系统重置，「上次同步～插电」段的估算耗电永久丢失（bilibili 8.8 分钟实测）。v0.16.8 让 app 自动在重置前把累计值存下来，日汇总不再缺段。
 

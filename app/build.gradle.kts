@@ -13,8 +13,8 @@ android {
         applicationId = "com.local.screentime"
         minSdk = 35
         targetSdk = 35
-        versionCode = 24
-        versionName = "0.16.8"
+        versionCode = 25
+        versionName = "0.16.9"
     }
 
     buildTypes {
@@ -52,4 +52,6 @@ dependencies {
 
     // root 数据源
     implementation("com.github.topjohnwu.libsu:core:5.2.2")
+
+    testImplementation("junit:junit:4.13.2")
 }
