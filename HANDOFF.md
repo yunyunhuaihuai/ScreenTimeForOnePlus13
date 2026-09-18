@@ -7,7 +7,7 @@
 一台一加 13（ColorOS 15）上用"冰箱"冻结应用后，**系统自带屏幕使用时间不再显示这些应用的时长**（展示层过滤）。本项目自建记录器：跨三层混合数据源重建完整的使用时长 + 耗电统计，**冻结应用照样显示**，并逐步加入 iOS 屏幕时间风格的可视化。
 
 - 目标设备：OnePlus 13（PJZ110），ColorOS 15 / Android 15（API 35），KernelSU root，屏幕 1440×3168
-- 包名：`com.local.screentime`，应用名“屏幕时间”，当前 v0.16.7（versionCode 23）
+- 包名：`com.local.screentime`，应用名“屏幕时间”，当前 v0.16.8（versionCode 24）
 - 工程：本仓库根目录；技术栈 Kotlin + Compose(M3) + Room + WorkManager + libsu，无 NDK
 - minSdk/targetSdk/compileSdk = 35；数据库 Room v3（destructive migration）
 
@@ -64,6 +64,28 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/debug/app-debug.apk
 - 每 6h WorkManager 后台对账；打开即先读本地库秒出、再后台同步（同步已去掉无用的 --checkin 解析，~1-2s）；Doze 白名单（root 自动添加）
 - ~~诊断导出（菜单）~~：**实际不可达**——`UsageRepository.diagnosticJson(day)` 实现完整（当天会话+聚合+root/权限状态 JSON），但标题栏 ⋮ 按钮没有任何弹窗入口，属死代码。详见 4.0.7。
 - 应用名"屏幕时间"，自适应图标（蓝底白时钟+黄色弧）
+
+## 4.0.9 v0.16.8 变更（耗电自动存档：插电抢拍 + 15 分钟兜底采样，补齐「充电重置丢数据」盲区）
+
+**背景**：v0.16.7 取证定案——`batterystats --charged` 在充电开始时被系统重置，「上次同步～插电」段的估算耗电永久丢失（bilibili 8.8 分钟实测）。v0.16.8 让 app 自动在重置前把累计值存下来，日汇总不再缺段。
+
+**实现（三层）**
+1. **插电瞬间抢拍**（`PowerEventReceiver`）：静态注册 `ACTION_POWER_CONNECTED`（隐式广播豁免清单内，重启后仍有效），插电时 `goAsync` + root/DUMP 通道立即读最终累计值、差分入库。与系统重置存在竞态：抢跑成功则零丢失；失败则读到重置后小值（差分逻辑自动识别重置，不产生脏数据）。
+2. **15 分钟兜底采样**（`BatteryCaptureWorker`）：WorkManager 周期任务只做耗电快照（毫秒级轻量，不做全量同步），把抢拍失败时的最大丢失窗口从 6h 压到 ≤15 分钟；高频差分同时让日归属更精确。
+3. **无 root 备用通道**：manifest 声明 `DUMP` 权限，`syncNow` 在 root 不可用但持有 DUMP 时也执行耗电采集。
+
+**关键发现（API 35 dumpsys 门槛）**：应用进程直接跑 `dumpsys batterystats --charged` 需要 **DUMP + PACKAGE_USAGE_STATS 两个权限**（后者 root 时被 su 绕过，一直没暴露）。debug 构建可 `adb shell pm grant` 双授权后走无 root 采集；release 无 root 时仍需 root 通道。
+
+**模拟器验证（OP13_API35，2026-09-18）**
+- ✅ 采集链路：应用侧 dumpsys → 解析（uids/globals/windowStart）→ 快照差分入库，三次采集快照持续累计
+- ✅ 两个周期任务注册正常（15min battery-capture + 6h usage-sync）
+- ✅ `syncNow` 无 root 时 DUMP 兜底采集生效
+- ⚠️ **插电接收器在此镜像上无法验证**：API 35 模拟器镜像系统性拦截 manifest 广播（`skipped by policy: Background execution not allowed`，连 Google Play 服务自己的接收器都被拦，前台/bucket=ACTIVE/appops allow 均无效）→ **待真机验证**（POWER_CONNECTED 是豁免广播，生产镜像对正常应用应无此限制）
+- 模拟器耗电数值 0.0000x mAh 量级低于 0.001 记录阈值，日聚合行不写入属正确防垃圾行为（真机 285mAh 量级无此问题）
+
+**真机部署（待手机连接）**
+- 直接安装即可，root 路径无需任何授权动作
+- 可选：`adb shell pm grant com.local.screentime android.permission.DUMP` + `pm grant android.permission.PACKAGE_USAGE_STATS`（debug 构建可授）启用无 root 备用通道
 
 ## 4.0.8 v0.16.7 变更（五项用户反馈修复：同步互斥/拿起口径/bilibili 耗电真相/⋮菜单/打开次数）
 

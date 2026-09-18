@@ -171,6 +171,27 @@ class UsageRepository(private val context: Context) {
         return syncMutex.withLock { syncNowLocked() }
     }
 
+    /**
+     * 轻量耗电快照采集：只跑 `dumpsys batterystats --charged` + 差分入库，不做全量同步。
+     * 调用方：插电瞬间接收器（PowerEventReceiver）与 15 分钟兜底采样（BatteryCaptureWorker），
+     * 目的是在系统充电重置前把累计值存下来，让「日汇总」不缺「上次同步～插电」段（v0.16.8）。
+     * root 或 DUMP 权限（adb 可授）任一可用即可；都不可用时 dumpsys 输出解析为空，返回 false。
+     */
+    suspend fun captureBatteryNow(): Boolean {
+        val ok = try {
+            syncBattery(System.currentTimeMillis())
+        } catch (e: Exception) {
+            Log.w(TAG, "captureBatteryNow failed", e)
+            false
+        }
+        if (!ok) Log.i(TAG, "capture: no data (root/DUMP 不可用或 dump 为空)")
+        return ok
+    }
+
+    private fun hasDumpAccess(): Boolean =
+        context.checkSelfPermission(android.Manifest.permission.DUMP) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+
     private suspend fun syncNowLocked(): SyncResult {
         val now = System.currentTimeMillis()
 
@@ -185,6 +206,10 @@ class UsageRepository(private val context: Context) {
         try {
             if (Shell.isAppGrantedRoot() == true) {
                 rootUsed = syncViaRoot()
+                syncBattery(now)
+            } else if (hasDumpAccess()) {
+                // 无 root 但持有 DUMP（debug 构建 adb 可授）：应用侧 dumpsys 采集耗电，
+                // 同样需要在系统充电重置前抢拍（v0.16.8）
                 syncBattery(now)
             }
         } catch (e: Exception) {

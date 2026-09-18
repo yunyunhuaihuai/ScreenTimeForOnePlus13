@@ -20,6 +20,13 @@
 
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- 耗电快照采集备用通道：DUMP 是 signature|development 型权限，
+         debug 构建可用 `adb shell pm grant com.local.screentime android.permission.DUMP`
+         授予（无需 root）。root 正常时用不到。 -->
+    <uses-permission
+        android:name="android.permission.DUMP"
+        tools:ignore="ProtectedPermissions" />
+
     <application
         android:name=".App"
         android:label="屏幕时间"
@@ -36,5 +43,16 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- 插电瞬间抢拍：系统在充电开始时即重置 batterystats「自上次充电」窗口，
+             接收器与系统抢跑，把重置前的最终累计值存进快照（v0.16.8）。
+             POWER_CONNECTED 属隐式广播豁免清单，可静态注册，重启后依然有效。 -->
+        <receiver
+            android:name=".PowerEventReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.ACTION_POWER_CONNECTED" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

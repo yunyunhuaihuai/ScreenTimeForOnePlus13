@@ -637,7 +637,7 @@ fun UsageApp(
             Spacer(Modifier.height(12.dp))
             UsageCard(title = "电量去向（毫安时 · 估算）") {
                 Text(
-                    "口径：自上次充满电以来的估算，充电即重置；跨窗口时段可能缺失",
+                    "口径：自上次充满电以来的估算；插电瞬间自动抢拍存档，日汇总不再缺充电前时段",
                     fontSize = 10.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )

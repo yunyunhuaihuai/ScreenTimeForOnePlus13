@@ -3,6 +3,7 @@ package com.local.screentime
 import android.app.Application
 import android.app.UiModeManager
 import android.content.Context
+import com.local.screentime.sync.BatteryCaptureWorker
 import com.local.screentime.sync.SyncWorker
 
 class App : Application() {
@@ -11,6 +12,7 @@ class App : Application() {
         applyAppNightMode(this)
         Notifications.ensureChannel(this)
         SyncWorker.ensureScheduled(this)
+        BatteryCaptureWorker.ensureScheduled(this)
     }
 
     companion object {
