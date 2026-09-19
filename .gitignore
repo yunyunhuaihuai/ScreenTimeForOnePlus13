@@ -39,4 +39,6 @@ desktop.ini
 # 测试截图/临时产物（真机 UI 回归）
 /*.png
 /*.jpg
+/*.db
+/*.xml
 /uitest/

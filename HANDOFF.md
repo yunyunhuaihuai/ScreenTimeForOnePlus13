@@ -7,7 +7,7 @@
 一台一加 13（ColorOS 15）上用"冰箱"冻结应用后，**系统自带屏幕使用时间不再显示这些应用的时长**（展示层过滤）。本项目自建记录器：跨三层混合数据源重建完整的使用时长 + 耗电统计，**冻结应用照样显示**，并逐步加入 iOS 屏幕时间风格的可视化。
 
 - 目标设备：OnePlus 13（PJZ110），ColorOS 15 / Android 15（API 35），KernelSU root，屏幕 1440×3168
-- 包名：`com.local.screentime`，应用名“屏幕时间”，当前 v0.16.9（versionCode 25）
+- 包名：`com.local.screentime`，应用名“屏幕时间”，当前 v0.16.12（versionCode 28）
 - 工程：本仓库根目录；技术栈 Kotlin + Compose(M3) + Room + WorkManager + libsu，无 NDK
 - minSdk/targetSdk/compileSdk = 35；数据库 Room v3（destructive migration）
 
@@ -64,6 +64,17 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/debug/app-debug.apk
 - 每 6h WorkManager 后台对账；打开即先读本地库秒出、再后台同步（同步已去掉无用的 --checkin 解析，~1-2s）；Doze 白名单（root 自动添加）
 - ~~诊断导出（菜单）~~：**实际不可达**——`UsageRepository.diagnosticJson(day)` 实现完整（当天会话+聚合+root/权限状态 JSON），但标题栏 ⋮ 按钮没有任何弹窗入口，属死代码。详见 4.0.7。
 - 应用名"屏幕时间"，自适应图标（蓝底白时钟+黄色弧）
+
+## 4.0.13 v0.16.12 变更（修复多用户导致拿起次数翻倍 + 息屏直入应用未计入）
+
+- **拿起翻倍（严重）**：`dumpsys usagestats` 在开启应用分身或多用户时会分段输出 `user=0` 与 `user=999`。系统级事件（如 `KEYGUARD_HIDDEN`）在每个用户下都会记录一份。旧版解析器未做用户分区过滤，两段事件被全量解析并按时间排序，导致**每次解锁产生两条同秒的 `KEYGUARD_HIDDEN`，拿起总次数直接翻倍**（例如真实拿起 117 次显示为 234 次，143 次显示为 286 次）。
+- **息屏直入应用漏记（严重）**：此前开发者误以为「拿起次数远大于解锁打开应用数」是因为「用户多数拿起停留在桌面/通知」。真机全量 dump 取证彻底推翻该假设：当用户在非桌面 App（微信/抖音/高德等）前台息屏后解锁时，系统直接恢复该 App，Android 在 `KEYGUARD_HIDDEN` 前后（`[-2s, 0s]`）发出 `ACTIVITY_RESUMED`。旧代码限定 `gap in 1..15_000`（严格大于 0ms），导致这类直入 App 时差 `<=0` 全部落空；且后续 15 秒内无新启动，多达 36.4%（真机 143 次样本中 52 次）的有效使用被误判为“仅看桌面”。
+- **修复**：
+  1. `parseDumpsysEvents` 增加 `user=` 分区过滤，仅保留 `user=0`（主用户）事件流，杜绝分身二次广播导致的拿起翻倍。
+  2. 提取纯函数 `computeDayEventStats` 放入 companion object；增加 `KEYGUARD_HIDDEN` 2000ms 防抖去重。
+  3. 解锁归属状态机升级：优先捕获解锁后 `(0, 15000]ms` 从桌面新启动的 App；若未新启动，回溯匹配 `[-2000, 0]ms` 伴随解锁恢复的前台非 Launcher App。真机 143 次解锁样本回放匹配率从 35% 提升至 91.6%（仅看桌面/通知仅 7 次，完全符合真实使用习惯）。
+  4. UI 副标题文案同步修正为「其中 X 次解锁后进入/打开了应用」。
+  5. 新增单测 `DayEventStatsTest`（涵盖用户隔离、拿起防抖、桌面启动、直入恢复、切应用优先级全场景）。
 
 ## 4.0.12 v0.16.11 变更（重置误判导致耗电成倍虚高 + 列表 <0.5mAh 静默不显示）
 

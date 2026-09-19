@@ -591,37 +591,13 @@ class UsageRepository(private val context: Context) {
         return true
     }
 
-    /** 拿起次数（KEYGUARD_HIDDEN 计数）与“解锁后 15 秒内首个应用”统计 */
+    /** 拿起次数（KEYGUARD_HIDDEN 计数）与“解锁后首开应用”统计 */
     private suspend fun syncDayEventStats(events: List<RawEvent>, zone: ZoneId) {
         if (events.isEmpty()) return
-        val pickups = HashMap<Long, Long>()
-        val unlockFirst = HashMap<Long, MutableMap<String, Long>>()
-        var lastUnlockTs = -1L
-        var lastUnlockDay = -1L
-        for (ev in events.sortedBy { it.ts }) {
-            val day = Instant.ofEpochMilli(ev.ts).atZone(zone).toLocalDate().toEpochDay()
-            when (ev.eventType) {
-                UsageEvents.Event.KEYGUARD_HIDDEN -> {
-                    lastUnlockTs = ev.ts
-                    lastUnlockDay = day
-                    pickups[day] = (pickups[day] ?: 0L) + 1
-                }
-                UsageEvents.Event.ACTIVITY_RESUMED -> {
-                    // 解锁后必然先回到桌面，桌面启动器不计入“解锁后首开”
-                    val isLauncher = ev.packageName.contains("launcher", ignoreCase = true)
-                    val gap = ev.ts - lastUnlockTs
-                    if (lastUnlockTs > 0 && gap in 1..15_000 && !isLauncher) {
-                        val d = if (lastUnlockDay >= 0) lastUnlockDay else day
-                        val m = unlockFirst.getOrPut(d) { mutableMapOf() }
-                        m[ev.packageName] = (m[ev.packageName] ?: 0L) + 1
-                        lastUnlockTs = -1L
-                    }
-                }
-            }
-        }
-        val statRows = pickups.map { (d, c) -> DayStatsEntity(d, c) }
+        val res = computeDayEventStats(events, zone)
+        val statRows = res.pickups.map { (d, c) -> DayStatsEntity(d, c) }
         if (statRows.isNotEmpty()) dao.upsertDayStats(statRows)
-        val unlockRows = unlockFirst.flatMap { (d, m) -> m.map { (p, c) -> UnlockStatsEntity(d, p, c) } }
+        val unlockRows = res.unlockFirst.flatMap { (d, m) -> m.map { (p, c) -> UnlockStatsEntity(d, p, c) } }
         if (unlockRows.isNotEmpty()) dao.upsertUnlockStats(unlockRows)
     }
 
@@ -957,12 +933,100 @@ class UsageRepository(private val context: Context) {
             return out
         }
 
+        data class DayEventStatsResult(
+            val pickups: Map<Long, Long>,
+            val unlockFirst: Map<Long, Map<String, Long>>
+        )
+
+        /**
+         * 纯函数：根据事件流计算每日拿起次数与解锁后应用统计。
+         * 1. 拿起防抖：连续 <= 2000ms 内的 KEYGUARD_HIDDEN 视为同一次解锁（防抖去重）。
+         * 2. 解锁应用匹配：
+         *    a. 优先捕获解锁后 (0, 15000] ms 内新启动的非 Launcher 应用（桌面启动场景）；
+         *    b. 若未新启动应用，回溯检查 [-2000, 0] ms 内伴随解锁恢复的前台非 Launcher 应用（直接解锁恢复场景）。
+         */
+        fun computeDayEventStats(events: List<RawEvent>, zone: ZoneId): DayEventStatsResult {
+            if (events.isEmpty()) return DayEventStatsResult(emptyMap(), emptyMap())
+            val sorted = events.sortedBy { it.ts }
+            val pickups = HashMap<Long, Long>()
+            val unlockFirst = HashMap<Long, MutableMap<String, Long>>()
+
+            // 1. 提取所有有效的解锁时刻（带 2000ms 防抖）
+            data class UnlockPoint(val index: Int, val ts: Long, val day: Long)
+            val unlockPoints = ArrayList<UnlockPoint>()
+            var lastUnlockTs = -10_000L
+
+            for (i in sorted.indices) {
+                val ev = sorted[i]
+                if (ev.eventType == UsageEvents.Event.KEYGUARD_HIDDEN) {
+                    if (ev.ts - lastUnlockTs > 2000L) {
+                        val day = Instant.ofEpochMilli(ev.ts).atZone(zone).toLocalDate().toEpochDay()
+                        unlockPoints.add(UnlockPoint(i, ev.ts, day))
+                        pickups[day] = (pickups[day] ?: 0L) + 1
+                        lastUnlockTs = ev.ts
+                    }
+                }
+            }
+
+            // 2. 为每个解锁点匹配对应的应用
+            for (up in unlockPoints) {
+                // a. 前向搜索：解锁后 (0, 15_000] ms 内首次 RESUMED 的非 Launcher 应用
+                var matchedPkg: String? = null
+                for (j in (up.index + 1) until sorted.size) {
+                    val ev = sorted[j]
+                    val gap = ev.ts - up.ts
+                    if (gap > 15_000L) break
+                    // 若中途发生另一次有效解锁（>2000ms），停止本轮前向搜索
+                    if (ev.eventType == UsageEvents.Event.KEYGUARD_HIDDEN && gap > 2000L) break
+                    if (ev.eventType == UsageEvents.Event.ACTIVITY_RESUMED) {
+                        val isLauncher = ev.packageName.contains("launcher", ignoreCase = true)
+                        if (!isLauncher) {
+                            matchedPkg = ev.packageName
+                            break
+                        }
+                    }
+                }
+
+                // b. 若未在前向找到（用户可能直接解锁回到之前正在使用的 App），回溯 [-2000, 0] ms
+                if (matchedPkg == null) {
+                    for (j in up.index downTo maxOf(0, up.index - 10)) {
+                        val ev = sorted[j]
+                        val gap = up.ts - ev.ts
+                        if (gap > 2000L) break
+                        if (ev.eventType == UsageEvents.Event.ACTIVITY_RESUMED) {
+                            val isLauncher = ev.packageName.contains("launcher", ignoreCase = true)
+                            if (!isLauncher) {
+                                matchedPkg = ev.packageName
+                                break
+                            }
+                        }
+                    }
+                }
+
+                if (matchedPkg != null) {
+                    val m = unlockFirst.getOrPut(up.day) { mutableMapOf() }
+                    m[matchedPkg] = (m[matchedPkg] ?: 0L) + 1
+                }
+            }
+
+            return DayEventStatsResult(pickups, unlockFirst)
+        }
+
         /** 解析 root dumpsys 的事件行：time="yyyy-MM-dd HH:mm:ss" type=X package=Y */
         fun parseDumpsysEvents(lines: List<String>, zone: ZoneId): List<RawEvent> {
             val fmt = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
             val re = Regex("""time="([^"]+)" type=([A-Z_]+) package=(\S+)""")
             val out = ArrayList<RawEvent>()
+            var isUser0 = true
             for (line in lines) {
+                val trimmed = line.trim()
+                if (trimmed.startsWith("user=")) {
+                    // dumpsys usagestats 按用户分段打印，user=999 等分身用户会产生重复的系统级事件
+                    // 仅提取主用户 (user=0) 的事件流，避免拿起次数翻倍
+                    isUser0 = (trimmed == "user=0")
+                    continue
+                }
+                if (!isUser0) continue
                 val m = re.find(line) ?: continue
                 val type = DUMP_EVENT_TYPES[m.groupValues[2]] ?: continue
                 val ts = try {

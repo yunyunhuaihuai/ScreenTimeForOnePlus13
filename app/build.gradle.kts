@@ -13,8 +13,8 @@ android {
         applicationId = "com.local.screentime"
         minSdk = 35
         targetSdk = 35
-        versionCode = 27
-        versionName = "0.16.11"
+        versionCode = 28
+        versionName = "0.16.12"
     }
 
     buildTypes {

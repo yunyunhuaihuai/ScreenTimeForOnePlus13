@@ -598,12 +598,11 @@ fun UsageApp(
                     fontSize = 15.sp,
                     fontWeight = FontWeight.SemiBold
                 )
-                // 口径说明：拿起次数 = 解锁(KEYGUARD_HIDDEN)总数；下面的分项只统计
-                // “解锁后 15 秒内打开了某个应用”的那部分解锁——多数拿起停留在桌面，
-                // 所以分项之和远小于拿起总数是正常现象（v0.16.7 补充说明）
+                // 口径说明：拿起次数 = 解锁(KEYGUARD_HIDDEN)总数（主用户 + 2s防抖）；
+                // 下面的分项统计解锁后直接进入或 15 秒内新打开的应用
                 val unlockedTotal = unlockTop3.sumOf { it.count }
                 Text(
-                    if (unlockedTotal > 0) "其中 $unlockedTotal 次解锁后 15 秒内打开了应用，其余多为亮屏看桌面/通知"
+                    if (unlockedTotal > 0) "其中 $unlockedTotal 次解锁后进入/打开了应用"
                     else "拿起 = 息屏后点亮屏幕的次数；多数拿起只停留在桌面，不打开应用",
                     fontSize = 11.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
