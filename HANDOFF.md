@@ -7,9 +7,9 @@
 一台一加 13（ColorOS 15）上用"冰箱"冻结应用后，**系统自带屏幕使用时间不再显示这些应用的时长**（展示层过滤）。本项目自建记录器：跨三层混合数据源重建完整的使用时长 + 耗电统计，**冻结应用照样显示**，并逐步加入 iOS 屏幕时间风格的可视化。
 
 - 目标设备：OnePlus 13（PJZ110），ColorOS 15 / Android 15（API 35），KernelSU root，屏幕 1440×3168
-- 包名：`com.local.screentime`，应用名“屏幕时间”，当前 v0.16.13（versionCode 29）
+- 包名：`com.local.screentime`，应用名“屏幕时间”，当前 v0.16.14（versionCode 30）
 - 工程：本仓库根目录；技术栈 Kotlin + Compose(M3) + Room + WorkManager + libsu，无 NDK
-- minSdk/targetSdk/compileSdk = 35；数据库 Room v3（destructive migration）
+- minSdk/targetSdk/compileSdk = 35；数据库 Room v5（包含平滑升级 MIGRATION_4_5）
 
 ## 2. 构建与部署
 
@@ -42,12 +42,12 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/release/app-release.apk
 展示策略：**事件重建值与聚合值逐包取 max**（`dailyRows()`）。
 耗时统计写入 `sessions` 表 + `usage_daily` 聚合表；耗电写入 `battery_daily` / `battery_global`（快照差分，充满清零自动检测：新值<旧值-0.5 即重置）。
 
-### 表结构（Room v3）
-- `sessions(pkg, startTs, endTs, day)` —— 会话（RESUMED/PAUSED 配对，跨午夜切分，<2s 碎片丢弃）
+### 表结构（Room v5）
+- `sessions(pkg, startTs, endTs, day)` —— 会话（RESUMED/PAUSED 配对，跨午夜切分，<2s 碎片丢弃；重建时按 startTs >= windowStart 清除，保留跨左边界的历史会话）
 - `usage_daily(pkg, day, totalMs, source[0事件/1聚合API/2root])` —— 每日每包时长
-- `battery_daily(uidKey, day, total/fg/bg/screen/cpu/audio/video/camera/gnss/wifi/bt/wakelock/sensors/other mAh)`
-- `battery_global(component, day, mah, durationMs)` —— 整机组件耗电（屏幕/CPU/蓝牙/音频/GNSS/息屏显示…）
-- `battery_snapshot(uidKey, cumMah, compsText, ts)` —— 差分基线
+- `battery_daily(uidKey, day, total/fg/bg/fgs/screen/cpu/audio/video/camera/gnss/wifi/bt/wakelock/sensors/other mAh)` —— 每日每 UID 耗电（v0.16.14 扩展 fgsMah 前台服务耗电）
+- `battery_global(component, day, mah, durationMs)` —— 整机组件耗电（屏幕/CPU/蓝牙/音频/GNSS/息屏显示…；durationMs 持续差分累加）
+- `battery_snapshot(uidKey, cumMah, compsText, ts)` —— 差分基线（含 `__global_drain__` 与 `__global_drain___dur`）
 - `app_info`（label/图标快照，冻结后仍可显示）、`sync_state`（事件水位线）
 
 ### 分类
@@ -68,6 +68,25 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/release/app-release.apk
 - 每 6h WorkManager 后台对账；打开即先读本地库秒出、再后台同步（同步已去掉无用的 --checkin 解析，~1-2s）；Doze 白名单（root 自动添加）
 - ~~诊断导出（菜单）~~：**实际不可达**——`UsageRepository.diagnosticJson(day)` 实现完整（当天会话+聚合+root/权限状态 JSON），但标题栏 ⋮ 按钮没有任何弹窗入口，属死代码。详见 4.0.7。
 - 应用名"屏幕时间"，自适应图标（蓝底白时钟+黄色弧）
+
+## 4.0.15 v0.16.14 变更（修复数据处理与统计口径错误，由 Gemini 修复）
+
+- **分身双开应用使用时长丢损（严重）**：
+  - **根因**：v0.16.12 为解决分身空间（`user=999`）系统事件导致拿起翻倍，在 `parseDumpsysEvents` 顶层增加了 `isUser0` 判断，粗暴丢弃了所有非主用户的行。导致用户在分身微信、分身淘宝等双开空间中的前台使用事件（`ACTIVITY_RESUMED` / `PAUSED`）被全量丢弃，分身应用使用时长和会话 100% 丢失。
+  - **修复**：事件流精细化过滤——仅针对系统广播类事件（`KEYGUARD_HIDDEN`、`SCREEN_INTERACTIVE`、`SCREEN_NON_INTERACTIVE`）过滤非 `user=0`（防止拿起翻倍与误切断会话）；应用级活跃事件保留全部用户空间，恢复分身微信等使用时长的正常统计。
+- **跨 24h 窗口左边界历史会话永久蒸发（严重）**：
+  - **根因**：`dumpsys usagestats` 仅保留最近 24 小时事件。旧版重算会话时执行 `DELETE FROM sessions WHERE endTs >= :start`。若某会话在 24h 起点前开始（如 `start - 10min`）、在起点后结束（`start + 5min`），该完整历史会话被直接从库中删除；但在新的 24h dump 中该应用只有 PAUSED 而缺失 RESUMED，导致其无法被重建。随着每日多次同步推进，滑动窗口左边缘的跨界会话被持续蚕食永久丢失。
+  - **修复**：在 `UsageDao` 中新增 `deleteSessionsStartingAfter(fromTs)`（`WHERE startTs >= :fromTs`），非 root 和 root 路径均改用该方法清除重算会话，确保起点在窗口之外的跨界历史会话完整保留。
+- **整机组件使用时长（`battery_global.durationMs`）永久冻结（中度）**：
+  - **根因**：`grow.add(BatteryGlobalEntity(..., durationMs = if (ex == null) pair.second else ex.durationMs))`，当当天数据库已有记录（`ex != null`）后，`durationMs` 永远被写回旧值，导致屏幕开启时长、相机时长在清晨首轮同步后全天永久冻结不再更新。
+  - **修复**：引入全局组件时长的差分快照（`GLOBAL_SNAPSHOT_KEY + "_dur"`），每次同步计算当期时长增量 `durDelta`，按日重叠权重加权累加更新，使整机硬件时长持续精准增长。
+- **前台服务耗电（`fgs`）被完全抛弃（中度）**：
+  - **根因**：Android 12+ 将前台服务耗电单列为 `fgs: xxx`。旧代码未提取该字段且 `BatteryDailyEntity` 表中缺失 `fgsMah`。导致听歌（网易云/QQ音乐）、导航（高德）、视频后台播放等大头耗电凭空消失，UI 详情弹窗中前台+后台远小于总耗电，后台占比严重失真。
+  - **修复**：在 `BatteryDailyEntity` 中扩展 `fgsMah` 字段；`AppDatabase` 升级到 Version 5 并提供平滑迁移 `MIGRATION_4_5`（`ALTER TABLE battery_daily ADD COLUMN fgsMah REAL NOT NULL DEFAULT 0.0`，无损保留所有历史数据）；在 `parseBatteryPower` 中采集 `fgs` 差分累加；UI 弹窗中清晰展示 `（前台 X / 前台服务 Y / 后台 Z）`。
+- **周期报表与首页统计口径脱节（中度）**：
+  - **根因**：首页时长采用 `dailyRows` 逐包取 `maxOf(sessions, usage_daily)` 兼容系统回补数据；而周报/月报的 `buildReportText` 直接查询 `sessionsSumBetween` 与 `topSessionsBetween`，仅查 `sessions` 表，导致包含历史回补期的周报/月报总时长比首页每日累加值少 30%~50%。
+  - **修复**：`buildReportText` 重构为复用 `dailyRows(day)` 逐日聚合总时长与 Top 5 应用，保证周报、月报汇总数据与用户在首页每日看到的数据 100% 严格一致、自洽。
+- **分支与部署**：独立分支 `fix/data-calculation-and-metrics-by-gemini`（commit `5840cbb`）；单元测试 25/25 全过；Release 优化包（v0.16.14，versionCode 30）已通过 adb 安装至真机（OnePlus 13，`e4e1b43e`），Room 数据库平滑升级至 v5。
 
 ## 4.0.14 v0.16.13 变更（短期与中期性能优化 + 工程化 Wrapper + Release 构建）
 
