@@ -7,23 +7,27 @@
 一台一加 13（ColorOS 15）上用"冰箱"冻结应用后，**系统自带屏幕使用时间不再显示这些应用的时长**（展示层过滤）。本项目自建记录器：跨三层混合数据源重建完整的使用时长 + 耗电统计，**冻结应用照样显示**，并逐步加入 iOS 屏幕时间风格的可视化。
 
 - 目标设备：OnePlus 13（PJZ110），ColorOS 15 / Android 15（API 35），KernelSU root，屏幕 1440×3168
-- 包名：`com.local.screentime`，应用名“屏幕时间”，当前 v0.16.12（versionCode 28）
+- 包名：`com.local.screentime`，应用名“屏幕时间”，当前 v0.16.13（versionCode 29）
 - 工程：本仓库根目录；技术栈 Kotlin + Compose(M3) + Room + WorkManager + libsu，无 NDK
 - minSdk/targetSdk/compileSdk = 35；数据库 Room v3（destructive migration）
 
 ## 2. 构建与部署
 
 ```bash
-# 工具链版本：JDK 21 / Gradle 8.9 / AGP 8.7.3 / Kotlin 2.0.21 / Compose BOM 2024.10.01
+# 工具链版本：JDK 21 / Gradle 8.9 (Wrapper) / AGP 8.7.3 / Kotlin 2.0.21 / Compose BOM 2024.10.01
 export JAVA_HOME="<JDK 21 安装路径>"
-export GRADLE_USER_HOME="<Gradle 缓存目录>"
-"<Gradle 8.9 安装路径>/bin/gradle.bat" -p "<本仓库根目录>" --console=plain :app:assembleDebug
+# 调试构建：
+./gradlew :app:assembleDebug
 adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/debug/app-debug.apk
+
+# 正式优化构建（推荐，运行更流畅）：
+./gradlew :app:assembleRelease
+adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/release/app-release.apk
 ```
-- 无 wrapper，直接用本机 Gradle 8.9 安装路径（见上）
+- 已内置 Gradle 8.9 Wrapper（`gradlew` / `gradlew.bat`），无需再硬编码本机 Gradle 绝对路径
 - 真机 adb 序列号由机主本机记录（`adb devices` 查询）；模拟器 AVD `OP13_API35`（google_apis，可 `adb root`，**用于回归测试**）
 - ColorOS 安装需要"USB 安装"开关（已开）；`adb shell appops set` 被 ColorOS 拒绝（shell 无 MANAGE_APP_OPS_MODES）
-- ⚠️ **升完版本号必须重新构建 + 复核产物版本**：产物版本只以 `app/build/outputs/apk/debug/output-metadata.json`（或 `adb shell dumpsys package com.local.screentime`）为准，`build.gradle.kts` 改完不重建就会打出旧版本号的包（曾踩，详见 4.0.7）
+- ⚠️ **升完版本号必须重新构建 + 复核产物版本**：产物版本只以 `output-metadata.json`（或 `adb shell dumpsys package com.local.screentime`）为准，`build.gradle.kts` 改完不重建就会打出旧版本号的包（曾踩，详见 4.0.7）
 
 ## 3. 架构：三层数据源（核心设计）
 
@@ -64,6 +68,15 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/debug/app-debug.apk
 - 每 6h WorkManager 后台对账；打开即先读本地库秒出、再后台同步（同步已去掉无用的 --checkin 解析，~1-2s）；Doze 白名单（root 自动添加）
 - ~~诊断导出（菜单）~~：**实际不可达**——`UsageRepository.diagnosticJson(day)` 实现完整（当天会话+聚合+root/权限状态 JSON），但标题栏 ⋮ 按钮没有任何弹窗入口，属死代码。详见 4.0.7。
 - 应用名"屏幕时间"，自适应图标（蓝底白时钟+黄色弧）
+
+## 4.0.14 v0.16.13 变更（短期与中期性能优化 + 工程化 Wrapper + Release 构建）
+
+- **手势重组掉帧消除**：移除 `HomeScreen` 顶层的 `dragTotal` Compose State，改为 `pointerInput(Unit)` 内部局部变量累加，彻底消除左右滑动时每一像素都触发整页重组调度的卡顿。
+- **快速切日防竞态**：`loadDayAsync()` 增加 `loadJob?.cancel()` 机制与目标日期双向核验，防止快速连续切日时慢请求乱序覆盖最新日期的数据。
+- **小时图计算缓存**：`HourlyChart` 24 小时区间循环及分类统计增加 `remember(sessions, categories, dayStart)`，避免组件频繁重组时重复循环与数组分配。
+- **耗电排行后台 App 解析完善**：`displays` 加载逻辑由原先仅读取 `rows` 扩展至合并 `batteryAll` 中出现的全部包名；“仅有后台耗电而无屏幕会话”的应用不再降级显示为原始英文包名，完整展示中文名称与图标；预构建 `rowsMap` 将排行行时长的匹配开销从 $O(N \times M)$ 压至 $O(1)$。
+- **工程化 Gradle Wrapper**：正式生成并入库标准 Gradle 8.9 Wrapper（`gradlew` / `gradlew.bat`），消除对外部硬编码绝对路径的依赖。
+- **Release 构建与签名支持**：`build.gradle.kts` 配置 release signingConfig（使用兼容签名通道），正式打出 `app-release.apk` 优化包，真机 Compose 运行更加流畅。
 
 ## 4.0.13 v0.16.12 变更（修复多用户导致拿起次数翻倍 + 息屏直入应用未计入）
 
@@ -324,24 +337,28 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/debug/app-debug.apk
 11. **耗电统计是"窗口口径"，不是"自然日口径"**：`dumpsys batterystats --charged` = 「自上次充电以来」，起点不是当天 0 点、可跨午夜甚至跨多天 → 任何「按今天」的聚合都必须按窗口时间轴分摊（v0.16.6 已修，见 4.0.6）。且各组件耗电全是**模型估算**：`组件 mAh = 该组件计时器时长 × power_profile.xml 里的固定电流常数`；相机的"计时器"= **相机子系统被占用时长**，所以**视频通话、扫码、前后台取景都会计入「相机」**，不只是拍照。
 12. 真机取证的两个环境坑（调试时必踩）：ColorOS **不把三方 App 的 `Log.d` 写进 logcat 缓冲区**；拉数据库必须用 `adb exec-out`（用 `adb shell cat` 会被 CRLF 破坏成 `database disk image is malformed`）。详见 4.0.7。
 
-## 6. 已知问题 / 待办（2026-09-17 更新）
+## 6. 已知问题 / 待办（2026-09-19 更新）
 
-### 确认存在、待修（大致按性价比排序）
-1. **标题栏 ⋮ 按钮无响应** —— `menuOpen` 只赋值不渲染弹窗，导致「诊断导出」不可达（v0.16.6 真机已复现，取证见 4.0.7）。修法已明确、工作量小，建议下一版直接做。
-2. **`syncNow()` 无 Mutex** —— UI 手动刷新与 6h WorkManager 对账可能并发，耗电增量会**双计**。
-3. **`dragTotal` 用 Compose state 做手势累加** —— 拖动（左右滑切日）时整棵树重组，是滚动卡顿来源之一。
-4. **`loadDayAsync()` 无取消机制** —— 快速连续切日可能乱序覆盖，显示到错误的日期数据。
-5. **`day_stats` / `unlock_stats` 用 REPLACE 写"当前窗口"计数** —— root 不可用时会偏小。
-6. **`battery_global` 同行内口径不一致** —— `mah` 是累加值，`durationMs` 只在当天首次插入时写一次（目前 UI 未展示 duration）。若日后要展示"相机开启时长"，需把 duration 也改成增量累加。
-7. **Room `fallbackToDestructiveMigration()` + `exportSchema=false`** —— 任何表结构变更都会**清空历史数据**，改表前务必先导出。
-8. **死代码清单** —— `weeklyTotals()` / `dao.sessionsSumsSince()`、`DonutChart()`、`parseCheckinAggregates()`、`dao.earliestSessionTs()`、`dao.dayTotalMs()`、`AppDisplay.stateDesc`、`UidPower.durs`、`UsageRepository.diagnosticJson()`（最后这个接上菜单即可复活）。
-9. **[建议] release 签名包** —— debug 包是滚动卡顿的主因之一。
-10. CSV/JSON 导出到下载目录；Gradle wrapper；速览插件专项（需欢太账号 + 个人开发者认证申请 Card 权限）。
-11. **文档整理** —— 本文件 4.x 章节编号有重复与乱序（`4.2` 出现 3 次，`4.9/4.10/4.11/4.12` 排序颠倒），且"v0.13.0 及更早"的内容在两节里近乎重复；建议下次顺一遍（只动标题与去重，不改内容）。
+### 待办 / 后续建议（大致按优先级排序）
+1. **`battery_global` durationMs 增量累加** —— 目前 `mah` 累加但 `durationMs` 只在当天首次插入时写一次；若后续要展示“整机组件（相机/屏幕/音频等）开启时长”，需把 duration 也按增量累加。
+2. **Room `fallbackToDestructiveMigration()` + `exportSchema=false`** —— 表结构修改时需提供显式 Migration，防范改表清库；建议后续增加“导出/备份数据库到下载目录”功能。
+3. **架构重构与文件拆分** —— `MainActivity.kt` 约 1350 行，建议后续拆分出 `HomeViewModel` 并将各个弹窗（DetailDialog、SettingsDialog 等）与图表提取至独立的 UI 组件文件。
+4. **速览插件专项** —— 需欢太账号 + 个人开发者认证申请 Card 权限。
 
-### 已澄清 / 已过期的旧待办
-- 原「[待确认] 真机上小时图分类颜色 + 拖动看每小时构成没实现」**与第 4 节功能列表冲突**：小时柱自 v0.11.0 起已实现"按分类堆叠 + 点柱子弹出该小时构成与明细"（用 24 个透明点按格覆盖解手势失效）。v0.16.5 真机回归时小时图渲染正常，但**未单独测过"点柱子"这条路**，若仍有问题请按新 bug 重开。
-- 手动改分类后小时图立即变色已实现（categories 状态即时更新）；排行里新增应用需重新进入当日。
+### 近期已解决项
+- ✅ **手势重组卡顿**（v0.16.13）：移除 `dragTotal` Compose State，改为 `pointerInput` 内部局部变量累加。
+- ✅ **切日异步竞态**（v0.16.13）：`loadDayAsync()` 增加 Job 取消机制与目标日期双向核验。
+- ✅ **小时图重绘性能**（v0.16.13）：`HourlyChart` 24 小时区间循环增加 `remember` 缓存。
+- ✅ **后台耗电 App 名称显示**（v0.16.13）：`displays` 预加载合并 `batteryAll` 全部包名；$O(1)$ 映射时长。
+- ✅ **工程化 Gradle Wrapper**（v0.16.13）：生成并入库标准 Gradle 8.9 Wrapper。
+- ✅ **Release 优化包构建**（v0.16.13）：配置 release signingConfig，支持 `./gradlew :app:assembleRelease`。
+- ✅ **分身多用户导致拿起次数翻倍**（v0.16.12）：`parseDumpsysEvents` 过滤 `user=999`，增加 2s 防抖。
+- ✅ **息屏直入应用漏记**（v0.16.12）：解锁归属状态机支持回溯捕获 `[-2s, 0s]` 直接恢复的前台 App。
+- ✅ **重置误判虚高 & 小耗电隐藏**（v0.16.11）：重置判据改比例（`< 0.5 * old`），补齐 `<0.5mAh` 格式化。
+- ✅ **冷启动首同步 root 降级**（v0.16.10）：改用 `Shell.getShell().isRoot` 同步等待 su 握手。
+- ✅ **UID 行含 fgs 耗电消失**（v0.16.9）：UID 行正则重构，全额捕获前台服务耗电。
+- ✅ **同步并发双计**（v0.16.7）：`syncNow` 加协程 Mutex 锁。
+- ✅ **标题栏 ⋮ 菜单无响应**（v0.16.7）：接通 DropdownMenu 并支持当日诊断 JSON 导出。
 
 ## 7. 验证命令速查
 

@@ -13,13 +13,14 @@ android {
         applicationId = "com.local.screentime"
         minSdk = 35
         targetSdk = 35
-        versionCode = 28
-        versionName = "0.16.12"
+        versionCode = 29
+        versionName = "0.16.13"
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
     compileOptions {

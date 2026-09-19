@@ -109,6 +109,7 @@ import com.local.screentime.data.UsageRepository
 import com.local.screentime.data.UsageSession
 import com.topjohnwu.superuser.Shell
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.time.Instant
@@ -322,7 +323,6 @@ fun UsageApp(
     val listState = rememberLazyListState()
     val textMeasurer = rememberTextMeasurer()
     val appPrefs = remember { context.getSharedPreferences("settings", Context.MODE_PRIVATE) }
-    var dragTotal by remember { mutableStateOf(0f) }
     val defaultOrder = listOf("hourly", "pickup", "battery", "apps")
     var moduleOrder by remember {
         val saved = appPrefs.getString("module_order", null)?.split(",")?.filter { it in defaultOrder }
@@ -366,40 +366,48 @@ fun UsageApp(
     var syncing by remember { mutableStateOf(false) }
     val notifPerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
-    val displays by produceState<Map<String, AppDisplay>>(emptyMap(), rows) {
+    val allPackages = remember(rows, batteryAll) {
+        (rows.map { it.packageName } + batteryAll.mapNotNull { it.packageName }).distinct()
+    }
+    val displays by produceState<Map<String, AppDisplay>>(emptyMap(), allPackages) {
         value = withContext(Dispatchers.IO) {
-            rows.associate { it.packageName to repo.resolveDisplay(it.packageName) }
+            allPackages.associateWith { repo.resolveDisplay(it) }
         }
     }
 
+    var loadJob by remember { mutableStateOf<Job?>(null) }
+
     fun loadDayAsync() {
-        scope.launch {
-            val day = selectedDay.toEpochDay()
+        val targetDay = selectedDay.toEpochDay()
+        loadJob?.cancel()
+        loadJob = scope.launch {
             val d = withContext(Dispatchers.IO) {
-                val r = repo.dailyRows(day)
+                val r = repo.dailyRows(targetDay)
                 DayLoad(
                     rows = r,
-                    total = repo.dayTotalMs(day),
-                    sessions = repo.sessionsOfDay(day),
+                    total = repo.dayTotalMs(targetDay),
+                    sessions = repo.sessionsOfDay(targetDay),
                     categories = r.associate { it.packageName to repo.categoryOf(it.packageName) },
-                    battery = repo.batteryForPackages(day, r.map { it.packageName }),
-                    batteryAll = repo.batteryDailyRows(day),
-                    batteryGlobal = repo.batteryGlobalRows(day),
-                    dayStats = repo.dayStats(day),
-                    unlockTop = repo.unlockTop(day, 100),
+                    battery = repo.batteryForPackages(targetDay, r.map { it.packageName }),
+                    batteryAll = repo.batteryDailyRows(targetDay),
+                    batteryGlobal = repo.batteryGlobalRows(targetDay),
+                    dayStats = repo.dayStats(targetDay),
+                    unlockTop = repo.unlockTop(targetDay, 100),
                     reports = repo.latestReports(),
                 )
             }
-            rows = d.rows
-            dayTotal = d.total
-            sessions = d.sessions
-            categories = d.categories
-            batteryByPkg = d.battery
-            batteryAll = d.batteryAll
-            batteryGlobal = d.batteryGlobal
-            dayStats = d.dayStats
-            unlockTop3 = d.unlockTop
-            reportsList = d.reports
+            if (selectedDay.toEpochDay() == targetDay) {
+                rows = d.rows
+                dayTotal = d.total
+                sessions = d.sessions
+                categories = d.categories
+                batteryByPkg = d.battery
+                batteryAll = d.batteryAll
+                batteryGlobal = d.batteryGlobal
+                dayStats = d.dayStats
+                unlockTop3 = d.unlockTop
+                reportsList = d.reports
+            }
         }
     }
 
@@ -444,7 +452,8 @@ fun UsageApp(
     }
     val weekday = selectedDay.dayOfWeek.getDisplayName(JavaTextStyle.SHORT, Locale.CHINESE)
 
-    val displayRows: List<UiRowInfo> = remember(rows, batteryAll, displays, batteryByPkg, sortByBattery) {
+    val rowsMap = remember(rows) { rows.associate { it.packageName to it.totalMs } }
+    val displayRows: List<UiRowInfo> = remember(rows, batteryAll, displays, batteryByPkg, sortByBattery, rowsMap) {
         buildList {
             if (sortByBattery) {
                 batteryAll.sortedByDescending { it.totalMah }.forEach { b ->
@@ -459,7 +468,7 @@ fun UsageApp(
                             key = if (pkg != null) pkg else "uid:" + b.uidKey,
                             packageName = pkg,
                             label = label,
-                            timeMs = pkg?.let { p -> rows.firstOrNull { it.packageName == p }?.totalMs },
+                            timeMs = pkg?.let { rowsMap[it] },
                             battery = b,
                             frozen = disp?.frozen ?: false,
                         )
@@ -490,6 +499,7 @@ fun UsageApp(
             .safeDrawingPadding()
             .padding(horizontal = 16.dp)
             .pointerInput(Unit) {
+                var dragTotal = 0f
                 detectHorizontalDragGestures(
                     onDragStart = { dragTotal = 0f },
                     onHorizontalDrag = { change, amount ->
@@ -1132,28 +1142,41 @@ fun HourlyChart(
         Instant.ofEpochMilli(it.startTs).atZone(zone).toLocalDate()
     } ?: return
     val dayStart = day.atStartOfDay(zone).toInstant().toEpochMilli()
-    val perCat = HashMap<String, LongArray>()
-    val catTotals = HashMap<String, Long>()
-    for (s in sessions) {
-        val cat = categories[s.packageName] ?: "其他"
-        val arr = perCat.getOrPut(cat) { LongArray(24) }
-        for (h in 0 until 24) {
-            val hs = dayStart + h * 3_600_000L
-            val he = hs + 3_600_000L
-            val ov = minOf(s.endTs, he) - maxOf(s.startTs, hs)
-            if (ov > 0) {
-                arr[h] += ov
-                catTotals[cat] = (catTotals[cat] ?: 0L) + ov
+    data class ChartCalculation(
+        val perCat: Map<String, LongArray>,
+        val catsSorted: List<String>,
+        val niceMin: Long,
+        val niceMs: Long,
+    )
+    val calc = remember(sessions, categories, dayStart) {
+        val perCat = HashMap<String, LongArray>()
+        val catTotals = HashMap<String, Long>()
+        for (s in sessions) {
+            val cat = categories[s.packageName] ?: "其他"
+            val arr = perCat.getOrPut(cat) { LongArray(24) }
+            for (h in 0 until 24) {
+                val hs = dayStart + h * 3_600_000L
+                val he = hs + 3_600_000L
+                val ov = minOf(s.endTs, he) - maxOf(s.startTs, hs)
+                if (ov > 0) {
+                    arr[h] += ov
+                    catTotals[cat] = (catTotals[cat] ?: 0L) + ov
+                }
             }
         }
+        // “其他”固定最后
+        val base = catTotals.entries.filter { it.value > 0 }.sortedByDescending { it.value }.map { it.key }
+        val catsSorted = base.filter { it != "其他" } + base.filter { it == "其他" }
+        val maxMs = LongArray(24) { h -> perCat.values.sumOf { it[h] } }.maxOrNull() ?: 0L
+        val maxMin = maxMs / 60000
+        val niceMin = (if (maxMin <= 30) 30 else ((maxMin + 29) / 30) * 30).coerceAtLeast(30)
+        val niceMs = niceMin * 60_000L
+        ChartCalculation(perCat, catsSorted, niceMin, niceMs)
     }
-    // “其他”固定最后
-    val base = catTotals.entries.filter { it.value > 0 }.sortedByDescending { it.value }.map { it.key }
-    val catsSorted = base.filter { it != "其他" } + base.filter { it == "其他" }
-    val maxMs = LongArray(24) { h -> perCat.values.sumOf { it[h] } }.max()
-    val maxMin = maxMs / 60000
-    val niceMin = (if (maxMin <= 30) 30 else ((maxMin + 29) / 30) * 30).coerceAtLeast(30)
-    val niceMs = niceMin * 60_000L
+    val perCat = calc.perCat
+    val catsSorted = calc.catsSorted
+    val niceMin = calc.niceMin
+    val niceMs = calc.niceMs
     val labelColor = if (dark) Color(0xFFB8BCC2) else MaterialTheme.colorScheme.onSurfaceVariant
     val gridColor = if (dark) Color(0x2AFFFFFF) else Color(0x26000000)
 
