@@ -86,6 +86,7 @@ data class BatteryDailyEntity(
     val totalMah: Double,
     val fgMah: Double,
     val bgMah: Double,
+    val fgsMah: Double = 0.0,
     val screenMah: Double,
     val cpuMah: Double,
     val audioMah: Double,

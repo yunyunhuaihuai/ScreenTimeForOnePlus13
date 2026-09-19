@@ -30,6 +30,7 @@ class BatteryParseTest {
         assertEquals(247.0, u!!.totalMah, 1e-9)
         assertEquals(28.8, u.fg, 1e-9)
         assertEquals(132.0, u.bg, 1e-9)
+        assertEquals(16.9, u.fgs, 1e-9)
         assertEquals(34.5, u.comps["screen"]!!, 1e-9)
         assertEquals(170.0, u.comps["cpu"]!!, 1e-9)
         assertEquals(18.5, u.comps["audio"]!!, 1e-9)
@@ -46,6 +47,7 @@ class BatteryParseTest {
         assertEquals(0.0431, u!!.totalMah, 1e-9)
         assertEquals(0.0, u.fg, 1e-12)
         assertEquals(0.0000610, u.bg, 1e-12)
+        assertEquals(0.00135, u.fgs, 1e-9)
         assertEquals(0.0431, u.comps["cpu"]!!, 1e-9)
     }
 
@@ -57,6 +59,7 @@ class BatteryParseTest {
         assertEquals(586.0, u!!.totalMah, 1e-9)
         assertEquals(151.0, u.fg, 1e-9)
         assertEquals(12.9, u.bg, 1e-9)
+        assertEquals(116.0, u.fgs, 1e-9)
     }
 
     @Test

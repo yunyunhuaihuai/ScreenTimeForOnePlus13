@@ -14,7 +14,11 @@ interface UsageDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertSessions(sessions: List<UsageSession>)
 
-    /** 重算窗口前先删掉窗口内的旧会话（endTs 落在窗口内的都会被重建） */
+    /** 重算窗口前先删掉窗口内启动的旧会话（避免删掉在窗口外开始但在窗口内结束的跨界历史会话） */
+    @Query("DELETE FROM sessions WHERE startTs >= :fromTs")
+    suspend fun deleteSessionsStartingAfter(fromTs: Long)
+
+    @Deprecated("Use deleteSessionsStartingAfter to prevent trimming boundary sessions")
     @Query("DELETE FROM sessions WHERE endTs >= :fromTs")
     suspend fun deleteSessionsEndedAfter(fromTs: Long)
 

@@ -46,6 +46,28 @@ class DayEventStatsTest {
     }
 
     @Test
+    fun parseDumpsysEvents_user999AppEventsKept_systemEventsFiltered() {
+        val lines = listOf(
+            "user=0",
+            """time="2026-09-19 10:00:00" type=KEYGUARD_HIDDEN package=android flags=0x0""",
+            """time="2026-09-19 10:00:02" type=ACTIVITY_RESUMED package=com.tencent.mm flags=0x0""",
+            "user=999",
+            """time="2026-09-19 10:00:00" type=KEYGUARD_HIDDEN package=android flags=0x0""",
+            """time="2026-09-19 10:00:01" type=SCREEN_INTERACTIVE package=android flags=0x0""",
+            """time="2026-09-19 10:05:00" type=ACTIVITY_RESUMED package=com.tencent.mm flags=0x0""",
+            """time="2026-09-19 10:10:00" type=ACTIVITY_PAUSED package=com.tencent.mm flags=0x0"""
+        )
+        val events = UsageRepository.parseDumpsysEvents(lines, zone)
+        // 应该有 4 条：user=0 的 KEYGUARD_HIDDEN 和 RESUMED；user=999 的 RESUMED 和 PAUSED。
+        // user=999 的 KEYGUARD_HIDDEN 和 SCREEN_INTERACTIVE 被过滤
+        assertEquals(4, events.size)
+        assertEquals(UsageEvents.Event.KEYGUARD_HIDDEN, events[0].eventType)
+        assertEquals(UsageEvents.Event.ACTIVITY_RESUMED, events[1].eventType)
+        assertEquals(UsageEvents.Event.ACTIVITY_RESUMED, events[2].eventType)
+        assertEquals(UsageEvents.Event.ACTIVITY_PAUSED, events[3].eventType)
+    }
+
+    @Test
     fun keyguardHidden_debouncesWithin2Seconds() {
         val events = listOf(
             RawEvent(ms(10, 0, 0), UsageEvents.Event.KEYGUARD_HIDDEN, "android"),

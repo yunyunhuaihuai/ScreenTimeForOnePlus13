@@ -37,6 +37,7 @@ data class UidPower(
     val totalMah: Double,
     val fg: Double,
     val bg: Double,
+    val fgs: Double = 0.0,
     val comps: Map<String, Double>,
 )
 
@@ -235,7 +236,7 @@ class UsageRepository(private val context: Context) {
             val sessions = buildSessions(events, windowStart, now)
             sessionCount = sessions.size
             db.withTransaction {
-                dao.deleteSessionsEndedAfter(windowStart)
+                dao.deleteSessionsStartingAfter(windowStart)
                 if (sessions.isNotEmpty()) dao.insertSessions(sessions)
                 dao.putState(SyncStateEntity(KEY_WATERMARK, now))
             }
@@ -452,7 +453,7 @@ class UsageRepository(private val context: Context) {
             val end = events.maxOf { it.ts }
             val sessions = buildSessions(events, start, end)
             db.withTransaction {
-                dao.deleteSessionsEndedAfter(start)
+                dao.deleteSessionsStartingAfter(start)
                 if (sessions.isNotEmpty()) dao.insertSessions(sessions)
             }
             runCatching { syncDayEventStats(events, zone) }
@@ -497,6 +498,7 @@ class UsageRepository(private val context: Context) {
                 val nowV = when (key) {
                     "fg" -> u.fg
                     "bg" -> u.bg
+                    "fgs" -> u.fgs
                     else -> u.comps[key] ?: 0.0
                 }
                 val prevV = if (last == null || reset) 0.0 else (prevComps[key] ?: 0.0)
@@ -511,7 +513,7 @@ class UsageRepository(private val context: Context) {
                 BatterySnapshotEntity(
                     uidKey = u.uidKey,
                     cumMah = u.totalMah,
-                    compsText = encodeComps(u.comps + mapOf("fg" to u.fg, "bg" to u.bg)),
+                    compsText = encodeComps(u.comps + mapOf("fg" to u.fg, "bg" to u.bg, "fgs" to u.fgs)),
                     updatedTs = now,
                 )
             )
@@ -534,6 +536,7 @@ class UsageRepository(private val context: Context) {
                         totalMah = (ex?.totalMah ?: 0.0) + totalDelta * w,
                         fgMah = (ex?.fgMah ?: 0.0) + compDelta("fg") * w,
                         bgMah = (ex?.bgMah ?: 0.0) + compDelta("bg") * w,
+                        fgsMah = (ex?.fgsMah ?: 0.0) + compDelta("fgs") * w,
                         screenMah = (ex?.screenMah ?: 0.0) + compDelta("screen") * w,
                         cpuMah = (ex?.cpuMah ?: 0.0) + compDelta("cpu") * w,
                         audioMah = (ex?.audioMah ?: 0.0) + compDelta("audio") * w,
@@ -561,14 +564,27 @@ class UsageRepository(private val context: Context) {
             dao.putBatterySnapshot(
                 BatterySnapshotEntity(GLOBAL_SNAPSHOT_KEY, parsed.computedDrain, encodeComps(parsed.globals.mapValues { it.value.first }), now)
             )
+            val gLastDur = dao.getBatterySnapshot(GLOBAL_SNAPSHOT_KEY + "_dur")
+            dao.putBatterySnapshot(
+                BatterySnapshotEntity(
+                    GLOBAL_SNAPSHOT_KEY + "_dur",
+                    parsed.globals.values.sumOf { it.second.toDouble() },
+                    encodeComps(parsed.globals.mapValues { it.value.second.toDouble() }),
+                    now,
+                )
+            )
             val prevComps = decodeComps(gLast?.compsText ?: "")
+            val prevDurComps = decodeComps(gLastDur?.compsText ?: "")
             val grow = ArrayList<BatteryGlobalEntity>()
             val weights = dayWeights(deltaFrom(gLast?.updatedTs, reset, parsed.windowStartTs, now), now, zone)
             for ((comp, pair) in parsed.globals) {
                 val nowV = pair.first
                 val prevV = if (gLast == null || reset) 0.0 else (prevComps[comp] ?: 0.0)
                 val delta = (nowV - prevV).coerceAtLeast(0.0)
-                if (delta <= 0.01) continue
+                val nowDur = pair.second
+                val prevDur = if (gLastDur == null || reset) 0L else (prevDurComps[comp]?.toLong() ?: 0L)
+                val durDelta = (nowDur - prevDur).coerceAtLeast(0L)
+                if (delta <= 0.01 && durDelta <= 0L) continue
                 for ((day, w) in weights) {
                     val ex = dao.getBatteryGlobal(comp, day)
                     grow.add(
@@ -576,7 +592,7 @@ class UsageRepository(private val context: Context) {
                             component = comp,
                             day = day,
                             mah = (ex?.mah ?: 0.0) + delta * w,
-                            durationMs = if (ex == null) pair.second else ex.durationMs,
+                            durationMs = (ex?.durationMs ?: 0L) + (durDelta * w).toLong(),
                         )
                     )
                 }
@@ -660,13 +676,29 @@ class UsageRepository(private val context: Context) {
         val from = p.start.toEpochDay()
         val to = p.end.toEpochDay()
         val days = p.start.datesUntil(p.end.plusDays(1)).count().toInt().coerceAtLeast(1)
-        val total = dao.sessionsSumBetween(from, to)
+        val pkgSums = HashMap<String, Long>()
+        var total = 0L
+        for (d in from..to) {
+            for (r in dailyRows(d)) {
+                pkgSums[r.packageName] = (pkgSums[r.packageName] ?: 0L) + r.totalMs
+                total += r.totalMs
+            }
+        }
+        val top = pkgSums.entries
+            .sortedByDescending { it.value }
+            .take(5)
+            .map { DailyRow(it.key, 0L, it.value) }
         val pickups = dao.pickupsBetween(from, to)
         val battery = dao.batteryBetween(from, to)
-        val top = dao.topSessionsBetween(from, to, 5)
         val prevTo = from - 1
         val prevFrom = prevTo - days + 1
-        val prevTop = dao.topSessionsBetween(prevFrom, prevTo, 100).associate { it.packageName to it.totalMs }
+        val prevPkgSums = HashMap<String, Long>()
+        for (d in prevFrom..prevTo) {
+            for (r in dailyRows(d)) {
+                prevPkgSums[r.packageName] = (prevPkgSums[r.packageName] ?: 0L) + r.totalMs
+            }
+        }
+        val prevTop = prevPkgSums
         val pm = context.packageManager
         val sb = StringBuilder()
         sb.appendLine("期间：${p.start} ~ ${p.end}（$days 天）")
@@ -817,6 +849,7 @@ class UsageRepository(private val context: Context) {
             val uidRe = Regex("""^\s*UID (\S+): ([0-9.]+)([^()]*)\((.*)\)\s*$""")
             val fgRe = Regex("""(?:^|\s)fg: ([0-9.]+)""")
             val bgRe = Regex("""(?:^|\s)bg: ([0-9.]+)""")
+            val fgsRe = Regex("""(?:^|\s)fgs: ([0-9.]+)""")
             val drainRe = Regex("""Capacity:\s*[0-9.]+,\s*Computed drain:\s*([0-9.]+),\s*actual drain:\s*([0-9.]+)""")
             val detailRe = Regex("""(?:^|\s)([a-z_]+)=([0-9.]+)(?: \(([^)]*)\))?""")
             for (raw in lines) {
@@ -862,6 +895,7 @@ class UsageRepository(private val context: Context) {
                             totalMah = um.groupValues[2].toDoubleOrNull() ?: 0.0,
                             fg = fgRe.find(headerTags)?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0,
                             bg = bgRe.find(headerTags)?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0,
+                            fgs = fgsRe.find(headerTags)?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0,
                             comps = comps,
                         )
                     )
@@ -1021,14 +1055,21 @@ class UsageRepository(private val context: Context) {
             for (line in lines) {
                 val trimmed = line.trim()
                 if (trimmed.startsWith("user=")) {
-                    // dumpsys usagestats 按用户分段打印，user=999 等分身用户会产生重复的系统级事件
-                    // 仅提取主用户 (user=0) 的事件流，避免拿起次数翻倍
+                    // dumpsys usagestats 按用户分段打印，形如 "user=0" 或 "user=999"
                     isUser0 = (trimmed == "user=0")
                     continue
                 }
-                if (!isUser0) continue
                 val m = re.find(line) ?: continue
                 val type = DUMP_EVENT_TYPES[m.groupValues[2]] ?: continue
+
+                // 锁屏/亮屏等系统级状态由系统按用户广播，user=999 等分身用户会产生重复事件导致拿起次数翻倍与切断会话，仅提取主用户 (user=0)；
+                // 应用级事件（RESUMED/PAUSED/STOPPED）属于用户实际操作，保留分身用户以统计双开应用时长
+                if (!isUser0 && (type == UsageEvents.Event.KEYGUARD_HIDDEN ||
+                        type == UsageEvents.Event.SCREEN_INTERACTIVE ||
+                        type == UsageEvents.Event.SCREEN_NON_INTERACTIVE)) {
+                    continue
+                }
+
                 val ts = try {
                     LocalDateTime.parse(m.groupValues[1], fmt).atZone(zone).toInstant().toEpochMilli()
                 } catch (e: Exception) {

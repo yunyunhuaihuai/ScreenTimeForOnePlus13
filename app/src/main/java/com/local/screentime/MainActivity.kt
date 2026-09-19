@@ -1003,8 +1003,13 @@ fun UsageApp(
                     info.battery?.let { b ->
                         if (b.totalMah >= 0.5) {
                             Spacer(Modifier.height(4.dp))
-                            val bgTxt = if (b.bgMah > 0.5)
-                                String.format(Locale.US, "（前台 %.1f / 后台 %.1f）", b.fgMah, b.bgMah) else ""
+                            val bgTxt = if (b.fgsMah > 0.5 || b.bgMah > 0.5) {
+                                if (b.fgsMah > 0.5) {
+                                    String.format(Locale.US, "（前台 %.1f / 前台服务 %.1f / 后台 %.1f）", b.fgMah, b.fgsMah, b.bgMah)
+                                } else {
+                                    String.format(Locale.US, "（前台 %.1f / 后台 %.1f）", b.fgMah, b.bgMah)
+                                }
+                            } else ""
                             Text(
                                 "耗电 " + String.format(Locale.US, "%.1f mAh", b.totalMah) + bgTxt,
                                 fontSize = 13.sp
