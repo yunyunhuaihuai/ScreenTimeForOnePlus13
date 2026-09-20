@@ -474,7 +474,10 @@ fun UsageApp(
                         ?: "系统进程"
                     add(
                         UiRowInfo(
-                            key = if (pkg != null) pkg else "uid:" + b.uidKey,
+                            // 必须用 uidKey：分身(u999a*)与主体(u0a*)等多 UID 可映射同一包名
+                            // （实测 09-19 android.ext.services 同日两行），用包名做 key
+                            // 会撞 LazyColumn 重复键，切耗电排序直接闪退（v0.16.15 崩溃修复）
+                            key = "uid:" + b.uidKey,
                             packageName = pkg,
                             label = label,
                             timeMs = pkg?.let { rowsMap[it] },
