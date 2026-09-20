@@ -1,7 +1,5 @@
 package com.local.screentime
 
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
@@ -92,11 +90,11 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.collection.LruCache
 import androidx.core.graphics.createBitmap
+import androidx.core.content.ContextCompat
 import com.local.screentime.data.AppDisplay
 import com.local.screentime.data.BatteryDailyEntity
 import com.local.screentime.data.BatteryGlobalEntity
@@ -144,6 +142,7 @@ private val CAT_COLORS = mapOf(
     "生活服务" to Color(0xFFFFD60A),
     "效率" to Color(0xFF98989D),
     "系统" to Color(0xFF98989D),
+    "图像" to Color(0xFF5AC8FA),
     "其他" to Color(0xFFC7C7CC),
 )
 
@@ -361,7 +360,8 @@ fun UsageApp(
     var showNotifs by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
     var menuOpen by remember { mutableStateOf(false) }
-    var hasPermission by remember { mutableStateOf(false) }
+    // 初值直接查 AppOps：此前固定 false，首帧会闪一下“缺少权限”文案
+    var hasPermission by remember { mutableStateOf(repo.hasPermission()) }
     var statusText by remember { mutableStateOf("就绪") }
     var syncing by remember { mutableStateOf(false) }
     val notifPerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
@@ -416,16 +416,20 @@ fun UsageApp(
         scope.launch {
             syncing = true
             statusText = "同步中…"
-            val result = withContext(Dispatchers.IO) { repo.syncNow() }
-            hasPermission = repo.hasPermission()
-            statusText = when (result) {
-                is SyncResult.Ok ->
-                    "上次同步 " + LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm")) +
-                        " · " + result.sessionCount + " 段会话" + if (result.rootUsed) " · root 全量" else ""
-                SyncResult.NoPermission -> "缺少“使用情况访问”权限"
+            try {
+                val result = withContext(Dispatchers.IO) { repo.syncNow() }
+                hasPermission = withContext(Dispatchers.IO) { repo.hasPermission() }
+                statusText = when (result) {
+                    is SyncResult.Ok ->
+                        "上次同步 " + LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm")) +
+                            " · " + result.sessionCount + " 段会话" + if (result.rootUsed) " · root 全量" else ""
+                    SyncResult.NoPermission -> "缺少“使用情况访问”权限"
+                }
+                loadDayAsync()
+            } finally {
+                // 此前无 finally：syncNow 意外抛异常会让 syncing 永为 true，刷新图标永久转圈
+                syncing = false
             }
-            loadDayAsync()
-            syncing = false
         }
     }
 
@@ -433,7 +437,12 @@ fun UsageApp(
         launch {
             withContext(Dispatchers.IO) { runCatching { Shell.getShell() } }
         }
-        notifPerm.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        // 已授权时不再重复发起请求（反复 launch 只会拿到无谓的拒绝回调）
+        if (ContextCompat.checkSelfPermission(context, android.Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            notifPerm.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
         loadDayAsync()   // 先秒出本地已存数据
         sync()           // 再后台对账，完成后自动刷新界面
     }
@@ -589,159 +598,17 @@ fun UsageApp(
             Text(formatMinutes(dayTotal), fontSize = 34.sp, fontWeight = FontWeight.Bold)
         }
 
-        item(key = "hourly") {
-            Spacer(Modifier.height(12.dp))
-            UsageCard {
-                if (sessions.isEmpty()) {
-                    Text("暂无数据", fontSize = 12.sp, modifier = Modifier.padding(vertical = 20.dp))
-                } else {
-                    HourlyChart(sessions, zone, categories, textMeasurer, dark)
-                }
-            }
-        }
-
-        if (dayStats != null || unlockTop3.isNotEmpty()) item(key = "pickup") {
-            Spacer(Modifier.height(12.dp))
-            UsageCard {
-                Text(
-                    "拿起 ${dayStats?.pickups ?: 0} 次",
-                    fontSize = 15.sp,
-                    fontWeight = FontWeight.SemiBold
-                )
-                // 口径说明：拿起次数 = 解锁(KEYGUARD_HIDDEN)总数（主用户 + 2s防抖）；
-                // 下面的分项统计解锁后直接进入或 15 秒内新打开的应用
-                val unlockedTotal = unlockTop3.sumOf { it.count }
-                Text(
-                    if (unlockedTotal > 0) "其中 $unlockedTotal 次解锁后进入/打开了应用"
-                    else "拿起 = 息屏后点亮屏幕的次数；多数拿起只停留在桌面，不打开应用",
-                    fontSize = 11.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                if (unlockTop3.isNotEmpty()) {
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        "解锁后首开 Top 3",
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Medium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(Modifier.height(4.dp))
-                    unlockTop3.take(3).forEach { u ->
-                        Row(
-                            Modifier.fillMaxWidth().padding(vertical = 3.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            AppIconBadge(u.packageName, appColor(u.packageName))
-                            Spacer(Modifier.width(6.dp))
-                            val nm = displays[u.packageName]?.label ?: u.packageName
-                            Text(nm, fontSize = 12.sp, modifier = Modifier.weight(1f), maxLines = 1)
-                            Text("×${u.count}", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                        }
-                    }
-                }
-            }
-        }
-
-        item(key = "battery") {
-            Spacer(Modifier.height(12.dp))
-            UsageCard(title = "电量去向（毫安时 · 估算）") {
-                Text(
-                    "口径：自上次充满电以来的估算；插电瞬间自动抢拍存档，日汇总不再缺充电前时段",
-                    fontSize = 10.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                Spacer(Modifier.height(6.dp))
-                if (batteryGlobal.isEmpty()) {
-                    Text(
-                        "耗电数据积累中",
-                        fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(vertical = 16.dp)
-                    )
-                } else {
-                    val top = batteryGlobal.take(8)
-                    val gMax = top.firstOrNull()?.mah ?: 1.0
-                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        top.forEach { g ->
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(compName(g.component), fontSize = 11.sp, modifier = Modifier.width(76.dp))
-                                Box(Modifier.weight(1f).height(6.dp)) {
-                                    Box(
-                                        Modifier
-                                            .fillMaxWidth((g.mah / gMax.coerceAtLeast(0.01)).toFloat())
-                                            .height(6.dp)
-                                            .clip(RoundedCornerShape(3.dp))
-                                            .background(ChartBlue.copy(alpha = 0.85f))
-                                    )
-                                }
-                                Spacer(Modifier.width(8.dp))
-                                // maxLines=1 防止 "340.6" 这类数值在 38dp 固定宽度里折成两行（v0.16.7）
-                                Text(
-                                    String.format(Locale.US, "%.1f", g.mah),
-                                    fontSize = 11.sp,
-                                    modifier = Modifier.width(44.dp),
-                                    maxLines = 1,
-                                    softWrap = false,
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        item(key = "apps") {
-            Spacer(Modifier.height(12.dp))
-            UsageCard(title = "应用占比") {
-                if (rows.isEmpty()) {
-                    Text(
-                        if (hasPermission) "暂无数据" else "缺少“使用情况访问”权限",
-                        fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(vertical = 16.dp)
-                    )
-                } else {
-                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        rows.take(8).chunked(2).forEach { pair ->
-                            Row(Modifier.fillMaxWidth()) {
-                                pair.forEachIndexed { ci, r ->
-                                    if (ci == 1) {
-                                        VerticalDivider(
-                                            Modifier.height(20.dp).padding(horizontal = 8.dp),
-                                            color = MaterialTheme.colorScheme.surfaceVariant
-                                        )
-                                    }
-                                    Row(
-                                        Modifier.weight(1f),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        AppIconBadge(r.packageName, appColor(r.packageName))
-                                        Spacer(Modifier.width(6.dp))
-                                        val nm = displays[r.packageName]?.label ?: r.packageName
-                                        Text(
-                                            nm,
-                                            fontSize = 11.sp,
-                                            maxLines = 1,
-                                            modifier = Modifier.weight(1f)
-                                        )
-                                        val pct = (r.totalMs * 100 / dayTotal.coerceAtLeast(1)).toInt()
-                                        Text(
-                                            if (pct == 0) "<1%" else "$pct%",
-                                            fontSize = 11.sp,
-                                            fontWeight = FontWeight.SemiBold
-                                        )
-                                    }
-                                }
-                                if (pair.size == 1) {
-                                    VerticalDivider(
-                                        Modifier.height(20.dp).padding(horizontal = 8.dp),
-                                        color = MaterialTheme.colorScheme.surfaceVariant
-                                    )
-                                    Spacer(Modifier.weight(1f))
-                                }
-                            }
-                        }
-                    }
+        // 此前四个模块按代码顺序硬编码 emit，moduleOrder 设置形同虚设；
+        // 现在真正按用户配置的顺序渲染（v0.16.15）
+        moduleOrder.forEach { id ->
+            if (id == "pickup" && dayStats == null && unlockTop3.isEmpty()) return@forEach
+            item(key = "module_$id") {
+                Spacer(Modifier.height(12.dp))
+                when (id) {
+                    "hourly" -> HourlyModule(sessions, categories, textMeasurer, dark, zone)
+                    "pickup" -> PickupModule(dayStats, unlockTop3, displays)
+                    "battery" -> BatteryModule(batteryGlobal)
+                    "apps" -> AppsModule(rows, hasPermission, displays, dayTotal)
                 }
             }
         }
@@ -1074,7 +941,177 @@ fun UsageApp(
     }
 }
 
-private fun hasPermission(repo: UsageRepository): Boolean = repo.hasPermission()
+@Composable
+private fun HourlyModule(
+    sessions: List<UsageSession>,
+    categories: Map<String, String>,
+    textMeasurer: androidx.compose.ui.text.TextMeasurer,
+    dark: Boolean,
+    zone: ZoneId,
+) {
+    UsageCard {
+        if (sessions.isEmpty()) {
+            Text("暂无数据", fontSize = 12.sp, modifier = Modifier.padding(vertical = 20.dp))
+        } else {
+            HourlyChart(sessions, zone, categories, textMeasurer, dark)
+        }
+    }
+}
+
+@Composable
+private fun PickupModule(
+    dayStats: DayStatsEntity?,
+    unlockTop3: List<UnlockStatsEntity>,
+    displays: Map<String, AppDisplay>,
+) {
+    UsageCard {
+        Text(
+            "拿起 ${dayStats?.pickups ?: 0} 次",
+            fontSize = 15.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+        // 口径说明：拿起次数 = 解锁(KEYGUARD_HIDDEN)总数（主用户 + 2s防抖）；
+        // 下面的分项统计解锁后直接进入或 15 秒内新打开的应用
+        val unlockedTotal = unlockTop3.sumOf { it.count }
+        Text(
+            if (unlockedTotal > 0) "其中 $unlockedTotal 次解锁后进入/打开了应用"
+            else "拿起 = 息屏后点亮屏幕的次数；多数拿起只停留在桌面，不打开应用",
+            fontSize = 11.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        if (unlockTop3.isNotEmpty()) {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "解锁后首开 Top 3",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(Modifier.height(4.dp))
+            unlockTop3.take(3).forEach { u ->
+                Row(
+                    Modifier.fillMaxWidth().padding(vertical = 3.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    AppIconBadge(u.packageName, appColor(u.packageName))
+                    Spacer(Modifier.width(6.dp))
+                    val nm = displays[u.packageName]?.label ?: u.packageName
+                    Text(nm, fontSize = 12.sp, modifier = Modifier.weight(1f), maxLines = 1)
+                    Text("×${u.count}", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun BatteryModule(batteryGlobal: List<BatteryGlobalEntity>) {
+    UsageCard(title = "电量去向（毫安时 · 估算）") {
+        Text(
+            "口径：自上次充满电以来的估算；插电瞬间自动抢拍存档，日汇总不再缺充电前时段",
+            fontSize = 10.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(Modifier.height(6.dp))
+        if (batteryGlobal.isEmpty()) {
+            Text(
+                "耗电数据积累中",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(vertical = 16.dp)
+            )
+        } else {
+            val top = batteryGlobal.take(8)
+            val gMax = top.firstOrNull()?.mah ?: 1.0
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                top.forEach { g ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(compName(g.component), fontSize = 11.sp, modifier = Modifier.width(76.dp))
+                        Box(Modifier.weight(1f).height(6.dp)) {
+                            Box(
+                                Modifier
+                                    .fillMaxWidth((g.mah / gMax.coerceAtLeast(0.01)).toFloat())
+                                    .height(6.dp)
+                                    .clip(RoundedCornerShape(3.dp))
+                                    .background(ChartBlue.copy(alpha = 0.85f))
+                            )
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        // maxLines=1 防止 "340.6" 这类数值在 38dp 固定宽度里折成两行（v0.16.7）
+                        Text(
+                            String.format(Locale.US, "%.1f", g.mah),
+                            fontSize = 11.sp,
+                            modifier = Modifier.width(44.dp),
+                            maxLines = 1,
+                            softWrap = false,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AppsModule(
+    rows: List<DailyRow>,
+    hasPermission: Boolean,
+    displays: Map<String, AppDisplay>,
+    dayTotal: Long,
+) {
+    UsageCard(title = "应用占比") {
+        if (rows.isEmpty()) {
+            Text(
+                if (hasPermission) "暂无数据" else "缺少“使用情况访问”权限",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(vertical = 16.dp)
+            )
+        } else {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                rows.take(8).chunked(2).forEach { pair ->
+                    Row(Modifier.fillMaxWidth()) {
+                        pair.forEachIndexed { ci, r ->
+                            if (ci == 1) {
+                                VerticalDivider(
+                                    Modifier.height(20.dp).padding(horizontal = 8.dp),
+                                    color = MaterialTheme.colorScheme.surfaceVariant
+                                )
+                            }
+                            Row(
+                                Modifier.weight(1f),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                AppIconBadge(r.packageName, appColor(r.packageName))
+                                Spacer(Modifier.width(6.dp))
+                                val nm = displays[r.packageName]?.label ?: r.packageName
+                                Text(
+                                    nm,
+                                    fontSize = 11.sp,
+                                    maxLines = 1,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                val pct = (r.totalMs * 100 / dayTotal.coerceAtLeast(1)).toInt()
+                                Text(
+                                    if (pct == 0) "<1%" else "$pct%",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                        }
+                        if (pair.size == 1) {
+                            VerticalDivider(
+                                Modifier.height(20.dp).padding(horizontal = 8.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant
+                            )
+                            Spacer(Modifier.weight(1f))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 @Composable
 private fun HeaderAction(icon: ImageVector, desc: String, onClick: () -> Unit) {

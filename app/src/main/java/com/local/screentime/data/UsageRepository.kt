@@ -68,19 +68,25 @@ class UsageRepository(private val context: Context) {
     private val displayCache = java.util.concurrent.ConcurrentHashMap<String, AppDisplay>()
     private val uidCache = java.util.concurrent.ConcurrentHashMap<String, Int>()
 
-    fun uidOfPackage(pkg: String): Int = uidCache.getOrPut(pkg) {
-        try {
+    fun uidOfPackage(pkg: String): Int = uidCache[pkg] ?: run {
+        val uid = try {
             context.packageManager.getPackageUid(pkg, 0)
         } catch (e: Exception) {
             -1
         }
+        // 失败结果不落缓存：包可能稍后才装上/可见，缓存 -1 会永久映射不到
+        if (uid >= 0) uidCache[pkg] = uid
+        uid
     }
 
     private val catCache = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     /** 手动分类覆盖：优先级最高；category=null 表示恢复自动 */
     fun setCategoryOverride(pkg: String, category: String?) {
-        val obj = JSONObject(prefs.getString("cat_overrides", null) ?: "{}")
+        // 与 categoryOf 同口径容错：prefs 里存量脏数据不得让点击直接崩溃
+        val obj = runCatching {
+            JSONObject(prefs.getString("cat_overrides", null) ?: "{}")
+        }.getOrElse { JSONObject() }
         if (category == null) obj.remove(pkg) else obj.put(pkg, category)
         prefs.edit().putString("cat_overrides", obj.toString()).apply()
         catCache.remove(pkg)
@@ -88,7 +94,7 @@ class UsageRepository(private val context: Context) {
 
     fun allCategories(): List<String> = listOf(
         "通讯社交", "影音娱乐", "游戏", "音乐音频", "资讯阅读", "AI 助手",
-        "购物", "金融", "地图出行", "生活服务", "效率", "其他",
+        "购物", "金融", "地图出行", "生活服务", "效率", "图像", "其他",
     )
 
     /** 应用分类：手动覆盖优先 → 系统声明的 category → 内置中国常用应用字典 → 兜底“其他” */
@@ -180,7 +186,9 @@ class UsageRepository(private val context: Context) {
      */
     suspend fun captureBatteryNow(): Boolean {
         val ok = try {
-            syncBattery(System.currentTimeMillis())
+            // 与 syncNow 共用互斥锁：15min 采样、插电抢拍与 6h 全量同步里的 syncBattery
+            // 并发交错时，慢的那路会把旧观测值写回快照（cumMah 倒退），污染下次差分基准
+            syncMutex.withLock { syncBattery(System.currentTimeMillis()) }
         } catch (e: Exception) {
             Log.w(TAG, "captureBatteryNow failed", e)
             false
@@ -208,6 +216,7 @@ class UsageRepository(private val context: Context) {
         //    恒降级、同进程第二次起才走 root，v0.16.10 修复）。这里同步等待 shell 建立后
         //    读权威状态；su 不可用时 getShell() 返回非 root shell，isRoot=false 正常降级。
         var rootUsed = false
+        var rootSessionCount = 0
         try {
             val rootOk = try {
                 Shell.getShell().isRoot
@@ -215,7 +224,8 @@ class UsageRepository(private val context: Context) {
                 false
             }
             if (rootOk) {
-                rootUsed = syncViaRoot()
+                rootSessionCount = syncViaRoot()
+                rootUsed = rootSessionCount > 0
                 syncBattery(now)
             } else if (hasDumpAccess()) {
                 // 无 root 但持有 DUMP（debug 构建 adb 可授）：应用侧 dumpsys 采集耗电，
@@ -229,9 +239,15 @@ class UsageRepository(private val context: Context) {
         // 2) API 事件流兜底：仅当 root 没拿到事件时才用它重建（ColorOS 会裁剪 queryEvents，
         //    丢 PAUSED 事件会使会话跨息屏虚高；root 正常时绝不能让裁剪数据入库/覆盖）
         val watermark = dao.getState(KEY_WATERMARK) ?: 0L
-        val windowStart = (watermark - OVERLAP_MS).coerceAtLeast(0L)
+        // 修复：此前水位线只在兜底分支写入，root 装机上恒为 0；root 一旦失效，
+        // windowStart 归零 → deleteSessionsStartingAfter(0) 删光 sessions 表，
+        // 再用被裁剪的 queryEvents 重建 = 永久丢历史明细。
+        // 现 root 成功也推进水位线，且兜底窗口下限钳到 API_MAX_LOOKBACK_MS：
+        // queryEvents 保留期仅 ~7 天，删除更早的会话本就拿不回来，无意义且有丢数据风险。
+        if (rootUsed) dao.putState(SyncStateEntity(KEY_WATERMARK, now))
+        val windowStart = maxOf(watermark - OVERLAP_MS, now - API_MAX_LOOKBACK_MS).coerceAtLeast(0L)
         val events = if (rootUsed) emptyList() else reader.queryEvents(windowStart, now)
-        var sessionCount = 0
+        var sessionCount = rootSessionCount
         if (!rootUsed) {
             val sessions = buildSessions(events, windowStart, now)
             sessionCount = sessions.size
@@ -256,7 +272,7 @@ class UsageRepository(private val context: Context) {
 
         refreshAppRegistry()
         runCatching { generateDueReports(force = false) }
-        Log.d(TAG, "sync: root=$rootUsed apiEvents=${events.size} fallbackSessions=$sessionCount")
+        Log.d(TAG, "sync: root=$rootUsed apiEvents=${events.size} sessions=$sessionCount")
         return SyncResult.Ok(windowStart, now, events.size, sessionCount, rootUsed)
     }
 
@@ -417,8 +433,8 @@ class UsageRepository(private val context: Context) {
         return root.toString(2)
     }
 
-    /** 方案 B：root 下 dumpsys 未裁剪全量（事件 + checkin 按天聚合） */
-    private suspend fun syncViaRoot(): Boolean {
+    /** 方案 B：root 下 dumpsys 未裁剪全量（事件 + checkin 按天聚合）。返回重建出的会话数，0=未拿到事件 */
+    private suspend fun syncViaRoot(): Int {
         val zone = ZoneId.systemDefault()
         // 一次性历史回补：导入 PC 端生成的自然日数据（来源 /data/system_ce/0/usagestats 的系统桶，
         // 按会话分布切分到自然日，覆盖 2026-09-04～09-12；那些天的会话被旧版 STOPPED bug 丢掉 30~90%）
@@ -457,9 +473,11 @@ class UsageRepository(private val context: Context) {
                 if (sessions.isNotEmpty()) dao.insertSessions(sessions)
             }
             runCatching { syncDayEventStats(events, zone) }
+            Log.d(TAG, "root: events=${events.size} sessions=${sessions.size}")
+            return sessions.size
         }
-        Log.d(TAG, "root: events=${events.size}")
-        return events.isNotEmpty()
+        Log.d(TAG, "root: events=0")
+        return 0
     }
 
     /**
@@ -611,9 +629,14 @@ class UsageRepository(private val context: Context) {
     private suspend fun syncDayEventStats(events: List<RawEvent>, zone: ZoneId) {
         if (events.isEmpty()) return
         val res = computeDayEventStats(events, zone)
-        val statRows = res.pickups.map { (d, c) -> DayStatsEntity(d, c) }
+        // 事件窗口首日通常不从零点起，而 day_stats/unlock_stats 是整行 REPLACE，
+        // 写残窗值会把该日既有计数覆盖偏小；随 ~7 天 root 窗口滑动，首日恒残缺。
+        // 该日更早的同步里曾位于窗口内被完整写入，跳过首日即可保住正确值。
+        val firstDay = Instant.ofEpochMilli(events.minOf { it.ts }).atZone(zone).toLocalDate().toEpochDay()
+        val statRows = res.pickups.filterKeys { it != firstDay }.map { (d, c) -> DayStatsEntity(d, c) }
         if (statRows.isNotEmpty()) dao.upsertDayStats(statRows)
-        val unlockRows = res.unlockFirst.flatMap { (d, m) -> m.map { (p, c) -> UnlockStatsEntity(d, p, c) } }
+        val unlockRows = res.unlockFirst.filterKeys { it != firstDay }
+            .flatMap { (d, m) -> m.map { (p, c) -> UnlockStatsEntity(d, p, c) } }
         if (unlockRows.isNotEmpty()) dao.upsertUnlockStats(unlockRows)
     }
 
@@ -656,7 +679,9 @@ class UsageRepository(private val context: Context) {
         val made = ArrayList<String>()
         for (p in currentPeriods(today)) {
             val exists = dao.getReport(p.type, p.key) != null
-            val inWindow = !today.isBefore(p.end) && !today.isAfter(p.end.plusDays(2))
+            // 补生成窗口从 2 天放宽到 7 天：ColorOS 杀后台激进，年报/周报若恰逢
+            // 窗口内一次同步都没跑成，2 天窗口会永久错过生成
+            val inWindow = !today.isBefore(p.end) && !today.isAfter(p.end.plusDays(7))
             if (exists || !(force || inWindow)) continue
             val text = buildReportText(p)
             dao.putReport(
@@ -741,6 +766,9 @@ class UsageRepository(private val context: Context) {
         const val REPORT_YEARLY = "YEARLY"
         private const val TAG = "STLog"
         private const val OVERLAP_MS = 2 * 60 * 60 * 1000L
+
+        /** API 兜底路径允许回看的最长窗口：queryEvents 保留期 ~7 天，再早的删了也重建不回 */
+        private const val API_MAX_LOOKBACK_MS = 6 * 24 * 60 * 60 * 1000L
         private const val MIN_SESSION_MS = 2_000L
         private const val GLOBAL_SNAPSHOT_KEY = "__global__"
 

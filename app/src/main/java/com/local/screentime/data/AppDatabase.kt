@@ -21,7 +21,9 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         ReportEntity::class,
     ],
     version = 5,
-    exportSchema = false,
+    // 导出 schema：今后每次升版本都有历史 schema 可依据，能写真正的增量迁移；
+    // 配合下面的注释，destructive fallback 只保留给 4 之前的存量老库
+    exportSchema = true,
 )
 abstract class AppDatabase : RoomDatabase() {
     abstract fun usageDao(): UsageDao
@@ -44,6 +46,8 @@ abstract class AppDatabase : RoomDatabase() {
                     "screentime.db",
                 )
                     .addMigrations(MIGRATION_4_5)
+                    // 历史 1→4 的 schema 未归档、无法补写迁移，存量老库仍走销毁式重建；
+                    // 当前及以后版本（≥5）必须写增量迁移，禁止再往这个 fallback 里塞新版本。
                     .fallbackToDestructiveMigration()
                     .build().also { instance = it }
             }

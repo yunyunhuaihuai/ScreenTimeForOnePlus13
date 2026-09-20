@@ -30,12 +30,12 @@ Kotlin + Jetpack Compose (Material 3) + Room + WorkManager + libsu，无 NDK。m
 
 ## 构建
 
-无 Gradle wrapper，使用本机 Gradle 8.9：
+使用仓库自带的 Gradle Wrapper（8.9）：
 
 ```bash
 export JAVA_HOME="<JDK 21 安装路径>"
-export GRADLE_USER_HOME="<Gradle 缓存目录>"
-"<Gradle 8.9 安装路径>/bin/gradle.bat" -p "<本仓库根目录>" --console=plain :app:assembleDebug
+./gradlew.bat :app:assembleDebug   # Windows
+# 或 ./gradlew :app:assembleDebug  # Git Bash
 adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 

@@ -46,10 +46,11 @@
 
         <!-- 插电瞬间抢拍：系统在充电开始时即重置 batterystats「自上次充电」窗口，
              接收器与系统抢跑，把重置前的最终累计值存进快照（v0.16.8）。
-             POWER_CONNECTED 属隐式广播豁免清单，可静态注册，重启后依然有效。 -->
+             POWER_CONNECTED 属隐式广播豁免清单，可静态注册，重启后依然有效。
+             exported=false：只收系统广播，不向三方应用暴露触发入口（最小暴露面）。 -->
         <receiver
             android:name=".PowerEventReceiver"
-            android:exported="true">
+            android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.ACTION_POWER_CONNECTED" />
             </intent-filter>

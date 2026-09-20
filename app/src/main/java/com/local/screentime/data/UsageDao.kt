@@ -18,10 +18,6 @@ interface UsageDao {
     @Query("DELETE FROM sessions WHERE startTs >= :fromTs")
     suspend fun deleteSessionsStartingAfter(fromTs: Long)
 
-    @Deprecated("Use deleteSessionsStartingAfter to prevent trimming boundary sessions")
-    @Query("DELETE FROM sessions WHERE endTs >= :fromTs")
-    suspend fun deleteSessionsEndedAfter(fromTs: Long)
-
     @Query(
         "SELECT packageName, day, SUM(endTs - startTs) AS totalMs FROM sessions " +
             "WHERE day = :day GROUP BY packageName ORDER BY totalMs DESC"

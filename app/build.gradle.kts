@@ -13,8 +13,8 @@ android {
         applicationId = "com.local.screentime"
         minSdk = 35
         targetSdk = 35
-        versionCode = 30
-        versionName = "0.16.14"
+        versionCode = 31
+        versionName = "0.16.15"
     }
 
     buildTypes {
@@ -33,6 +33,11 @@ android {
     buildFeatures {
         compose = true
     }
+}
+
+ksp {
+    // Room 导出版本化 schema（供后续版本写真正的增量迁移），目录内容应随仓库提交
+    arg("room.schemaLocation", "$projectDir/schemas")
 }
 
 dependencies {
