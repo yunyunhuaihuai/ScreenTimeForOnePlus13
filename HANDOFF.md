@@ -102,6 +102,17 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/release/app-release.apk
 - **测试规模**：JVM 单测 76/76 通过（较 v0.16.15 的 25 个新增 51 个）；`:app:assembleDebug` 产物复核 versionCode=32/versionName=0.17.0。
 - **待真机验证（未做，不得标注通过）**：① 真机升级 v4→6/v5→6 迁移后历史数据完整（模拟器/JVM 已验证迁移逻辑）；② 进程级锁下 15min 采样与手动同步并发无双计（DB 前后对比法，见第 7 节）；③ 共享 UID 行显示与归属；④ 周一/次月 1 日的上一周期补生成与通知；⑤ 诊断 JSON 的 lastUsageSource/lastBatterySource 与实际通道一致。
 
+### 4.0.16.1 真机验证记录（2026-10-01 深夜，OnePlus 13 e4e1b43e，ColorOS 15）
+
+验证方法：升级前用 `run-as` 拉取 v5 库三件套（db/-wal/-shm，WAL 未 checkpoint 也一并保留）作基线 A；装 0.17.0（debug 构建，与 release 同 debug 签名，覆盖安装保留数据且 run-as 可用）；启动后拉 B（迁移+首次同步）、二次启动拉 C（第二次同步）、`dumpsys battery unplug`→`set ac 1` 模拟插电触发抢拍后拉 D（之后 `dumpsys battery reset` 恢复）。DB 分析用本机 Node 24 内置 `node:sqlite`（可回放 WAL），快照/逐行 diff 全程脚本化。快照总和含 `__global___dur` 行的毫秒时长值，**不能**当 mAh 看待。
+
+- ✅ **① v5→6 迁移数据零丢失**：user_version 5→6；10 张表行数与值级聚合逐位一致——battery_daily 2748 行 / 28796.525521581098 mAh、battery_global 242 行 / 29579.71509819 mAh、usage_daily 351 行 / 153837128 ms、battery_snapshot 255 行、day_stats 拿起 2259、unlock_stats 1944、app_info 140 全部精确相等；sessions 19142→19144（+2 为升级当次真实使用的新会话，非迁移产物）。
+- ✅ **② 同步/采集无双计、无丢增量、快照无回退**：两次全量同步 + 一次插电抢拍；抢拍后 14 行 battery_daily 增量（如 u0a432 +0.1、u0a330 +0.15、UID 1000 +0.1）与各自快照推进**逐 UID 精确相等**，当天增量总和 0.5901 mAh 与总差值一致且全部归属 2026-10-01（dayWeights 正确）；255 行快照 0 回退、0 误判重置（重置比例判据下系统 smearing 正常存活）；报告补生成幂等（17 条稳定，二次同步不再新增）。
+- ✅ **③ shared UID 数据层**：新规则生效（uidKey LIKE 'u%a%' 且 packageName IS NULL 的行存在，共享 UID 不再挂给任意第一个包）；**UI 标签目视确认未完成**——验证时设备在机主手中使用（UI 自动化会与手持操作冲突，已主动停止），耗电排行切「耗电」后应见「共享 UID：…」条目，待机主自查。
+- ✅ **④ 周期补生成**：reports 4→17。W:2026-09-21（上一完整周）、M:2026-9（上一自然月）、Y:2025（上一自然年）按新语义生成，旧版在周期最后一天提前生成的过早报告已被完整口径重生成（generatedTs 更新为升级当日）；8 周/6 月/2 年回溯各就位，全部 finalized=1；通知仅最新一条（回溯静默）。
+- ✅ **⑤ 持久化诊断状态**：last_usage_source=1(ROOT)、last_battery_source=1(ROOT)、last_sync_success_ts 随每次同步推进；插电抢拍后 cap_last_attempt_ts / cap_last_success_ts 写入、cap_last_fail_code=0、cap_max_gap_ms=null（首次成功无间隔，语义正确）；`dumpsys activity broadcasts` 可见 PowerEventReceiver 派发记录（沿用 v0.16.8 的 DB 时间戳+广播派发取证手法）。
+- 补充说明：验证装机为 **debug 构建**（run-as 需要）；日常可换回 release 包，同签名覆盖安装不丢数据。UI 整体渲染正常（首页大数字/小时图/拿起/电量去向/占比模块，无崩溃）。
+
 ## 4.0.15 v0.16.14 变更（修复数据处理与统计口径错误，由 Gemini 修复）
 
 - **分身双开应用使用时长丢损（严重）**：
