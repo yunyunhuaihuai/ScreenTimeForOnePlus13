@@ -170,12 +170,9 @@ class UsageRepository(private val context: Context) {
         return table.firstOrNull { p.contains(it.first) }?.second
     }
 
-    /** 同步互斥：UI 手动刷新与 WorkManager 6h 对账并发时，会话/耗电增量会双计或交错留脏数据 */
-    private val syncMutex = Mutex()
-
     suspend fun syncNow(): SyncResult {
         if (!reader.hasPermission()) return SyncResult.NoPermission
-        return syncMutex.withLock { syncNowLocked() }
+        return SYNC_MUTEX.withLock { syncNowLocked() }
     }
 
     /**
@@ -186,9 +183,10 @@ class UsageRepository(private val context: Context) {
      */
     suspend fun captureBatteryNow(): Boolean {
         val ok = try {
-            // 与 syncNow 共用互斥锁：15min 采样、插电抢拍与 6h 全量同步里的 syncBattery
-            // 并发交错时，慢的那路会把旧观测值写回快照（cumMah 倒退），污染下次差分基准
-            syncMutex.withLock { syncBattery(System.currentTimeMillis()) }
+            // 与 syncNow 共用进程级互斥（companion 单例锁）：15min 采样、插电抢拍与
+            // 6h 全量同步里的 syncBattery 并发交错时，慢的那路会把旧观测值写回快照
+            // （cumMah 倒退），污染下次差分基准
+            SYNC_MUTEX.withLock { syncBattery(System.currentTimeMillis()) }
         } catch (e: Exception) {
             Log.w(TAG, "captureBatteryNow failed", e)
             false
@@ -487,8 +485,15 @@ class UsageRepository(private val context: Context) {
      * 午夜甚至多天（本机实测 2026-09-17 18:05 才重置，上一个窗口跨了 09-16 整个晚上）。
      * 累计计数器的两次观测之差 = 该时间段内真实发生的用量，所以按「上次快照 → 本次」区间与各
      * 本地日的重叠比例归属；否则会把昨天的耗电整体记到今天（曾表现为「今天没拍照却 988mAh」）。
+     *
+     * 原子性（v0.17.0 重构，P0-2）：旧实现「读旧快照 → 算差分 → 先推进快照 → 再写 daily」，
+     * 快照与 daily 是两次独立写入，进程在中间被杀会让该段差分永久丢失。现在拆成两个阶段：
+     *  1) Room 事务外：shell dumpsys + 纯解析（dumpsys 绝不能进事务：阻塞 DB 连接、拖长持锁时间）；
+     *  2) 单一 db.withTransaction：批量读旧状态 → 纯差分（BatteryLedger）→ 批量写
+     *     battery_daily / battery_global → 最后推进快照；任何一步失败整体回滚。
      */
     private suspend fun syncBattery(now: Long): Boolean {
+        // —— 阶段一：shell + 解析（事务外） ——
         val lines = try {
             Shell.cmd("dumpsys batterystats --charged").exec().out
         } catch (e: Exception) {
@@ -497,125 +502,15 @@ class UsageRepository(private val context: Context) {
         val parsed = parseBatteryPower(lines)
         if (parsed.uids.isEmpty() && parsed.globals.isEmpty()) return false
         val zone = ZoneId.systemDefault()
-        val pm = context.packageManager
 
-        val rows = ArrayList<BatteryDailyEntity>()
-        for (u in parsed.uids) {
-            val last = dao.getBatterySnapshot(u.uidKey)
-            // 重置判据用「比例」而不是绝对值：真实充电重置会把累计值打到接近 0，
-            // 而系统的估算值在两次 dump 之间会被整体重算/smeer（真机实测 u0a330 9.9→9.67、
-            // u0a333 279→274，-1.8~-2.3%）。旧判据 new < old-0.5 把这种抖动误判成重置，
-            // 全额累计被再记一遍（真机实测：抖音两天被记出 1143mAh，窗口真实只有 274）。
-            // 跌幅过半才认定重置；0.16.11 起生效。
-            val reset = last != null && u.totalMah < last.cumMah * 0.5
-            val prevComps = decodeComps(last?.compsText ?: "")
-
-            fun compDelta(key: String): Double {
-                // fg/bg 在 dump 的 UID 行括号之外（“… fg: 25.1 bg: 1.04 (…)”），
-                // 不在 comps（括号内组件表）里 —— 此前误从 u.comps 取值恒得 0（v0.16.7 修复）
-                val nowV = when (key) {
-                    "fg" -> u.fg
-                    "bg" -> u.bg
-                    "fgs" -> u.fgs
-                    else -> u.comps[key] ?: 0.0
-                }
-                val prevV = if (last == null || reset) 0.0 else (prevComps[key] ?: 0.0)
-                return (nowV - prevV).coerceAtLeast(0.0)
-            }
-            val totalDelta = if (last == null || reset) {
-                u.totalMah
-            } else {
-                (u.totalMah - last.cumMah).coerceAtLeast(0.0)
-            }
-            dao.putBatterySnapshot(
-                BatterySnapshotEntity(
-                    uidKey = u.uidKey,
-                    cumMah = u.totalMah,
-                    compsText = encodeComps(u.comps + mapOf("fg" to u.fg, "bg" to u.bg, "fgs" to u.fgs)),
-                    updatedTs = now,
-                )
-            )
-            // 阈值从 0.01 收紧到 0.001：视频类应用一次亮屏几分钟的估算耗电可能只有几十 mAh，
-            // 但被冰箱冻结后仅剩零星后台增量，0.01 会把整段使用期之间的微小增量整段丢弃（v0.16.7）
-            if (totalDelta <= 0.001) continue
-            val uid = uidOf(u.uidKey)
-            val pkg = if (uid >= 10000) try {
-                pm.getPackagesForUid(uid)?.firstOrNull { !it.isNullOrBlank() }
-            } catch (e: Exception) {
-                null
-            } else null  // 系统 UID（<10000）是共享的，随便挂某个包名会误导（如 UID 1000 显示成“安全中心”），交给 systemUidLabel
-            for ((day, w) in dayWeights(deltaFrom(last?.updatedTs, reset, parsed.windowStartTs, now), now, zone)) {
-                val ex = dao.getBatteryDaily(u.uidKey, day)
-                rows.add(
-                    BatteryDailyEntity(
-                        uidKey = u.uidKey,
-                        day = day,
-                        packageName = pkg,
-                        totalMah = (ex?.totalMah ?: 0.0) + totalDelta * w,
-                        fgMah = (ex?.fgMah ?: 0.0) + compDelta("fg") * w,
-                        bgMah = (ex?.bgMah ?: 0.0) + compDelta("bg") * w,
-                        fgsMah = (ex?.fgsMah ?: 0.0) + compDelta("fgs") * w,
-                        screenMah = (ex?.screenMah ?: 0.0) + compDelta("screen") * w,
-                        cpuMah = (ex?.cpuMah ?: 0.0) + compDelta("cpu") * w,
-                        audioMah = (ex?.audioMah ?: 0.0) + compDelta("audio") * w,
-                        videoMah = (ex?.videoMah ?: 0.0) + compDelta("video") * w,
-                        cameraMah = (ex?.cameraMah ?: 0.0) + compDelta("camera") * w,
-                        gnssMah = (ex?.gnssMah ?: 0.0) + compDelta("gnss") * w,
-                        wifiMah = (ex?.wifiMah ?: 0.0) + compDelta("wifi") * w,
-                        btMah = (ex?.btMah ?: 0.0) + compDelta("bluetooth") * w,
-                        wakelockMah = (ex?.wakelockMah ?: 0.0) + compDelta("wakelock") * w,
-                        sensorsMah = (ex?.sensorsMah ?: 0.0) + compDelta("sensors") * w,
-                        otherMah = (ex?.otherMah ?: 0.0) + u.comps.keys
-                            .filter { it !in KNOWN_COMPS }
-                            .sumOf { compDelta(it) } * w,
-                    )
-                )
-            }
-        }
-        if (rows.isNotEmpty()) dao.upsertBatteryDaily(rows)
-
-        // 全局组件：以模型估算总量为重置信号
-        if (parsed.computedDrain > 0) {
-            val gLast = dao.getBatterySnapshot(GLOBAL_SNAPSHOT_KEY)
-            // 同 UID 行：整机重算/校准也会让 computedDrain 小幅回落，比例判据防误判（v0.16.11）
-            val reset = gLast != null && parsed.computedDrain < gLast.cumMah * 0.5
-            dao.putBatterySnapshot(
-                BatterySnapshotEntity(GLOBAL_SNAPSHOT_KEY, parsed.computedDrain, encodeComps(parsed.globals.mapValues { it.value.first }), now)
-            )
-            val gLastDur = dao.getBatterySnapshot(GLOBAL_SNAPSHOT_KEY + "_dur")
-            dao.putBatterySnapshot(
-                BatterySnapshotEntity(
-                    GLOBAL_SNAPSHOT_KEY + "_dur",
-                    parsed.globals.values.sumOf { it.second.toDouble() },
-                    encodeComps(parsed.globals.mapValues { it.value.second.toDouble() }),
-                    now,
-                )
-            )
-            val prevComps = decodeComps(gLast?.compsText ?: "")
-            val prevDurComps = decodeComps(gLastDur?.compsText ?: "")
-            val grow = ArrayList<BatteryGlobalEntity>()
-            val weights = dayWeights(deltaFrom(gLast?.updatedTs, reset, parsed.windowStartTs, now), now, zone)
-            for ((comp, pair) in parsed.globals) {
-                val nowV = pair.first
-                val prevV = if (gLast == null || reset) 0.0 else (prevComps[comp] ?: 0.0)
-                val delta = (nowV - prevV).coerceAtLeast(0.0)
-                val nowDur = pair.second
-                val prevDur = if (gLastDur == null || reset) 0L else (prevDurComps[comp]?.toLong() ?: 0L)
-                val durDelta = (nowDur - prevDur).coerceAtLeast(0L)
-                if (delta <= 0.01 && durDelta <= 0L) continue
-                for ((day, w) in weights) {
-                    val ex = dao.getBatteryGlobal(comp, day)
-                    grow.add(
-                        BatteryGlobalEntity(
-                            component = comp,
-                            day = day,
-                            mah = (ex?.mah ?: 0.0) + delta * w,
-                            durationMs = (ex?.durationMs ?: 0L) + (durDelta * w).toLong(),
-                        )
-                    )
-                }
-            }
-            if (grow.isNotEmpty()) dao.upsertBatteryGlobal(grow)
+        // —— 阶段二：单一事务（调用方已持 SYNC_MUTEX，差分基于串行化的快照状态） ——
+        try {
+            applyBatteryLedgerTx(db, dao, parsed, now, zone, pkgOf = ::resolveBatteryOwnerPackage)
+        } catch (e: Exception) {
+            // 事务已整体回滚：快照未推进、daily 未写入，本轮差分作废，
+            // 下一轮采集会基于旧快照重算（宁可少记一轮，不可半提交）
+            Log.w(TAG, "battery tx failed (rolled back)", e)
+            return false
         }
         Log.d(
             TAG,
@@ -623,6 +518,17 @@ class UsageRepository(private val context: Context) {
                 "window=${parsed.windowStartTs?.let { Instant.ofEpochMilli(it).atZone(zone).toLocalDateTime() } ?: "?"}",
         )
         return true
+    }
+
+    /** UID → 耗电归属包名。系统 UID（<10000）是共享的，挂到任意包名会误导
+     *  （如 UID 1000 显示成“安全中心”），保持 null 交给 systemUidLabel。 */
+    private fun resolveBatteryOwnerPackage(uid: Int): String? {
+        if (uid < 10000) return null
+        return try {
+            context.packageManager.getPackagesForUid(uid)?.firstOrNull { !it.isNullOrBlank() }
+        } catch (e: Exception) {
+            null
+        }
     }
 
     /** 拿起次数（KEYGUARD_HIDDEN 计数）与“解锁后首开应用”统计 */
@@ -754,6 +660,12 @@ class UsageRepository(private val context: Context) {
     }
 
     companion object {
+        // 进程级同步互斥（v0.17.0 修正）：必须放在 companion 而不是实例上。
+        // MainActivity / SyncWorker / BatteryCaptureWorker / PowerEventReceiver 各自 new
+        // UsageRepository，实例锁互不感知 —— v0.16.7 的「已解决并发双计」只对同一实例成立，
+        // 跨实例并发（15min 采样 vs 6h 对账 vs 插电抢拍）仍可能基于同一份旧快照各算一份差分。
+        internal val SYNC_MUTEX = Mutex()
+
         const val KEY_WATERMARK = "event_watermark"
         const val KEY_AGG_WIPED = "usage_daily_wiped_v16"
         const val KEY_BACKFILL = "backfill_natural_days_v18"
@@ -770,12 +682,7 @@ class UsageRepository(private val context: Context) {
         /** API 兜底路径允许回看的最长窗口：queryEvents 保留期 ~7 天，再早的删了也重建不回 */
         private const val API_MAX_LOOKBACK_MS = 6 * 24 * 60 * 60 * 1000L
         private const val MIN_SESSION_MS = 2_000L
-        private const val GLOBAL_SNAPSHOT_KEY = "__global__"
-
-        private val KNOWN_COMPS = setOf(
-            "screen", "cpu", "audio", "video", "camera", "gnss", "wifi", "bluetooth", "bt",
-            "wakelock", "sensors", "mobile_radio", "ambient_display", "idle", "flashlight", "phone",
-        )
+        // GLOBAL_SNAPSHOT_KEY / KNOWN_COMPS 已随差分计算移入 BatteryLedger（v0.17.0）
 
         /** uid ↔ uidKey 支持多用户：ColorOS 分身/隐私空间是 u999a*（曾因只认 u0a 前缀，
          *  分身应用的耗电行 packageName 恒为 null，UI 永远映射不到包）。 */

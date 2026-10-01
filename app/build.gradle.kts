@@ -33,6 +33,16 @@ android {
     buildFeatures {
         compose = true
     }
+    testOptions {
+        // Robolectric（真实 Room 事务/迁移测试在 JVM 上运行）
+        unitTests.isIncludeAndroidResources = true
+    }
+    sourceSets {
+        // Room schema JSON 作为测试资产：MigrationTestHelper 按版本号读取（应随仓库提交）
+        getByName("test") {
+            assets.srcDir("$projectDir/schemas")
+        }
+    }
 }
 
 ksp {
@@ -60,4 +70,8 @@ dependencies {
     implementation("com.github.topjohnwu.libsu:core:5.2.2")
 
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.14.1")
+    testImplementation("androidx.test:core-ktx:1.6.1")
+    testImplementation("androidx.room:room-testing:2.6.1")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
 }

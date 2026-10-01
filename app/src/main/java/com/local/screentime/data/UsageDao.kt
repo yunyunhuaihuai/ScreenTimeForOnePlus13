@@ -87,8 +87,21 @@ interface UsageDao {
     @Query("SELECT * FROM battery_snapshot WHERE uidKey = :uidKey")
     suspend fun getBatterySnapshot(uidKey: String): BatterySnapshotEntity?
 
+    @Query("SELECT * FROM battery_snapshot")
+    suspend fun allBatterySnapshots(): List<BatterySnapshotEntity>
+
     @Upsert
     suspend fun putBatterySnapshot(snapshot: BatterySnapshotEntity)
+
+    @Upsert
+    suspend fun upsertBatterySnapshots(rows: List<BatterySnapshotEntity>)
+
+    /** 批量读取（差分事务内一次取齐待写日的既有行，替代逐 UID 查询） */
+    @Query("SELECT * FROM battery_daily WHERE day IN (:days)")
+    suspend fun batteryDailyForDays(days: List<Long>): List<BatteryDailyEntity>
+
+    @Query("SELECT * FROM battery_global WHERE day IN (:days)")
+    suspend fun batteryGlobalForDays(days: List<Long>): List<BatteryGlobalEntity>
 
     @Query("SELECT * FROM day_stats WHERE day = :day")
     suspend fun getDayStats(day: Long): DayStatsEntity?
