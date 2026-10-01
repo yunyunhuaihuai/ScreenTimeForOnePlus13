@@ -6,7 +6,8 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.util.Log
 import androidx.room.withTransaction
-import com.topjohnwu.superuser.Shell
+import com.local.screentime.privileged.PrivilegedCommandRunner
+import com.local.screentime.privileged.RootCommandRunner
 import com.local.screentime.Notifications
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -78,7 +79,11 @@ data class BatteryParsed(
  *  3) root 下 dumpsys usagestats —— 未裁剪的全量事件，重建出的会话表是唯一展示权威
  *     （实测与系统 totalTimeUsed 逐包一致，见 HANDOFF 第 8 节）。
  */
-class UsageRepository(private val context: Context) {
+class UsageRepository(
+    private val context: Context,
+    /** 高权限命令后端（P1-3）：默认 libsu root，行为与旧直用 Shell.cmd 完全一致 */
+    private val runner: PrivilegedCommandRunner = RootCommandRunner(),
+) {
 
     private val db = AppDatabase.get(context)
     private val dao = db.usageDao()
@@ -251,11 +256,7 @@ class UsageRepository(private val context: Context) {
                 captureHealth = CaptureHealth.onAttempt(captureHealth, now)
                 saveCaptureHealth()
                 // root 与 DUMP 权限都不可用时重试无意义（需用户侧动作），直接归类
-                val rootOk = try {
-                    Shell.getShell().isRoot
-                } catch (e: Exception) {
-                    false
-                }
+                val rootOk = runner.isRootAvailable()
                 if (!rootOk && !hasDumpAccess()) {
                     captureHealth = CaptureHealth.onFailure(captureHealth, now, CaptureHealth.FAIL_NO_SOURCE)
                     saveCaptureHealth()
@@ -298,11 +299,7 @@ class UsageRepository(private val context: Context) {
         var rootUsed = false
         var rootSessionCount = 0
         try {
-            val rootOk = try {
-                Shell.getShell().isRoot
-            } catch (e: Exception) {
-                false
-            }
+            val rootOk = runner.isRootAvailable()
             if (rootOk) {
                 rootSessionCount = syncViaRoot()
                 rootUsed = rootSessionCount > 0
@@ -561,7 +558,7 @@ class UsageRepository(private val context: Context) {
         // 按会话分布切分到自然日，覆盖 2026-09-04～09-12；那些天的会话被旧版 STOPPED bug 丢掉 30~90%）
         if (dao.getState(KEY_BACKFILL) == null) {
             runCatching {
-                val text = Shell.cmd("cat /data/local/tmp/stlog_backfill.json").exec().out.joinToString("\n")
+                val text = runner.exec("cat /data/local/tmp/stlog_backfill.json").joinToString("\n")
                 if (text.length > 10) {
                     val arr = JSONObject(text).getJSONArray("rows")
                     val list = ArrayList<DailyUsageEntity>(arr.length())
@@ -571,7 +568,7 @@ class UsageRepository(private val context: Context) {
                     }
                     if (list.isNotEmpty()) {
                         db.withTransaction { dao.upsertDaily(list) }
-                        Shell.cmd("rm -f /data/local/tmp/stlog_backfill.json")
+                        runner.exec("rm -f /data/local/tmp/stlog_backfill.json")
                         dao.putState(SyncStateEntity(KEY_BACKFILL, 1))
                         Log.d(TAG, "backfill: ${list.size} rows")
                     }
@@ -580,10 +577,10 @@ class UsageRepository(private val context: Context) {
         }
         // 保活：把自己加进 Doze 白名单，降低 ColorOS 后台清理概率
         runCatching {
-            Shell.cmd("dumpsys deviceidle whitelist +${context.packageName}").exec()
+            runner.exec("dumpsys deviceidle whitelist +${context.packageName}")
         }
         // --checkin 在 root 下输出格式不同（解析恒为 0 行），聚合已由方案 A 覆盖，跳过以缩短同步时间
-        val dump = Shell.cmd("dumpsys usagestats").exec().out
+        val dump = runner.exec("dumpsys usagestats")
         val events = parseDumpsysEvents(dump, zone)
         if (events.isNotEmpty()) {
             val start = events.minOf { it.ts }
@@ -621,7 +618,7 @@ class UsageRepository(private val context: Context) {
     private suspend fun syncBattery(now: Long, source: BatterySource): BatteryCaptureOutcome {
         // —— 阶段一：shell + 解析（事务外） ——
         val lines = try {
-            Shell.cmd("dumpsys batterystats --charged").exec().out
+            runner.exec("dumpsys batterystats --charged")
         } catch (e: Exception) {
             recordBatteryFailure("shell", "${e.javaClass.simpleName}: ${e.message}")
             return BatteryCaptureOutcome.Failed("shell", "${e.javaClass.simpleName}: ${e.message}")
