@@ -3,6 +3,7 @@ package com.local.screentime
 import com.local.screentime.data.UsageRepository
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.time.Instant
@@ -146,6 +147,45 @@ class BatteryParseTest {
         assertEquals(10334, UsageRepository.uidOf("u0a334"))
         assertEquals("1000", UsageRepository.uidKeyOf(1000))
         assertEquals(1000, UsageRepository.uidOf("1000"))
+    }
+
+    @Test
+    fun sectionBoundary_stopsAtNextRealHeader_decoysIgnored() {
+        // P1-8：真机 ColorOS 15 结构——power 段（2 空格标题）之后是 "  All kernel wake locks:"，
+        // 旧实现只认 In-memory/Statistics since last charge（真机均未命中）→ 扫描 10000+ 行。
+        // 边界后的形似 component/UID 行不得污染 globals/uids。
+        val p = parse(
+            """  Screen brightnesses:""",   // power 段之前的其他 section（应被忽略）
+            headerLine,
+            """    Capacity: 5920, Computed drain: 1522, actual drain: 1954-2072""",
+            """    Global""",
+            """      screen: 324 apps: 324 duration: 2h 3m 47s 557ms """,
+            """    UID u0a334: 319 fg: 94.4 ( cpu=33.8 ) """,
+            """""",
+            """  All kernel wake locks:""",   // ← 真实边界（2 空格缩进 + 冒号）
+            """  Kernel Wake lock PowerManagerService.WakeLocks: 39m 16s 444ms (3 times) realtime""",
+            """      wifi: 55.5 apps: 55.5""",           // 后段的形似 component 行
+            """    UID u0aXXX: 99 ( cpu=9 ) """,          // 后段的形似 UID 行
+            """      cpu: 1.0""",
+        )
+        assertEquals(324.0, p.globals["screen"]!!.first, 1e-9)
+        assertEquals(1, p.uids.size)
+        assertEquals("u0a334", p.uids[0].uidKey)
+        assertNull("边界后的 wifi 形似行不得进入 globals", p.globals["wifi"])
+        assertNull(p.globals["cpu"])
+    }
+
+    @Test
+    fun sectionBoundary_notHardcodedToOemTitle() {
+        // 任意 2 空格缩进 + 冒号结尾标题都结束 power 段（不硬编码单个 OEM 标题）
+        val p = parse(
+            headerLine,
+            drainLine,
+            """      screen: 10 apps: 10 """,
+            """  Some Oem Custom Section:""",
+            """      screen: 999 apps: 999 """,
+        )
+        assertEquals(10.0, p.globals["screen"]!!.first, 1e-9)
     }
 
     // ===== 以下为真机 dump 原始行（逐字节未改）=====

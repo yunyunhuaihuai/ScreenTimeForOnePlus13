@@ -25,6 +25,7 @@ object CaptureHealth {
 
     fun failCodeOf(outcome: BatteryCaptureOutcome): Int = when (outcome) {
         is BatteryCaptureOutcome.SourceUnavailable -> FAIL_NO_SOURCE
+        is BatteryCaptureOutcome.ParseFailed -> FAIL_PARSE
         is BatteryCaptureOutcome.Failed -> when (outcome.stage) {
             "tx" -> FAIL_TX
             "parser" -> FAIL_PARSE

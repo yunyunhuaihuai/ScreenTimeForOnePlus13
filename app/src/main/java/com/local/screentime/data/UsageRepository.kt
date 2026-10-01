@@ -36,19 +36,23 @@ sealed class SyncResult {
 /** 耗电采集走的通道（root shell 直读 / 应用进程 DUMP 权限），用于持久化「实际同步结果」 */
 enum class BatterySource { ROOT, DUMP }
 
-/** 单次 batterystats 采集/差分的结果（P1-1：区分四类语义，供 Worker 决定是否 retry） */
+/** 单次 batterystats 采集/差分的结果（P1-1/P1-10：区分语义，供 Worker 决定是否 retry） */
 sealed class BatteryCaptureOutcome {
     /** shell 成功、解析非空、差分事务提交成功 */
     data object Success : BatteryCaptureOutcome()
 
-    /** shell 成功但 dump 解析为空（root/DUMP 输出为空、batterystats 尚未就绪等）——
-     *  属系统状态而非本进程错误，等下一周期自然重试即可 */
+    /** shell 成功但输出为合法空（VALID_EMPTY_OUTPUT：batterystats 尚未就绪等系统状态）——
+     *  等下一周期自然重试即可 */
     data object NoData : BatteryCaptureOutcome()
+
+    /** shell 成功、输出非空但解析不出 power 段（PARSE_FAILED：格式变化/非目标输出）——
+     *  CaptureDiagnostics 已落盘供诊断 */
+    data class ParseFailed(val detail: String) : BatteryCaptureOutcome()
 
     /** root 与 DUMP 权限都不可用——重试无意义，需要用户侧动作（root 授权/adb 授权） */
     data object SourceUnavailable : BatteryCaptureOutcome()
 
-    /** shell 执行异常或差分事务异常（已整体回滚）——真正的临时错误，可 retry */
+    /** shell 执行异常/非零退出或差分事务异常（已整体回滚）——真正的临时错误，可 retry */
     data class Failed(val stage: String, val error: String) : BatteryCaptureOutcome()
 }
 
@@ -635,7 +639,7 @@ class UsageRepository(
         // 按会话分布切分到自然日，覆盖 2026-09-04～09-12；那些天的会话被旧版 STOPPED bug 丢掉 30~90%）
         if (dao.getState(KEY_BACKFILL) == null) {
             runCatching {
-                val text = runner.exec("cat /data/local/tmp/stlog_backfill.json").joinToString("\n")
+                val text = runner.exec("cat /data/local/tmp/stlog_backfill.json").stdout.joinToString("\n")
                 if (text.length > 10) {
                     val arr = JSONObject(text).getJSONArray("rows")
                     val list = ArrayList<DailyUsageEntity>(arr.length())
@@ -657,7 +661,11 @@ class UsageRepository(
             runner.exec("dumpsys deviceidle whitelist +${context.packageName}")
         }
         // --checkin 在 root 下输出格式不同（解析恒为 0 行），聚合已由方案 A 覆盖，跳过以缩短同步时间
-        val dump = runner.exec("dumpsys usagestats")
+        val dumpRes = runner.exec("dumpsys usagestats")
+        val dump = if (dumpRes.success) dumpRes.stdout else run {
+            Log.w(TAG, "usagestats shell exit=${dumpRes.exitCode}: ${dumpRes.stderrFirstLine}")
+            emptyList()
+        }
         val events = parseDumpsysEvents(dump, zone)
         if (events.isNotEmpty()) {
             val start = events.minOf { it.ts }
@@ -694,12 +702,21 @@ class UsageRepository(
      */
     private suspend fun syncBattery(now: Long, source: BatterySource): BatteryCaptureOutcome {
         // —— 阶段一：shell + 解析（事务外） ——
-        val lines = try {
+        // P1-10：区分 NO_PRIVILEGE（isRootAvailable=false，调用方处理）/ COMMAND_FAILED
+        // （exit≠0）/ VALID_EMPTY_OUTPUT（exit=0 且 stdout 空）/ PARSE_FAILED（有输出但无 power 段）
+        val res = try {
             runner.exec("dumpsys batterystats --charged")
         } catch (e: Exception) {
             recordBatteryFailure("shell", "${e.javaClass.simpleName}: ${e.message}")
             return BatteryCaptureOutcome.Failed("shell", "${e.javaClass.simpleName}: ${e.message}")
         }
+        if (!res.success) {
+            val err = res.stderrFirstLine ?: ""
+            Log.w(TAG, "battery shell exit=${res.exitCode}: $err")
+            recordBatteryFailure("shell", "exit=${res.exitCode} $err")
+            return BatteryCaptureOutcome.Failed("shell", "exit=${res.exitCode} $err")
+        }
+        val lines = res.stdout
         val parsed = parseBatteryPower(lines)
         // 完整性诊断（P1-2）：无论成败先落盘，diagnosticJson 可回查本帧解析画像
         val diag = CaptureDiagnostics.fromParsed(
@@ -709,9 +726,15 @@ class UsageRepository(
         )
         prefs.edit().putString(PREF_LAST_BATTERY_DIAG, diag.toJson().toString()).apply()
         if (parsed.uids.isEmpty() && parsed.globals.isEmpty()) {
-            Log.i(TAG, "battery: dump 解析为空（root/DUMP 输出异常或 batterystats 未就绪）")
-            recordBatteryFailure("parse", "dump 解析为空（${lines.size} 行）")
-            return BatteryCaptureOutcome.NoData
+            return if (lines.isEmpty()) {
+                Log.i(TAG, "battery: shell 成功但输出为空（VALID_EMPTY_OUTPUT，batterystats 未就绪？）")
+                recordBatteryFailure("parse", "合法空输出（exit=0，0 行）")
+                BatteryCaptureOutcome.NoData
+            } else {
+                Log.w(TAG, "battery: 输出 ${lines.size} 行但解析不出 power 段（PARSE_FAILED）")
+                recordBatteryFailure("parser", "PARSE_FAILED: ${lines.size} 行无可解析内容")
+                BatteryCaptureOutcome.ParseFailed("stdout ${lines.size} 行无可解析内容")
+            }
         }
         // parser anomaly 门控（P1-2）：禁止静默推进部分快照——fgs 字段失配史的教训
         if (diag.anomalies.isNotEmpty()) {
@@ -1113,6 +1136,8 @@ class UsageRepository(
             val drainRe = Regex(
                 """Capacity:\s*([0-9.]+),\s*Computed drain:\s*([0-9.]+),\s*actual drain:\s*([0-9.]+)(?:\s*-\s*([0-9.]+))?"""
             )
+            // 2 空格缩进的段标题（P1-8 边界判据，见循环内注释）
+            val sectionHeaderRe = Regex("""^ {2}\S.*:\s*$""")
             val detailRe = Regex("""(?:^|\s)([a-z_]+)=([0-9.]+)(?: \(([^)]*)\))?""")
             for (raw in lines) {
                 val line = raw.trimEnd()
@@ -1135,6 +1160,13 @@ class UsageRepository(
                 }
                 if (!inPower) continue
                 if (line.contains("In-memory") || line.contains("Statistics since last charge")) break
+                // section 边界（P1-8）：真机 ColorOS 15 dump 中，power 段之后是 2 空格缩进的
+                // 下一段标题（实测为 "  All kernel wake locks:"，此前还有 Screen/Cellular/Wifi
+                // 等 2 空格标题；段内所有内容行 ≥4 空格缩进）。旧实现只认 In-memory/
+                // Statistics since last charge 两个结束条件，真机均未命中 → 扫描 10000+ 行，
+                // 且后续 section 的形似行有污染 globals/uids 的风险。规则：power 段内一旦
+                // 出现 2 空格缩进 + 冒号结尾的标题行即结束，不硬编码任何 OEM 标题。
+                if (sectionHeaderRe.matches(line)) break
                 val dm = drainRe.find(line)
                 if (dm != null) {
                     capacity = dm.groupValues[1].toDoubleOrNull()

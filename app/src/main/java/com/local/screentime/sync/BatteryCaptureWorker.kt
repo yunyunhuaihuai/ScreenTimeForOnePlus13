@@ -42,7 +42,9 @@ class BatteryCaptureWorker(context: Context, params: WorkerParameters) :
             is BatteryCaptureOutcome.NoData -> Result.success()
             // 权限需用户侧动作（root 授权/adb 授权 DUMP）：retry 无意义
             is BatteryCaptureOutcome.SourceUnavailable -> Result.success()
-            // 临时错误：有限次退避重试，避免无限无意义重试
+            // 临时错误/解析异常：有限次退避重试，避免无限无意义重试
+            is BatteryCaptureOutcome.ParseFailed ->
+                if (runAttemptCount < MAX_RETRIES) Result.retry() else Result.success()
             is BatteryCaptureOutcome.Failed ->
                 if (runAttemptCount < MAX_RETRIES) Result.retry() else Result.success()
         }
