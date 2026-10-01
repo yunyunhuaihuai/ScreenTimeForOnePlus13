@@ -37,12 +37,6 @@ android {
         // Robolectric（真实 Room 事务/迁移测试在 JVM 上运行）
         unitTests.isIncludeAndroidResources = true
     }
-    sourceSets {
-        // Room schema JSON 作为测试资产：MigrationTestHelper 按版本号读取（应随仓库提交）
-        getByName("test") {
-            assets.srcDir("$projectDir/schemas")
-        }
-    }
 }
 
 ksp {

@@ -54,9 +54,12 @@ abstract class AppDatabase : RoomDatabase() {
                     "screentime.db",
                 )
                     .addMigrations(MIGRATION_4_5, MIGRATION_5_6)
-                    // 历史 1→4 的 schema 未归档、无法补写迁移，存量老库仍走销毁式重建；
-                    // 当前及以后版本（≥5）必须写增量迁移，禁止再往这个 fallback 里塞新版本。
-                    .fallbackToDestructiveMigration()
+                    // v0.17.0（P0-5）：移除全局 fallbackToDestructiveMigration——
+                    // 对长期历史记录应用，缺迁移就该显式失败，而不是静默清库。
+                    // 仅 v1-3 例外：它们是早期开发版本、schema 未归档（schemas/ 只有 4.json 起，
+                    // 4.json 为按 MIGRATION_4_5 逆推重建），无法补写迁移；这些老库定向销毁重建。
+                    // v4 及以后任何升级必须走显式 Migration（4→5、5→6 均有迁移测试钉死）。
+                    .fallbackToDestructiveMigrationFrom(1, 2, 3)
                     .build().also { instance = it }
             }
     }
