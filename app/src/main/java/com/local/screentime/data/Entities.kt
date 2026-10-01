@@ -101,6 +101,10 @@ data class BatteryDailyEntity(
     val btMah: Double,
     val wakelockMah: Double,
     val sensorsMah: Double,
+    /** 移动网络（mobile_radio 组件）耗电。v7 新增：此前该组件既不进独立列也不进
+     *  otherMah（KNOWN_COMPS 含 mobile_radio），组件明细丢失。注意 UID totalMah
+     *  是 UID 行开头的总值，本列缺失从未导致 totalMah 少记——修的是组件完整性。 */
+    @ColumnInfo(defaultValue = "0.0") val mobileMah: Double = 0.0,
     val otherMah: Double,
 )
 

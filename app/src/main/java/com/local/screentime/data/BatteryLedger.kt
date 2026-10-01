@@ -85,6 +85,37 @@ object BatteryLedger {
         val newWindowStartTs: Long? = null,
     )
 
+    /**
+     * 账本一致性不变量（P1-7，真机曾出现 screenMah 23.03 > totalMah 15.24 的故障行——
+     * 该现象是 P0-1 吞量 bug 的衍生症状，根因修复后新数据不应再出现；本检查作为
+     * 诊断门卫持续盯着账本）。
+     *
+     * 语义：**任意单一**真实功率组件不得显著大于 UID total（total 是 UID 行开头的
+     * 总值；组件间可能有 smear/other/rounding 语义，不要求组件之和严格等于 total，
+     * 所以不用「求和相等」这种脆弱判据）。违反 = "LEDGER_INCONSISTENT"，仅诊断标记，
+     * 不阻断提交（阻断会让历史脏日卡死整条采集链）。
+     */
+    fun ledgerInconsistencies(
+        rows: List<BatteryDailyEntity>,
+        toleranceMah: Double = LEDGER_COMPONENT_TOLERANCE_MAH,
+    ): List<String> {
+        val out = ArrayList<String>()
+        for (r in rows) {
+            val worstComp = maxOf(
+                r.screenMah, r.cpuMah, r.audioMah, r.videoMah, r.cameraMah, r.gnssMah,
+                r.wifiMah, r.mobileMah, r.btMah, r.wakelockMah, r.sensorsMah,
+            )
+            if (worstComp > r.totalMah + toleranceMah) {
+                out.add(
+                    "LEDGER_INCONSISTENT ${r.uidKey}|day=${r.day}: maxComponent=$worstComp > total=${r.totalMah}"
+                )
+            }
+        }
+        return out
+    }
+
+    const val LEDGER_COMPONENT_TOLERANCE_MAH = 0.05
+
     /** 充电重置判据（v0.16.11 引入的比例规则）。
      *  v0.17.1 起降级为 **fallback**：仅当窗口起点缺失、epoch 无法判定时使用；
      *  epoch 可判定时以 [epochStateOf] 为权威（见其注释中的真机实证）。 */
@@ -205,6 +236,9 @@ object BatteryLedger {
                         btMah = (ex?.btMah ?: 0.0) + compDelta("bluetooth") * w,
                         wakelockMah = (ex?.wakelockMah ?: 0.0) + compDelta("wakelock") * w,
                         sensorsMah = (ex?.sensorsMah ?: 0.0) + compDelta("sensors") * w,
+                        // mobile_radio 组件进独立列（P1-6）：此前 KNOWN_COMPS 含 mobile_radio
+                        // 但实体无列，组件明细凭空丢失（不进 otherMah、也不进任何列）
+                        mobileMah = (ex?.mobileMah ?: 0.0) + compDelta("mobile_radio") * w,
                         otherMah = (ex?.otherMah ?: 0.0) + u.comps.keys
                             .filter { it !in KNOWN_COMPS }
                             .sumOf { compDelta(it) } * w,

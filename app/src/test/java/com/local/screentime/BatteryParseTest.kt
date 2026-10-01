@@ -105,6 +105,28 @@ class BatteryParseTest {
     }
 
     @Test
+    fun actualDrainRange_parsed() {
+        // P1-3：真机 2026-10-01 实测行——actual drain 是区间 1954-2072，不得把 low 当唯一实际值
+        val p = parse(
+            headerLine,
+            """    Capacity: 5920, Computed drain: 1522, actual drain: 1954-2072""",
+        )
+        assertEquals(5920.0, p.batteryCapacityMah!!, 1e-9)
+        assertEquals(1522.0, p.computedDrain, 1e-9)
+        assertEquals(1954.0, p.actualDrainLow, 1e-9)
+        assertEquals(2072.0, p.actualDrainHigh!!, 1e-9)
+        assertEquals(2, p.rawLineCount)
+    }
+
+    @Test
+    fun actualDrainSingleValue_highFallsBackToLow() {
+        // 兼容单值形式（旧设备/旧格式）：actual drain: 3256 → high=low
+        val p = parse(headerLine, """    Capacity: 5920, Computed drain: 2460, actual drain: 3256""")
+        assertEquals(3256.0, p.actualDrainLow, 1e-9)
+        assertEquals(3256.0, p.actualDrainHigh!!, 1e-9)
+    }
+
+    @Test
     fun globalComponents_parsed() {
         val p = parse(headerLine, drainLine, gScreen, gCpu, gCamera, gWifi)
         assertEquals(303.0, p.globals["screen"]!!.first, 1e-9)

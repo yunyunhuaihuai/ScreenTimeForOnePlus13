@@ -42,7 +42,10 @@ class BatteryLedgerTest {
         vararg uids: UidPower,
         computedDrain: Double = 0.0,
         windowStartTs: Long? = null,
-    ) = BatteryParsed(uids.toList(), LinkedHashMap(), computedDrain, 0.0, windowStartTs)
+    ) = BatteryParsed(
+        uids = uids.toList(), globals = LinkedHashMap(), computedDrain = computedDrain,
+        actualDrainLow = 0.0, actualDrainHigh = null, windowStartTs = windowStartTs,
+    )
 
     private fun uidOf(
         key: String, total: Double,
@@ -176,6 +179,39 @@ class BatteryLedgerTest {
         )
         // modem/gpu 均非 KNOWN_COMPS：other = (3-1) + (5-2) = 5
         assertEquals(5.0, out.dailyRows.single().otherMah, 1e-9)
+    }
+
+    @Test
+    fun mobileRadioComponent_flowsIntoMobileColumn_notOther() {
+        // P1-6：mobile_radio 此前既不进独立列也不进 otherMah（KNOWN_COMPS 含它），
+        // 组件明细凭空丢失；v7 起进 mobileMah 列
+        val lastTs = ts(2026, 10, 1, 12, 0)
+        val now = lastTs + 60_000
+        val existing = BatteryLedger.Existing(
+            snapshots = mapOf("u0a1" to BatterySnapshotEntity("u0a1", 0.0, "mobile_radio=1.0", lastTs)),
+            daily = emptyMap(), global = emptyMap(),
+        )
+        val out = BatteryLedger.compute(
+            parsedOf(uidOf("u0a1", 10.0, comps = mapOf("mobile_radio" to 3.0))),
+            existing, now, zone,
+        )
+        val r = out.dailyRows.single()
+        assertEquals(2.0, r.mobileMah, 1e-9)  // 3 - 1
+        assertEquals(0.0, r.otherMah, 1e-9)   // 不得并入 other
+    }
+
+    // ---------- 账本一致性不变量（P1-7） ----------
+
+    @Test
+    fun ledgerInconsistencies_flagsComponentGreaterThanTotal() {
+        // 真机故障形态：screenMah 23.03 > totalMah 15.24（P0-1 吞量 bug 的衍生症状）
+        val bad = dailyRow("u0a333", 100L, total = 15.24).copy(screenMah = 23.03)
+        val good = dailyRow("u0a334", 100L, total = 319.0).copy(screenMah = 138.0, cpuMah = 33.8)
+        val violations = BatteryLedger.ledgerInconsistencies(listOf(bad, good))
+        assertEquals(1, violations.size)
+        assertTrue(violations[0].contains("LEDGER_INCONSISTENT"))
+        assertTrue(violations[0].contains("u0a333"))
+        assertEquals(0, BatteryLedger.ledgerInconsistencies(listOf(good)).size)
     }
 
     // ---------- 全局组件 ----------

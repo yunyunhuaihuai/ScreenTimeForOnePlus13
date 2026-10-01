@@ -28,6 +28,8 @@ sealed class SyncResult {
         val eventCount: Int,
         val sessionCount: Int,
         val rootUsed: Boolean = false,
+        /** battery 分支是否成功（P1-1：usage 成功不代表 battery 成功，二者独立健康） */
+        val batteryOk: Boolean = true,
     ) : SyncResult()
 }
 
@@ -66,8 +68,15 @@ data class BatteryParsed(
     val globals: Map<String, Pair<Double, Long>>,
     val computedDrain: Double,
     val actualDrainLow: Double,
+    /** actual drain 的上界（真机实测形如 1954-2072；单值形式时与 low 相同）。
+     *  v0.17.1（P1-3）：此前只取第一个数字，把 low 当成唯一实际值。 */
+    val actualDrainHigh: Double? = null,
     /** 「自上次充电」统计窗口的起点（dump 里的 Start clock time），窗口可跨天甚至跨多天 */
     val windowStartTs: Long? = null,
+    /** 电池容量（Capacity: 5920）。注意：是电池容量，不是本窗口耗电，禁止与 UID sum 直接比较 */
+    val batteryCapacityMah: Double? = null,
+    /** 传入 parser 的原始行数（P1-2 完整性诊断用） */
+    val rawLineCount: Int = 0,
 )
 
 /**
@@ -260,6 +269,8 @@ class UsageRepository(
                 if (!rootOk && !hasDumpAccess()) {
                     captureHealth = CaptureHealth.onFailure(captureHealth, now, CaptureHealth.FAIL_NO_SOURCE)
                     saveCaptureHealth()
+                    // 无源也是一次 battery failure（P1-1 健康线）
+                    dao.putState(SyncStateEntity(KEY_LAST_BATTERY_FAIL_TS, now))
                     BatteryCaptureOutcome.SourceUnavailable
                 } else {
                     val outcome = syncBattery(now, if (rootOk) BatterySource.ROOT else BatterySource.DUMP)
@@ -298,16 +309,17 @@ class UsageRepository(
         //    读权威状态；su 不可用时 getShell() 返回非 root shell，isRoot=false 正常降级。
         var rootUsed = false
         var rootSessionCount = 0
+        var batteryOk = true
         try {
             val rootOk = runner.isRootAvailable()
             if (rootOk) {
                 rootSessionCount = syncViaRoot()
                 rootUsed = rootSessionCount > 0
-                syncBattery(now, BatterySource.ROOT)
+                batteryOk = syncBattery(now, BatterySource.ROOT) is BatteryCaptureOutcome.Success
             } else if (hasDumpAccess()) {
                 // 无 root 但持有 DUMP（debug 构建 adb 可授）：应用侧 dumpsys 采集耗电，
                 // 同样需要在系统充电重置前抢拍（v0.16.8）
-                syncBattery(now, BatterySource.DUMP)
+                batteryOk = syncBattery(now, BatterySource.DUMP) is BatteryCaptureOutcome.Success
             }
         } catch (e: Exception) {
             Log.w(TAG, "root sync failed", e)
@@ -350,13 +362,13 @@ class UsageRepository(
 
         refreshAppRegistry()
         runCatching { generateDueReports(force = false) }
-        // 持久化「实际同步结果」（P1-5）：diagnosticJson 输出真实历史状态，
-        // 而不是诊断时现场 probe（Shell.isAppGrantedRoot 冷启动为 null 曾恒误报 API）
+        // 持久化「实际同步结果」（P1-5 / P1-1）：usage 与 battery 两条独立健康线——
+        // UsageStats 成功不等于 batterystats 成功，diagnosticJson 分别呈现
         dao.putState(SyncStateEntity(KEY_LAST_USAGE_SOURCE, if (rootUsed) 1L else 2L))
-        dao.putState(SyncStateEntity(KEY_LAST_SYNC_SUCCESS_TS, now))
+        dao.putState(SyncStateEntity(KEY_LAST_USAGE_SUCCESS_TS, now))
         prefs.edit().putString(PREF_LAST_SYNC_ERROR, null).apply()
-        Log.d(TAG, "sync: root=$rootUsed apiEvents=${events.size} sessions=$sessionCount")
-        return SyncResult.Ok(windowStart, now, events.size, sessionCount, rootUsed)
+        Log.d(TAG, "sync: root=$rootUsed apiEvents=${events.size} sessions=$sessionCount batteryOk=$batteryOk")
+        return SyncResult.Ok(windowStart, now, events.size, sessionCount, rootUsed, batteryOk)
     }
 
     /**
@@ -484,8 +496,12 @@ class UsageRepository(
         if (entities.isNotEmpty()) dao.upsertApps(entities)
     }
 
-    /** 诊断导出：某天全部会话 + 聚合 + 持久化的同步/采样健康状态（P1-1/P1-5） */
-    suspend fun diagnosticJson(day: Long): String {
+    /**
+     * 诊断导出：某天全部会话 + 聚合 + 持久化的同步/采样健康状态（P1-1/P1-5/P2）。
+     * perUid=true 时附按耗电排序的逐 UID 调试段（rawUidKey/归属/组件，截取 top 30 控制体积）；
+     * 不包含原始 dump（隐私与体积），需要 raw 时用审计脚本现场取证。
+     */
+    suspend fun diagnosticJson(day: Long, perUid: Boolean = false): String {
         val sessions = dao.sessionsOfDay(day)
         val rows = dailyRows(day)
         val zone = ZoneId.systemDefault()
@@ -520,8 +536,7 @@ class UsageRepository(
         root.put("day", LocalDate.ofEpochDay(day).toString())
         root.put("hasUsagePermission", reader.hasPermission())
         root.put("lastUsageSource", usageSource)
-        root.put("lastBatterySource", batterySource)
-        root.put("lastSyncSuccessTs", tsString(dao.getState(KEY_LAST_SYNC_SUCCESS_TS)))
+        root.put("lastUsageSuccessTs", tsString(dao.getState(KEY_LAST_USAGE_SUCCESS_TS)))
         root.put("lastSyncError", prefs.getString(PREF_LAST_SYNC_ERROR, null) ?: JSONObject.NULL)
         val health = JSONObject()
         health.put("lastCaptureAttemptTs", tsString(capture.lastAttemptTs))
@@ -533,6 +548,54 @@ class UsageRepository(
             capture.maxObservedCaptureGapMs ?: JSONObject.NULL,
         )
         root.put("captureHealth", health)
+        // battery 独立健康线（P1-1）+ 最近一帧解析画像（P1-2/P1-4）+ 账本不变量样本（P1-7）
+        val battery = JSONObject()
+        battery.put("source", batterySource)
+        battery.put("lastBatterySuccessTs", tsString(dao.getState(KEY_LAST_BATTERY_SUCCESS_TS)))
+        battery.put("lastBatteryFailureTs", tsString(dao.getState(KEY_LAST_BATTERY_FAIL_TS)))
+        battery.put("lastBatteryFailure", prefs.getString(PREF_LAST_BATTERY_FAIL, null) ?: JSONObject.NULL)
+        battery.put("epochWindowStartTs", tsString(dao.getState(KEY_BATTERY_WINDOW_START_TS)))
+        battery.put(
+            "lastCaptureDiagnostics",
+            prefs.getString(PREF_LAST_BATTERY_DIAG, null)?.let { CaptureDiagnostics.fromJson(it)?.toJson() }
+                ?: JSONObject.NULL,
+        )
+        battery.put("ledgerInconsistent", prefs.getString(PREF_LAST_LEDGER_INCONSISTENT, null) ?: JSONObject.NULL)
+        root.put("battery", battery)
+        if (perUid) {
+            // 逐 UID 调试段：归属结果（唯一包 / 共享 / 系统）+ 组件明细，top 30 by totalMah
+            val uidArr = JSONArray()
+            for (r in dao.batteryDailyRows(day).sortedByDescending { it.totalMah }.take(30)) {
+                val uid = uidOf(r.uidKey)
+                val owner = if (uid >= 10000) try {
+                    ownerPackageOf(uid, context.packageManager.getPackagesForUid(uid))
+                } catch (e: Exception) {
+                    null
+                } else null
+                val o = JSONObject()
+                o.put("rawUidKey", r.uidKey)
+                o.put(
+                    "attribution",
+                    when {
+                        uid < 10000 -> "system"
+                        owner != null -> owner
+                        else -> sharedUidLabel(r.uidKey) ?: "shared"
+                    },
+                )
+                o.put("totalMah", r.totalMah)
+                o.put(
+                    "components",
+                    JSONObject().apply {
+                        put("screen", r.screenMah); put("cpu", r.cpuMah); put("audio", r.audioMah)
+                        put("video", r.videoMah); put("camera", r.cameraMah); put("gnss", r.gnssMah)
+                        put("wifi", r.wifiMah); put("mobile", r.mobileMah); put("bt", r.btMah)
+                        put("wakelock", r.wakelockMah); put("sensors", r.sensorsMah); put("other", r.otherMah)
+                    },
+                )
+                uidArr.put(o)
+            }
+            root.put("perUidBattery", uidArr)
+        }
         val arr = JSONArray()
         for (s in sessions) {
             val o = JSONObject()
@@ -638,49 +701,69 @@ class UsageRepository(
             return BatteryCaptureOutcome.Failed("shell", "${e.javaClass.simpleName}: ${e.message}")
         }
         val parsed = parseBatteryPower(lines)
+        // 完整性诊断（P1-2）：无论成败先落盘，diagnosticJson 可回查本帧解析画像
+        val diag = CaptureDiagnostics.fromParsed(
+            parsed,
+            baselineUidCount = dao.getState(KEY_PARSER_BASELINE_UIDS),
+            hadWindowBaseline = dao.getState(KEY_PARSER_HAD_WINDOW) != null,
+        )
+        prefs.edit().putString(PREF_LAST_BATTERY_DIAG, diag.toJson().toString()).apply()
         if (parsed.uids.isEmpty() && parsed.globals.isEmpty()) {
             Log.i(TAG, "battery: dump 解析为空（root/DUMP 输出异常或 batterystats 未就绪）")
             recordBatteryFailure("parse", "dump 解析为空（${lines.size} 行）")
             return BatteryCaptureOutcome.NoData
         }
+        // parser anomaly 门控（P1-2）：禁止静默推进部分快照——fgs 字段失配史的教训
+        if (diag.anomalies.isNotEmpty()) {
+            Log.w(TAG, "battery parser anomaly: ${diag.anomalies} —— 本帧不提交")
+            recordBatteryFailure("parser", "anomaly: ${diag.anomalies.joinToString(";")}")
+            return BatteryCaptureOutcome.Failed("parser", diag.anomalies.joinToString(";"))
+        }
+        // 健康帧 → 更新基线（供后续帧的相对异常判据；不设固定 UID 阈值）
+        dao.putState(SyncStateEntity(KEY_PARSER_BASELINE_UIDS, parsed.uids.size.toLong()))
+        if (parsed.windowStartTs != null) dao.putState(SyncStateEntity(KEY_PARSER_HAD_WINDOW, 1L))
         val zone = ZoneId.systemDefault()
 
         // —— 阶段二：单一事务（调用方已持 SYNC_MUTEX，差分基于串行化的快照状态） ——
         // epoch 标记（上一帧窗口起点）在事务内读取、与新帧比较并在事务内推进（P0-1/P0-4）
         val prevWindowStartTs = dao.getState(KEY_BATTERY_WINDOW_START_TS)
-        try {
-            val out = applyBatteryLedgerTx(
+        val out: BatteryLedger.Result = try {
+            applyBatteryLedgerTx(
                 db, dao, parsed, now, zone,
                 pkgOf = ::resolveBatteryOwnerPackage,
                 prevWindowStartTs = prevWindowStartTs,
             )
-            if (out.epochChanged) {
-                Log.i(
-                    TAG,
-                    "battery: GLOBAL RESET epoch " + (prevWindowStartTs?.let { Instant.ofEpochMilli(it).atZone(zone).toLocalDateTime().toString() } ?: "?") +
-                        " → " + parsed.windowStartTs?.let { Instant.ofEpochMilli(it).atZone(zone).toLocalDateTime().toString() } +
-                        "（旧 epoch 快照全部失效）",
-                )
-            }
         } catch (e: Exception) {
-            // 事务已整体回滚：快照未推进、daily 未写入，本轮差分作废，
+            // 事务已整体回滚：快照未推进、daily 未写入、epoch 标记未推进，本轮差分作废，
             // 下一轮采集会基于旧快照重算（宁可少记一轮，不可半提交）
             Log.w(TAG, "battery tx failed (rolled back)", e)
             recordBatteryFailure("tx", "${e.javaClass.simpleName}: ${e.message}")
             return BatteryCaptureOutcome.Failed("tx", "${e.javaClass.simpleName}: ${e.message}")
         }
+        // 账本一致性不变量（P1-7）：任意单一组件 > total+容差 → LEDGER_INCONSISTENT（仅诊断，不阻断）
+        val violations = BatteryLedger.ledgerInconsistencies(out.dailyRows)
+        prefs.edit()
+            .putString(PREF_LAST_LEDGER_INCONSISTENT, violations.take(20).joinToString("\n").ifEmpty { null })
+            .apply()
+        if (violations.isNotEmpty()) {
+            Log.w(TAG, "ledger invariant violations=${violations.size} first=${violations.first()}")
+        }
+        dao.putState(SyncStateEntity(KEY_LAST_BATTERY_SUCCESS_TS, now))
         dao.putState(SyncStateEntity(KEY_LAST_BATTERY_SOURCE, if (source == BatterySource.ROOT) 1L else 2L))
+        prefs.edit().putString(PREF_LAST_BATTERY_FAIL, null).apply()
         Log.d(
             TAG,
             "battery: uids=${parsed.uids.size} globals=${parsed.globals.size} drain=${parsed.computedDrain} " +
-                "src=$source window=${parsed.windowStartTs?.let { Instant.ofEpochMilli(it).atZone(zone).toLocalDateTime() } ?: "?"}",
+                "src=$source epochChanged=${out.epochChanged} " +
+                "window=${parsed.windowStartTs?.let { Instant.ofEpochMilli(it).atZone(zone).toLocalDateTime() } ?: "?"}",
         )
         return BatteryCaptureOutcome.Success
     }
 
-    /** 采集失败的持久化记录（人类可读原因进 prefs；时间戳/错误码由 CaptureHealth 状态管理） */
-    private fun recordBatteryFailure(stage: String, error: String) {
+    /** 采集失败的持久化记录（人类可读原因进 prefs；时间戳进 sync_state，供 P1-1 健康键拆分） */
+    private suspend fun recordBatteryFailure(stage: String, error: String) {
         prefs.edit().putString(PREF_LAST_BATTERY_FAIL, "[$stage] $error").apply()
+        dao.putState(SyncStateEntity(KEY_LAST_BATTERY_FAIL_TS, System.currentTimeMillis()))
     }
 
     /**
@@ -835,21 +918,26 @@ class UsageRepository(
         const val KEY_SYSUID_FIX = "sysuid_labels_v18"
 
         // —— 持久化诊断状态（P1-1/P1-5，sync_state 持久化，diagnosticJson 输出） ——
+        // usage 与 battery 是两条独立健康线（P1-1）：UsageStats 成功不代表 batterystats 成功
         const val KEY_LAST_USAGE_SOURCE = "last_usage_source"      // 1=ROOT 2=API
         const val KEY_LAST_BATTERY_SOURCE = "last_battery_source"  // 1=ROOT 2=DUMP
-        const val KEY_LAST_SYNC_SUCCESS_TS = "last_sync_success_ts"
         const val KEY_LAST_USAGE_SUCCESS_TS = "last_usage_success_ts"
         const val KEY_LAST_BATTERY_SUCCESS_TS = "last_battery_success_ts"
         const val KEY_LAST_BATTERY_FAIL_TS = "last_battery_fail_ts"
         const val KEY_BATTERY_WINDOW_START_TS = "battery_window_start_ts" // batterystats epoch 标记（P0-1）
+        // parser 完整性基线（P1-2）：不设固定 UID 阈值，用本设备近期健康解析做相对参照
+        const val KEY_PARSER_BASELINE_UIDS = "parser_baseline_uid_count"
+        const val KEY_PARSER_HAD_WINDOW = "parser_had_window_baseline"
+        // 人类可读的诊断文本（prefs，sync_state 只能存 Long）
+        const val PREF_LAST_SYNC_ERROR = "last_sync_error"
+        const val PREF_LAST_BATTERY_FAIL = "last_battery_fail"
+        const val PREF_LAST_BATTERY_DIAG = "last_battery_diag"               // CaptureDiagnostics JSON
+        const val PREF_LAST_LEDGER_INCONSISTENT = "last_ledger_inconsistent" // LEDGER_INCONSISTENT 样本
         const val KEY_CAP_ATTEMPT = "cap_last_attempt_ts"
         const val KEY_CAP_SUCCESS = "cap_last_success_ts"
         const val KEY_CAP_FAIL_CODE = "cap_last_fail_code"
         const val KEY_CAP_FAIL_TS = "cap_last_fail_ts"
         const val KEY_CAP_MAX_GAP = "cap_max_gap_ms"
-        // 人类可读的失败原因（prefs，sync_state 只能存 Long）
-        const val PREF_LAST_SYNC_ERROR = "last_sync_error"
-        const val PREF_LAST_BATTERY_FAIL = "last_battery_fail"
         const val SOURCE_EVENT = 0
         const val SOURCE_AGG_API = 1
         const val SOURCE_ROOT = 2
@@ -933,6 +1021,7 @@ class UsageRepository(
                 btMah = rows.sumOf { it.btMah },
                 wakelockMah = rows.sumOf { it.wakelockMah },
                 sensorsMah = rows.sumOf { it.sensorsMah },
+                mobileMah = rows.sumOf { it.mobileMah },
                 otherMah = rows.sumOf { it.otherMah },
             )
         }
@@ -1004,6 +1093,8 @@ class UsageRepository(
             var inPower = false
             var computedDrain = 0.0
             var actualLow = 0.0
+            var actualHigh = 0.0
+            var capacity: Double? = null
             var windowStartTs: Long? = null
             val uids = ArrayList<UidPower>()
             val globals = LinkedHashMap<String, Pair<Double, Long>>()
@@ -1019,7 +1110,9 @@ class UsageRepository(
             val fgRe = Regex("""(?:^|\s)fg: ([0-9.]+)""")
             val bgRe = Regex("""(?:^|\s)bg: ([0-9.]+)""")
             val fgsRe = Regex("""(?:^|\s)fgs: ([0-9.]+)""")
-            val drainRe = Regex("""Capacity:\s*[0-9.]+,\s*Computed drain:\s*([0-9.]+),\s*actual drain:\s*([0-9.]+)""")
+            val drainRe = Regex(
+                """Capacity:\s*([0-9.]+),\s*Computed drain:\s*([0-9.]+),\s*actual drain:\s*([0-9.]+)(?:\s*-\s*([0-9.]+))?"""
+            )
             val detailRe = Regex("""(?:^|\s)([a-z_]+)=([0-9.]+)(?: \(([^)]*)\))?""")
             for (raw in lines) {
                 val line = raw.trimEnd()
@@ -1044,8 +1137,10 @@ class UsageRepository(
                 if (line.contains("In-memory") || line.contains("Statistics since last charge")) break
                 val dm = drainRe.find(line)
                 if (dm != null) {
-                    computedDrain = dm.groupValues[1].toDoubleOrNull() ?: 0.0
-                    actualLow = dm.groupValues[2].toDoubleOrNull() ?: 0.0
+                    capacity = dm.groupValues[1].toDoubleOrNull()
+                    computedDrain = dm.groupValues[2].toDoubleOrNull() ?: 0.0
+                    actualLow = dm.groupValues[3].toDoubleOrNull() ?: 0.0
+                    actualHigh = dm.groupValues[4].toDoubleOrNull() ?: actualLow
                     continue
                 }
                 val um = uidRe.find(line)
@@ -1076,7 +1171,10 @@ class UsageRepository(
                     globals[cm.groupValues[1]] = Pair(mah, parseDurationMs(cm.groupValues[4]))
                 }
             }
-            return BatteryParsed(uids, globals, computedDrain, actualLow, windowStartTs)
+            return BatteryParsed(
+                uids, globals, computedDrain, actualLow, actualHigh, windowStartTs,
+                capacity, lines.size,
+            )
         }
 
         private val DUMP_EVENT_TYPES = mapOf(

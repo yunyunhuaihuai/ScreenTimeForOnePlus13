@@ -429,7 +429,9 @@ fun UsageApp(
                 statusText = when (result) {
                     is SyncResult.Ok ->
                         "上次同步 " + LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm")) +
-                            " · " + result.sessionCount + " 段会话" + if (result.rootUsed) " · root 全量" else ""
+                            " · " + result.sessionCount + " 段会话" +
+                            (if (result.rootUsed) " · root 全量" else "") +
+                            (if (!result.batteryOk) " · 耗电未更新" else "")
                     SyncResult.NoPermission -> "缺少“使用情况访问”权限"
                 }
                 loadDayAsync()

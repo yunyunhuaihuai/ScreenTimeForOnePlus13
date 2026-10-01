@@ -93,7 +93,7 @@ class RoomMigrationTest {
 
     private fun buildRoom(): AppDatabase =
         Room.databaseBuilder(context, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_4_5, AppDatabase.MIGRATION_5_6)
+            .addMigrations(AppDatabase.MIGRATION_4_5, AppDatabase.MIGRATION_5_6, AppDatabase.MIGRATION_6_7)
             .allowMainThreadQueries()
             .build()
 
@@ -108,10 +108,10 @@ class RoomMigrationTest {
     }
 
     @Test
-    fun migrate4To6_allTenTablesDataPreserved() = runBlocking {
+    fun migrate4ToLatest_allTenTablesDataPreserved() = runBlocking {
         createLegacyDb(4, atV5 = false).use { seedAllTables(it) }
 
-        val dao = buildRoom().usageDao()  // 首次访问触发 4→5→6 迁移 + Room schema 校验
+        val dao = buildRoom().usageDao()  // 首次访问触发 4→5→6→7 迁移 + Room schema 校验
 
         assertEquals(1, dao.sessionsOfDay(20656).size)
         assertEquals(60000L, dao.sessionsOfDay(20656)[0].endTs - dao.sessionsOfDay(20656)[0].startTs)
@@ -124,6 +124,7 @@ class RoomMigrationTest {
         assertEquals(247.5, battery!!.totalMah, 1e-9)
         assertEquals(28.8, battery.fgMah, 1e-9)
         assertEquals("v4 老库补出的 fgsMah 列默认 0", 0.0, battery.fgsMah, 1e-9)
+        assertEquals("v6→7 补出的 mobileMah 列默认 0", 0.0, battery.mobileMah, 1e-9)
         assertEquals(988.0, dao.batteryGlobalRows(20656)[0].mah, 1e-9)
         assertEquals(3161912L, dao.batteryGlobalRows(20656)[0].durationMs)
         assertEquals(247.5, dao.getBatterySnapshot("u0a334")!!.cumMah, 1e-9)

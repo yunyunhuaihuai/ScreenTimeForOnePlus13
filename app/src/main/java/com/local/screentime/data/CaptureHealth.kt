@@ -21,10 +21,15 @@ object CaptureHealth {
     const val FAIL_SHELL = 2       // shell 执行异常（临时错误，可 retry）
     const val FAIL_TX = 3          // 差分事务异常（已整体回滚，可 retry）
     const val FAIL_NO_DATA = 4     // dump 解析为空（系统状态，等下一周期）
+    const val FAIL_PARSE = 5       // parser 完整性异常（P1-2：禁止静默推进部分快照，可 retry）
 
     fun failCodeOf(outcome: BatteryCaptureOutcome): Int = when (outcome) {
         is BatteryCaptureOutcome.SourceUnavailable -> FAIL_NO_SOURCE
-        is BatteryCaptureOutcome.Failed -> if (outcome.stage == "tx") FAIL_TX else FAIL_SHELL
+        is BatteryCaptureOutcome.Failed -> when (outcome.stage) {
+            "tx" -> FAIL_TX
+            "parser" -> FAIL_PARSE
+            else -> FAIL_SHELL
+        }
         is BatteryCaptureOutcome.NoData -> FAIL_NO_DATA
         is BatteryCaptureOutcome.Success -> FAIL_NONE
     }
@@ -34,6 +39,7 @@ object CaptureHealth {
         FAIL_SHELL -> "shell 执行失败"
         FAIL_TX -> "差分事务失败（已回滚）"
         FAIL_NO_DATA -> "dump 解析为空"
+        FAIL_PARSE -> "parser 完整性异常（本帧未提交）"
         else -> "无"
     }
 
