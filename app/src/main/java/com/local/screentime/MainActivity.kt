@@ -374,6 +374,13 @@ fun UsageApp(
             allPackages.associateWith { repo.resolveDisplay(it) }
         }
     }
+    // 共享 UID（packageName=null 的耗电行）的展示名：动态解析包列表，不猜归属（P1-2）
+    val sharedUidLabels by produceState<Map<String, String>>(emptyMap(), batteryAll) {
+        val keys = batteryAll.filter { it.packageName == null }.map { it.uidKey }.distinct()
+        value = withContext(Dispatchers.IO) {
+            keys.mapNotNull { k -> repo.sharedUidLabel(k)?.let { k to it } }.toMap()
+        }
+    }
 
     var loadJob by remember { mutableStateOf<Job?>(null) }
 
@@ -462,7 +469,7 @@ fun UsageApp(
     val weekday = selectedDay.dayOfWeek.getDisplayName(JavaTextStyle.SHORT, Locale.CHINESE)
 
     val rowsMap = remember(rows) { rows.associate { it.packageName to it.totalMs } }
-    val displayRows: List<UiRowInfo> = remember(rows, batteryAll, displays, batteryByPkg, sortByBattery, rowsMap) {
+    val displayRows: List<UiRowInfo> = remember(rows, batteryAll, displays, sharedUidLabels, batteryByPkg, sortByBattery, rowsMap) {
         buildList {
             if (sortByBattery) {
                 batteryAll.sortedByDescending { it.totalMah }.forEach { b ->
@@ -470,6 +477,8 @@ fun UsageApp(
                     val disp = pkg?.let { displays[it] }
                     val label = disp?.label
                         ?: pkg
+                        // 共享 UID（多包同 UID）：显示包列表而不是把耗电挂给任意一个包（P1-2）
+                        ?: sharedUidLabels[b.uidKey]
                         ?: repo.systemUidLabel(b.uidKey)
                         ?: "系统进程"
                     add(

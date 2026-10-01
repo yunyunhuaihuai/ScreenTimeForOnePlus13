@@ -19,7 +19,7 @@ import kotlinx.coroutines.launch
  *
  * 本接收器在 POWER_CONNECTED 时与系统抢跑：尽力在重置生效前读出最终累计值并差分入库。
  * 即使抢跑失败（读到的是重置后的小值），差分逻辑也能正确识别重置、不产生脏数据，
- * 损失由 15 分钟兜底采样（BatteryCaptureWorker）兜住。
+ * 残余损失由周期兜底采样（BatteryCaptureWorker，名义 15 分钟、实际受系统调度影响）承担。
  */
 class PowerEventReceiver : BroadcastReceiver() {
 
@@ -29,8 +29,8 @@ class PowerEventReceiver : BroadcastReceiver() {
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val repo = UsageRepository(context.applicationContext)
-                val ok = repo.captureBatteryNow()
-                Log.i(TAG, "power-capture: captured=$ok")
+                val outcome = repo.captureBatteryNow()
+                Log.i(TAG, "power-capture: $outcome")
             } catch (e: Exception) {
                 Log.w(TAG, "power-capture failed", e)
             } finally {
