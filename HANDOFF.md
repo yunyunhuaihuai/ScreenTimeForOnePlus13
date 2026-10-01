@@ -7,9 +7,9 @@
 一台一加 13（ColorOS 15）上用"冰箱"冻结应用后，**系统自带屏幕使用时间不再显示这些应用的时长**（展示层过滤）。本项目自建记录器：跨三层混合数据源重建完整的使用时长 + 耗电统计，**冻结应用照样显示**，并逐步加入 iOS 屏幕时间风格的可视化。
 
 - 目标设备：OnePlus 13（PJZ110），ColorOS 15 / Android 15（API 35），KernelSU root，屏幕 1440×3168
-- 包名：`com.local.screentime`，应用名“屏幕时间”，当前 v0.16.14（versionCode 30）
+- 包名：`com.local.screentime`，应用名“屏幕时间”，当前 v0.17.0（versionCode 32）
 - 工程：本仓库根目录；技术栈 Kotlin + Compose(M3) + Room + WorkManager + libsu，无 NDK
-- minSdk/targetSdk/compileSdk = 35；数据库 Room v5（包含平滑升级 MIGRATION_4_5）
+- minSdk/targetSdk/compileSdk = 35；数据库 Room v6（显式迁移 MIGRATION_4_5 / MIGRATION_5_6，schema JSON 已入库 schemas/，**已移除全局销毁式迁移**——v4+ 升级必须写显式 Migration，缺迁移会显式失败而不是清库）
 
 ## 2. 构建与部署
 
@@ -42,13 +42,17 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/release/app-release.apk
 展示策略：**事件重建值与聚合值逐包取 max**（`dailyRows()`）。
 耗时统计写入 `sessions` 表 + `usage_daily` 聚合表；耗电写入 `battery_daily` / `battery_global`（快照差分，充满清零自动检测：新值<旧值-0.5 即重置）。
 
-### 表结构（Room v5）
+### 表结构（Room v6）
 - `sessions(pkg, startTs, endTs, day)` —— 会话（RESUMED/PAUSED 配对，跨午夜切分，<2s 碎片丢弃；重建时按 startTs >= windowStart 清除，保留跨左边界的历史会话）
 - `usage_daily(pkg, day, totalMs, source[0事件/1聚合API/2root])` —— 每日每包时长
-- `battery_daily(uidKey, day, total/fg/bg/fgs/screen/cpu/audio/video/camera/gnss/wifi/bt/wakelock/sensors/other mAh)` —— 每日每 UID 耗电（v0.16.14 扩展 fgsMah 前台服务耗电）
+- `battery_daily(uidKey, day, total/fg/bg/fgs/screen/cpu/audio/video/camera/gnss/wifi/bt/wakelock/sensors/other mAh)` —— 每日每 UID 耗电（v0.16.14 扩展 fgsMah 前台服务耗电；**v0.17.0 起共享 UID（多包同 UID）的行 packageName=null，不归属给任意单个包**）
 - `battery_global(component, day, mah, durationMs)` —— 整机组件耗电（屏幕/CPU/蓝牙/音频/GNSS/息屏显示…；durationMs 持续差分累加）
-- `battery_snapshot(uidKey, cumMah, compsText, ts)` —— 差分基线（含 `__global_drain__` 与 `__global_drain___dur`）
-- `app_info`（label/图标快照，冻结后仍可显示）、`sync_state`（事件水位线）
+- `battery_snapshot(uidKey, cumMah, compsText, ts)` —— 差分基线（含 `__global__` 与 `__global___dur`）
+- `app_info`（label/图标快照，冻结后仍可显示）、`sync_state`（事件水位线 + **v0.17.0 起的同步/采样诊断状态**：last_usage_source、last_battery_source、last_sync_success_ts、cap_* 采样健康）
+- `reports(type, periodKey, generatedTs, text, finalized)` —— v6 新增 finalized（1=正式，0=当前周期预览；列默认 1，既有报告按正式历史保留）
+
+### 展示与报告的唯一口径（v0.17.0）
+`effective usage = 逐包逐日 max(会话聚合, usage_daily 回补值)`，实现在 `UsageDao.effectiveUsageDay/effectiveUsageBetween`；首页 `dailyRows`、周报/月报/年报的总量/Top/环比共用同一查询——UI 与报告不再各自维护一套逻辑，历史回补日（2026-09-04～09-12）数据计入报告。
 
 ### 分类
 `repo.categoryOf(pkg)`：手动覆盖（SharedPreferences `cat_overrides` JSON）→ 系统 `ApplicationInfo.category` → 内置中国应用字典（`categoryDict`，微信/QQ→通讯社交、抖音/B站→影音娱乐、DeepSeek/豆包→AI 助手…）→ 兜底"其他"。修改入口：应用明细弹窗"修改"。
@@ -59,7 +63,7 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/release/app-release.apk
 - 小时柱状图：**按分类堆叠**（社交蓝/娱乐橙/AI 紫…，底部图例）；**点任意柱子弹出该小时分类构成 + 应用明细**
 - **全天时间轴色带**：0-24 时的会话色带，按分类上色
 - **拿起与解锁**卡片：每天拿起次数（KEYGUARD_HIDDEN 计数）+ 解锁后 15 秒内最常打开的 App Top3（表 `day_stats` / `unlock_stats`，root 与 API 事件流双路写入，事件保留约 2 天）
-- **报告**：周报（周日晚）/月报（月底）/年报（年底）自动生成（`reports` 表，周期结束 2 天内补生成），含环比上一周期 Top 应用变化、拿起次数、总耗电；卡片可点开全文、可手动立即生成当前周期
+- **报告**：周报/月报/年报自动生成（`reports` 表）。**v0.17.0 语义修正**：正式报告一律针对「最近已完整结束的周期」（周报=上一个 Mon-Sun，周一及以后；月报=上一自然月，次月 1 日起；年报=上一自然年，次年 1 月 1 日起），按 8 周/6 月/2 年有界回溯补生成，错过的周期不会永久错过；手动生成改为「当前周期预览」（finalized=0，与正式报告区分，周期结束后被正式报告覆盖）。卡片可点开全文，含环比上一周期 Top 应用变化、拿起次数、总耗电
 - 应用占比：两列"图标+名称+占比%"网格（中间竖分隔线）
 - 排行列表：时长/耗电双模式排序；耗电模式含系统条目（Android 系统服务/系统服务…）；行尾显示 mAh + 后台占比（≥30% 标红）
 - 应用明细弹窗（点行）：分类（可修改，写 `cat_overrides` 覆盖自动分类）/总时长/打开次数/**全部会话起止与时长（可滚动，无条数上限）**/耗电前后台
@@ -68,6 +72,35 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/release/app-release.apk
 - 每 6h WorkManager 后台对账；打开即先读本地库秒出、再后台同步（同步已去掉无用的 --checkin 解析，~1-2s）；Doze 白名单（root 自动添加）
 - ~~诊断导出（菜单）~~：**实际不可达**——`UsageRepository.diagnosticJson(day)` 实现完整（当天会话+聚合+root/权限状态 JSON），但标题栏 ⋮ 按钮没有任何弹窗入口，属死代码。详见 4.0.7。
 - 应用名"屏幕时间"，自适应图标（蓝底白时钟+黄色弧）
+
+## 4.0.16 v0.17.0 变更（数据正确性与可靠性专项：agent/v017-data-integrity 分支）
+
+本版不新增功能，只修数据正确性。分析基线 main=ea9cd53（v0.16.13），实际基于最新「千问」分支（v0.16.15，vc31）开发——真机数据库已是 Room v5，从 main（v4）重建会回退。开发前对照代码核验了 HANDOFF 旧结论，其中两条与实际不符：
+
+- **「v0.16.7 已解决同步并发双计」只对同一实例成立（P0-1，本轮修正）**：
+  - **根因**：`syncMutex` 是 UsageRepository 的**实例成员**，而 MainActivity / SyncWorker / BatteryCaptureWorker / PowerEventReceiver 各自 new 仓库实例，实例锁互不感知；captureBatteryNow 虽在「千问」分支已进锁（f8e1156），但跨实例仍无保护。两个 capture 同时基于同一旧快照启动 → 后提交者整行 REPLACE（丢增量）或快照 cumMah 倒退（下轮差分双计）。
+  - **修复**：锁移到 companion（`SYNC_MUTEX` 进程级单例）；syncNow 与 captureBatteryNow 全部串行化于它。测试：BatteryLedgerTest 两个 capture 基于同一旧快照的序列化场景（不双计/不丢增量/快照不回退）+ 独立锁漏洞对照复现。
+- **「v0.16.13」任务清单中『captureBatteryNow 未进锁』已过时**：千问分支已修，本轮核验后保留其结构并升级为进程级锁。
+- **batterystats 差分原子事务（P0-2）**：
+  - **根因**：旧 syncBattery 顺序为 读旧快照 → 算差分 → **先推进快照** → 写 daily（两次独立写入），进程在中间被杀 → 快照已指向新累计值、daily 未落库，该段差分永久丢失。
+  - **修复**：拆两阶段——事务外 shell+纯解析（dumpsys 绝不进 Room 事务）；单一 `db.withTransaction` 内「批量读旧状态（candidateDays 保证覆盖全部触碰日期）→ 纯差分（新模块 BatteryLedger）→ 批量写 battery_daily/global → **最后**推进快照」，任一步失败整体回滚。UID 与 GLOBAL（含 `_dur`）快照同规则。差分语义逐条对齐旧实现（重置比例判据/0.001 阈值/other 归并），消除了逐 UID 的数据库 round trip。
+  - **测试**：BatteryLedgerTxTest（Robolectric 真实 Room）：差分计算后注入故障 → 快照与 daily/global 全部回滚，不出现半提交；多天窗口批量读取不重写既有行。
+- **报告周期 resolver 重设计（P0-3）**：
+  - **根因**：旧 `currentPeriods(today)` 返回进行中周期 + `today ∈ [end, end+7]` 补生成判断——周期一切换（周一/次月 1 日/次年 1 月 1 日）currentPeriods 已指向新周期，上一周期**永远补不上**；反而会在周期最后一天（周日晚/月底/12-31）把未结束的周期当正式报告提前生成。
+  - **修复**：新 `ReportPeriods`——正式报告只针对「最近已完整结束的周期」（周报=上一 Mon-Sun；月报=上一自然月；年报=上一自然年），按 8 周/6 月/2 年有界回溯补生成；手动生成改为「当前周期预览」（ReportEntity 新增 finalized 字段，Room v6 MIGRATION_5_6 列默认 1，**既有报告全部按正式历史保留**）。旧版提前生成的报告按「生成时间早于周期结束=过早」规则在升级后自动以完整口径重生成。periodKey 格式不变。
+  - **测试**：ReportPeriodsTest 覆盖 周日 00:01/23:59、周一、周六、月末最后一天、次月 1 日、闰月、12-31、1-1、过早/预览升级规则、周一起始不变量（2026 全季度逐日）。
+- **effective usage 唯一口径（P0-4）**：
+  - **根因**：UI `dailyRows` 取 max(会话, usage_daily 回补) 修复了 2026-09-04~09-12 旧 STOPPED bug 历史日；但报告（v0.16.14 起改为逐日调 dailyRows）与 UI 仍各跑一套合并逻辑，且效率低（周报 14 次查询）。
+  - **修复**：DAO 新增 `effectiveUsageDay` / `effectiveUsageBetween`（sessions 聚合 UNION ALL usage_daily 逐包逐日取 MAX，区间对每日 effective 求和）——首页与报告共用同一 SQL 口径，报告总量/Top/环比与首页逐日求和**完全一致**（单测钉死），周报查询从 14 次降到 2 次。删除死代码 sessionsSumBetween/topSessionsBetween。
+- **停止销毁式迁移（P0-5）**：移除 `fallbackToDestructiveMigration()`；schema JSON（4/5/6.json）入库，4.json 为按 MIGRATION_4_5 逆推重建的历史档案；仅 v1-3（早期开发版、无档案）定向 fallback。RoomMigrationTest（Robolectric 真实迁移路径）：v4/v5 结构手工建库 + 全部 10 张表样本数据 → Room 打开迁移 → schema 校验 + 数据值级断言（sessions/usage_daily/battery_daily 含 fgsMah/battery_global/battery_snapshot/day_stats/unlock_stats/reports/app_info/sync_state 全保留）。
+- **采集语义与健康监控（P1-1）**：captureBatteryNow 返回四类结果（Success/NoData/SourceUnavailable/Failed），Worker 仅对临时错误 retry（上限 3 次），权限不可用/解析为空不 retry；文档删除「最大损失窗口 ≤15 分钟」绝对表述（PeriodicWorkRequest 名义 15 分钟，实际受 Doze 与调度影响）。新增采样健康状态（sync_state 持久化）：lastCaptureAttemptTs / lastCaptureSuccessTs / lastCaptureFailure（错误码+时刻）/ maxObservedCaptureGapMs（实际观测到的最大成功间隔=实际损失窗口），diagnosticJson 输出。
+- **共享 UID 耗电归属（P1-2）**：`getPackagesForUid` 唯一对应一个包才归属；多包共享 UID 不再挂给任意第一个包（保持 packageName=null，UI 动态解析包列表显示「共享 UID：A / B / …」），杜绝整机耗电复制给多个 App 双计。存量已误挂的行不做回算（不可追溯），新数据正确。测试 OwnerPackageTest。
+- **高权限命令抽象（P1-3）**：新增 `PrivilegedCommandRunner` 接口 + `RootCommandRunner`（libsu 直移封装，行为等价）；UsageRepository 不再散落 Shell.cmd。Shizuku 后端留待独立 PR。
+- **checkin 格式脚手架（P1-4）**：`CheckinBatteryParser`（仅解析高置信度 pwi 行）+ 合成 fixture + 与 human-readable 真机行的一致性测试。**未经 OnePlus 13 实测对账，不接入生产**；human-readable parser（经真机验证）保持生产地位。注意 `-c` ≠ `--checkin`（后者带旧 completed 统计段特殊语义）。
+- **持久化同步来源（P1-5）**：last_usage_source(ROOT/API)、last_battery_source(ROOT/DUMP)、last_sync_success_ts、last_sync_error/last_battery_fail 持久化；diagnosticJson 不再用 `Shell.isAppGrantedRoot()` 现场猜测（冷启动 null 恒误报，v0.16.10 已证明）。
+- **P2 核验记录**：① battery_global.durationMs 增量累计——v0.16.14（gemini）已修（`__global___dur` 差分快照），待办销项；② allCategories 已含「图像」；③ README 已写 Gradle Wrapper；④ release 仍用 debug signingConfig（个人测试用，勿当正式发行签名）；⑤ MainActivity ~1400 行 / UsageRepository ~1100 行，架构拆分见「架构重构原则」待办。
+- **测试规模**：JVM 单测 76/76 通过（较 v0.16.15 的 25 个新增 51 个）；`:app:assembleDebug` 产物复核 versionCode=32/versionName=0.17.0。
+- **待真机验证（未做，不得标注通过）**：① 真机升级 v4→6/v5→6 迁移后历史数据完整（模拟器/JVM 已验证迁移逻辑）；② 进程级锁下 15min 采样与手动同步并发无双计（DB 前后对比法，见第 7 节）；③ 共享 UID 行显示与归属；④ 周一/次月 1 日的上一周期补生成与通知；⑤ 诊断 JSON 的 lastUsageSource/lastBatterySource 与实际通道一致。
 
 ## 4.0.15 v0.16.14 变更（修复数据处理与统计口径错误，由 Gemini 修复）
 
@@ -356,15 +389,19 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/release/app-release.apk
 11. **耗电统计是"窗口口径"，不是"自然日口径"**：`dumpsys batterystats --charged` = 「自上次充电以来」，起点不是当天 0 点、可跨午夜甚至跨多天 → 任何「按今天」的聚合都必须按窗口时间轴分摊（v0.16.6 已修，见 4.0.6）。且各组件耗电全是**模型估算**：`组件 mAh = 该组件计时器时长 × power_profile.xml 里的固定电流常数`；相机的"计时器"= **相机子系统被占用时长**，所以**视频通话、扫码、前后台取景都会计入「相机」**，不只是拍照。
 12. 真机取证的两个环境坑（调试时必踩）：ColorOS **不把三方 App 的 `Log.d` 写进 logcat 缓冲区**；拉数据库必须用 `adb exec-out`（用 `adb shell cat` 会被 CRLF 破坏成 `database disk image is malformed`）。详见 4.0.7。
 
-## 6. 已知问题 / 待办（2026-09-19 更新）
+## 6. 已知问题 / 待办（2026-10-01 更新）
 
 ### 待办 / 后续建议（大致按优先级排序）
-1. **`battery_global` durationMs 增量累加** —— 目前 `mah` 累加但 `durationMs` 只在当天首次插入时写一次；若后续要展示“整机组件（相机/屏幕/音频等）开启时长”，需把 duration 也按增量累加。
-2. **Room `fallbackToDestructiveMigration()` + `exportSchema=false`** —— 表结构修改时需提供显式 Migration，防范改表清库；建议后续增加“导出/备份数据库到下载目录”功能。
-3. **架构重构与文件拆分** —— `MainActivity.kt` 约 1350 行，建议后续拆分出 `HomeViewModel` 并将各个弹窗（DetailDialog、SettingsDialog 等）与图表提取至独立的 UI 组件文件。
-4. **速览插件专项** —— 需欢太账号 + 个人开发者认证申请 Card 权限。
+1. **架构拆分（P0 全部完成后的重构轮）**：UsageRepository → UsageSyncRepository / BatteryRepository / ReportRepository / AppMetadataRepository；shell/parser 拆纯模块；MainActivity（~1400 行）→ HomeViewModel + 图表/Dialog/Settings 独立 Compose 文件。每次拆分必须行为等价并跑回归测试，不做一次性大重构。
+2. **正式数据导出**：SQLite backup / JSON / CSV / diagnostic bundle（Storage Access Framework），导出 schema 必须带 version 字段；不得把设备敏感信息、本机绝对路径、ADB serial、密钥写入仓库。
+3. **Shizuku 后端**：基于 P1-3 的 PrivilegedCommandRunner 接口实现 ShizukuCommandRunner，独立 PR。
+4. **checkin batterystats 真机对账（P1-4 收尾）**：拿 OnePlus 13 真机 `dumpsys batterystats -c` 原始样本逐行对账（注意 `-c` 与 `--checkin` 语义不同），对账通过前 CheckinBatteryParser 不接入生产。**严禁运行 `dumpsys batterystats --reset` / `--reset-all`。**
+5. **shared UID 展示优化（可选）**：uid_packages 持久化映射（当前为显示时动态解析，卸载后历史行退化为「共享 UID（u0aX）」）。
+6. **速览插件专项** —— 需欢太账号 + 个人开发者认证申请 Card 权限。
+7. **release 签名**：当前仍用 debug signingConfig（个人测试用，勿当正式发行签名发布）。
 
 ### 近期已解决项
+- ✅ **数据正确性专项（v0.17.0，本分支）**：进程级同步互斥（P0-1）、差分原子事务（P0-2）、周期 resolver 重设计（P0-3）、effective usage 唯一口径（P0-4）、停止销毁式迁移（P0-5）、采集健康监控/共享 UID/持久化诊断来源（P1-1/2/5）、命令执行抽象（P1-3）、checkin 脚手架（P1-4）。详见 4.0.16。
 - ✅ **手势重组卡顿**（v0.16.13）：移除 `dragTotal` Compose State，改为 `pointerInput` 内部局部变量累加。
 - ✅ **切日异步竞态**（v0.16.13）：`loadDayAsync()` 增加 Job 取消机制与目标日期双向核验。
 - ✅ **小时图重绘性能**（v0.16.13）：`HourlyChart` 24 小时区间循环增加 `remember` 缓存。
@@ -376,8 +413,8 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/release/app-release.apk
 - ✅ **重置误判虚高 & 小耗电隐藏**（v0.16.11）：重置判据改比例（`< 0.5 * old`），补齐 `<0.5mAh` 格式化。
 - ✅ **冷启动首同步 root 降级**（v0.16.10）：改用 `Shell.getShell().isRoot` 同步等待 su 握手。
 - ✅ **UID 行含 fgs 耗电消失**（v0.16.9）：UID 行正则重构，全额捕获前台服务耗电。
-- ✅ **同步并发双计**（v0.16.7）：`syncNow` 加协程 Mutex 锁。
 - ✅ **标题栏 ⋮ 菜单无响应**（v0.16.7）：接通 DropdownMenu 并支持当日诊断 JSON 导出。
+- ⚠️→✅ **同步并发双计**（v0.16.7 标记解决 → **v0.17.0 真正解决**）：v0.16.7 只给 `syncNow` 加了**实例级** Mutex，而四个调用方各自构建 UsageRepository 实例，跨实例并发（15min 采样 vs 6h 对账 vs 插电抢拍）从未被串行化；v0.16.8~v0.16.14 期间该问题一直存在。v0.17.0 移到 companion 级进程锁 + 差分原子事务 + 并发/回滚测试（BatteryLedgerTest / BatteryLedgerTxTest）后，本条才可标记为已解决。
 
 ## 7. 验证命令速查
 
