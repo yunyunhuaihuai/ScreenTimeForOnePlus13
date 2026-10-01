@@ -7,9 +7,9 @@
 一台一加 13（ColorOS 15）上用"冰箱"冻结应用后，**系统自带屏幕使用时间不再显示这些应用的时长**（展示层过滤）。本项目自建记录器：跨三层混合数据源重建完整的使用时长 + 耗电统计，**冻结应用照样显示**，并逐步加入 iOS 屏幕时间风格的可视化。
 
 - 目标设备：OnePlus 13（PJZ110），ColorOS 15 / Android 15（API 35），KernelSU root，屏幕 1440×3168
-- 包名：`com.local.screentime`，应用名“屏幕时间”，当前 v0.17.0（versionCode 32）
+- 包名：`com.local.screentime`，应用名“屏幕时间”，当前 v0.17.1（versionCode 33）
 - 工程：本仓库根目录；技术栈 Kotlin + Compose(M3) + Room + WorkManager + libsu，无 NDK
-- minSdk/targetSdk/compileSdk = 35；数据库 Room v6（显式迁移 MIGRATION_4_5 / MIGRATION_5_6，schema JSON 已入库 schemas/，**已移除全局销毁式迁移**——v4+ 升级必须写显式 Migration，缺迁移会显式失败而不是清库）
+- minSdk/targetSdk/compileSdk = 35；数据库 Room v8（显式迁移 MIGRATION_4_5/5_6/6_7/7_8，schema JSON 已入库 schemas/，**已移除全局销毁式迁移**——v4+ 升级必须写显式 Migration，缺迁移会显式失败而不是清库）
 
 ## 2. 构建与部署
 
@@ -102,7 +102,57 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/release/app-release.apk
 - **测试规模**：JVM 单测 76/76 通过（较 v0.16.15 的 25 个新增 51 个）；`:app:assembleDebug` 产物复核 versionCode=32/versionName=0.17.0。
 - **待真机验证（未做，不得标注通过）**：① 真机升级 v4→6/v5→6 迁移后历史数据完整（模拟器/JVM 已验证迁移逻辑）；② 进程级锁下 15min 采样与手动同步并发无双计（DB 前后对比法，见第 7 节）；③ 共享 UID 行显示与归属；④ 周一/次月 1 日的上一周期补生成与通知；⑤ 诊断 JSON 的 lastUsageSource/lastBatterySource 与实际通道一致。
 
-### 4.0.16.1 真机验证记录（2026-10-01 深夜，OnePlus 13 e4e1b43e，ColorOS 15）
+### 4.0.17 v0.17.1 变更（真机审计驱动的数据完整性修复：epoch 重置 / 会话权威 / 归属 / parser / 诊断）
+
+本轮全部修复由真机（OnePlus 13，ColorOS 15.0.0.861）数据审计确认后实施，非假设案例。审计工具（export_battery_diagnostic.py / battery_diagnostic_raw.json / batterystats.txt）含设备隐私，已 gitignore 不入库；关键数值以脱敏形式进入测试 fixture。
+
+### P0-1 Reset Swallow（吞量）bug——真机实锤与修复
+
+- **实锤**：抖音 u0a333 旧 epoch 快照 ≈132.8 mAh → 充电周期切换后新 epoch dump 148 mAh。旧判据 `new < old×0.5`（148 < 66.4 = false）不触发 → delta = 148−132.8 = **15.2 mAh 入账**，新 epoch 前段 ~132.8 mAh 被永久吞掉，且快照被推进到 148 无法回补。同日 screenMah 23.03 > totalMah 15.24 是同一错误基线的衍生症状。
+- **修复**：epoch 判定取代数值判据——持久化上一帧窗口起点（sync_state.`battery_window_start_ts`），与本帧解析的 `Start clock time` 比较，明确不同 = **GLOBAL RESET**：所有旧快照（UID/GLOBAL/GLOBAL_DUR，含本帧未出现的 UID）在同一事务内统一失效重建。unplug 广播不可靠，禁止作为判据；窗口起点缺失时才退回旧比例 heuristic；SAME epoch 禁止任何数值型 reset（100→97 是模型回算）。epoch 标记与数据写入同事务（失败三者全部回滚）。
+- 真机事实：窗口起点 2026-10-01 18:05:32、capacity 5920、computed 1522、actual 1954~2072、UID 142 个；bilibili 319 / QQ 261 / 抖音 148 mAh，而抖音当天入库仅 15.24——修复后同类场景 delta=全量。
+
+### P0-2 root→API 降级覆盖权威历史（会话 source-aware）
+
+- UsageSession 新增 `source` 列（v8）：LEGACY(0，历史行默认，按权威对待)/ROOT(1)/API(2)。
+- API fallback（`applyApiFallbackSessions`，单事务）：只删 source=API 的旧 fallback；新 API 会话与权威会话时间相交即丢弃（`filterNonOverlapping`，半开区间）；只补权威缺席区间。root 恢复后全量重建自然回到权威结果。
+
+### P0-3 归属修复
+
+- `batteryForPackages` 重写：逐行按 `ownerPackageOf` 归属（共享 UID/系统 UID 恒 null 整行跳过），分身同包多 UID（QQ=u0a351+u999a351、微信=u0a350+u999a350，真机确认）**求和聚合**，不再静默覆盖；`groupBatteryRowsByOwner`/`sumBatteryDaily` 纯函数可测。
+
+### P1 各项
+
+- **P1-1**：usage/battery 两条独立健康线（last_usage_success_ts / last_battery_success_ts / last_battery_fail_ts）；SyncResult.Ok.batteryOk；CaptureHealth 新增 FAIL_PARSE。
+- **P1-2**：CaptureDiagnostics（rawLineCount/UID 数/全局数/窗口起点/capacity/computed/actualLow/High/sumUidTotal/parserVersion）+ 基于本设备健康基线的异常检测（不设固定阈值）；anomaly 帧禁止提交（fgs 失配史教训）。
+- **P1-3**：actual drain 解析区间 `1954-2072`（上界此前被丢）；单值形式 high=low。
+- **P1-4/P1-5**：能量口径比率 uidAttributionRatio / modelCoverageLow/High；**真机事实**：Global 无有效 wifi/mobile_radio power、UID mobile_radio=0、checkin pwi cell=0（09-18 窗口 wifi=72.8 存在）、EnergyConsumer on-battery stats 不支持。设备无法提供有效 WiFi/cellular UID power attribution 是模型缺口的**重要候选来源**——缺口区间（computed 1522 vs actual 1954~2072，差 432~550 mAh）不得精确归因给任何组件或 App，严禁按比例摊派。
+- **P1-6**：battery_daily.mobileMah（v7）；修组件明细完整性，非 total 少记。
+- **P1-7**：账本不变量 LEDGER_INCONSISTENT（任意单一组件 > total+0.05 mAh 即标记；仅诊断不阻断）。
+- **P1-8**：power 段边界=2 空格缩进段标题（真机实测段后为 `  All kernel wake locks:`）；旧实现只认 In-memory/Statistics（真机未命中）→ 扫描 10000+ 行。不硬编码 OEM 标题。
+- **P1-9**：checkin parser 按真机重写：行结构 `<ver>,<uid>,<agg>,<section>,<fields...>`（pwi/pws 是 cols[3]）；真机 fixture（2026-09-18 root --checkin，脱敏）+ AOSP fixture 双钉死；旧实现的错误列结构由 negative 用例锁死。**真机事实：checkin 的 pwi 全部为设备级组件（uid=0），per-UID 耗电在该 ROM checkin 中不存在** → checkin 无法替代 human-readable 的 per-UID 账本，后者保持生产主路径。
+- **P1-10**：CommandResult(stdout/stderr/exitCode/success)；区分 COMMAND_FAILED / VALID_EMPTY_OUTPUT（→NoData）/ PARSE_FAILED（→新 outcome）/ NO_PRIVILEGE。
+- **P1-11**：报告改「应用归因耗电（UID 模型估算，非整机实际耗电）」——SUM(battery_daily.totalMah) 是 UID 归因口径，不得与 battery_global 相加（重叠语义），更非 computedDrain/5920（容量≠窗口耗电）。
+- **P1-12**：backfillPlan 逐周期检查（break→continue）——中间缺失周期（连杀两周后台后恢复的场景）现在会被补齐；通知仍只推最新周期。
+
+### 数据库 v6→v8
+
+- v7：battery_daily.mobileMah（MIGRATION_6_7）；v8：sessions.source（MIGRATION_7_8）。schema 7/8.json 入库；迁移测试覆盖 4→8 全链（全部表值级保留 + 新列默认值 + 历史会话 source=LEGACY）。
+
+### 测试与验证
+
+- JVM 单测 115/115（v0.17.0 的 76 → 新增 39，含 epoch 6 场景、会话权威、checkin 双 fixture、异常检测、invariant、backfill 计划）。
+- 本轮验证限于 JVM/Robolectric 与构建（手机未连接）；**真机回归待办**（连接后按 HANDOFF 第 7 节取证手法执行）：
+  1. 同一 epoch 连续两次采集：第二次只增加真实 delta；
+  2. 自然发生的下一次 epoch 切换：所有 UID 全局重置，不再出现抖音式 148→15 吞量；
+  3. epoch 首帧缺席的 UID 重新出现时不与旧基线做差；
+  4. 任意单一 component 不再明显大于 totalMah（LEDGER_INCONSISTENT 诊断应为空或仅历史行）；
+  5. shared UID 不挂给任意单 App；6. u0/u999 同包聚合展示；
+  7. root 临时不可用（可临时撤权模拟）时 API fallback 不破坏 ROOT sessions；
+  8. battery shell/parser/tx 失败时 diagnosticJson 的 battery 段独立显示 failure。
+- 严禁：`dumpsys batterystats --reset` / `--reset-all`；给 UID 功率乘经验系数；把 Actual−Computed 缺口按比例摊给 App；为迁移清库。
+
+## 4.0.16.1 真机验证记录（2026-10-01 深夜，OnePlus 13 e4e1b43e，ColorOS 15）
 
 验证方法：升级前用 `run-as` 拉取 v5 库三件套（db/-wal/-shm，WAL 未 checkpoint 也一并保留）作基线 A；装 0.17.0（debug 构建，与 release 同 debug 签名，覆盖安装保留数据且 run-as 可用）；启动后拉 B（迁移+首次同步）、二次启动拉 C（第二次同步）、`dumpsys battery unplug`→`set ac 1` 模拟插电触发抢拍后拉 D（之后 `dumpsys battery reset` 恢复）。DB 分析用本机 Node 24 内置 `node:sqlite`（可回放 WAL），快照/逐行 diff 全程脚本化。快照总和含 `__global___dur` 行的毫秒时长值，**不能**当 mAh 看待。
 

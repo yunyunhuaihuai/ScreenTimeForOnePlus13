@@ -42,3 +42,9 @@ desktop.ini
 /*.db
 /*.xml
 /uitest/
+
+# --- 真机审计/取证文件（含设备隐私数据，不入库；分析结论写入 HANDOFF）---
+/batterystats.txt
+/battery_diagnostic_raw.json
+/packages.txt
+/export_battery_diagnostic.py
