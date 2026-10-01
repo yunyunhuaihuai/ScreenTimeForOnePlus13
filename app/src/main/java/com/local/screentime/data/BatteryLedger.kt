@@ -356,3 +356,45 @@ internal suspend fun applyBatteryLedgerTx(
         out.newWindowStartTs?.let { dao.putState(SyncStateEntity(UsageRepository.KEY_BATTERY_WINDOW_START_TS, it)) }
         out
     }
+
+/**
+ * API fallback 会话落库（P0-2，v0.17.1）：单一事务内
+ *  1) 只删除 source=API 的旧 fallback 会话——ROOT/LEGACY 权威历史**永不触碰**；
+ *  2) 新 API 会话与现存权威会话时间重叠的一律丢弃（只补权威缺席的区间）；
+ *  3) 推进事件水位线。
+ * root 恢复后，root 全量重建路径（deleteSessionsStartingAfter + ROOT 来源插入）
+ * 会自然替换此前的 API fallback 数据。
+ * probeAfterCompute 仅供事务回滚测试注入故障。
+ */
+internal suspend fun applyApiFallbackSessions(
+    db: RoomDatabase,
+    dao: UsageDao,
+    apiSessions: List<UsageSession>,
+    windowStart: Long,
+    watermarkTs: Long,
+    probeBeforeInsert: (suspend () -> Unit)? = null,
+) {
+    db.withTransaction {
+        dao.deleteSessionsBySourceStartingAfter(SESSION_SOURCE_API, windowStart)
+        val authority = dao.sessionsActiveSince(windowStart)
+        val safe = filterNonOverlapping(apiSessions, authority)
+        probeBeforeInsert?.invoke()
+        if (safe.isNotEmpty()) dao.insertSessions(safe)
+        dao.putState(SyncStateEntity(UsageRepository.KEY_WATERMARK, watermarkTs))
+    }
+}
+
+/**
+ * 重叠过滤（P0-2 纯函数）：候选会话与任一权威会话时间区间相交即丢弃
+ * （权威模型同一时刻只有一个前台应用，跨包重叠同样是 API 残缺流的伪影）。
+ */
+internal fun filterNonOverlapping(
+    candidates: List<UsageSession>,
+    authority: List<UsageSession>,
+): List<UsageSession> {
+    if (candidates.isEmpty() || authority.isEmpty()) return candidates
+    val sorted = authority.sortedBy { it.startTs }
+    return candidates.filter { c ->
+        sorted.none { a -> c.startTs < a.endTs && a.startTs < c.endTs }
+    }
+}

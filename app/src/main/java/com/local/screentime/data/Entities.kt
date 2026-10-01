@@ -5,6 +5,14 @@ import androidx.room.Entity
 import androidx.room.Index
 import androidx.room.PrimaryKey
 
+/** 会话数据来源（P0-2 source-aware 权威策略，v8 起落库）。
+ *  ROOT 可修正对应窗口内的一切数据；API（ColorOS queryEvents 被深度裁剪）只能补
+ *  ROOT 权威缺席的区间、永不删除 ROOT session；LEGACY = v7 及以前入库的历史会话
+ *  （当时只有 root 重建路径），升级时按 ROOT 权威对待，禁止清库。 */
+const val SESSION_SOURCE_LEGACY = 0
+const val SESSION_SOURCE_ROOT = 1
+const val SESSION_SOURCE_API = 2
+
 /** 一次前台会话；跨午夜的会话在写入前已按本地日切分。 */
 @Entity(
     tableName = "sessions",
@@ -17,6 +25,8 @@ data class UsageSession(
     val endTs: Long,
     /** LocalDate.toEpochDay()，按会话起始时刻归属 */
     val day: Long,
+    /** 数据来源（P0-2）；DB 列默认 0=LEGACY，历史会话升级后保持权威地位 */
+    @ColumnInfo(defaultValue = "0") val source: Int = SESSION_SOURCE_LEGACY,
 )
 
 /** 应用注册表：label/图标快照，冻结或卸载后仍能显示历史记录 */

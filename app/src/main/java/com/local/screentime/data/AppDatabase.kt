@@ -20,7 +20,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         UnlockStatsEntity::class,
         ReportEntity::class,
     ],
-    version = 7,
+    version = 8,
     // 导出 schema：今后每次升版本都有历史 schema 可依据，能写真正的增量迁移；
     // 配合下面的注释，destructive fallback 只保留给 4 之前的存量老库
     exportSchema = true,
@@ -53,6 +53,14 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_7_8 = object : Migration(7, 8) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // 会话来源标记（P0-2）：历史会话（v7 前只有 root 重建路径入库）按 LEGACY=权威处理；
+                // API fallback 只能补 ROOT 缺席区间、永不删除权威历史
+                db.execSQL("ALTER TABLE sessions ADD COLUMN source INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
         fun get(context: Context): AppDatabase =
             instance ?: synchronized(this) {
                 instance ?: Room.databaseBuilder(
@@ -60,7 +68,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "screentime.db",
                 )
-                    .addMigrations(MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7)
+                    .addMigrations(MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8)
                     // v0.17.0（P0-5）：移除全局 fallbackToDestructiveMigration——
                     // 对长期历史记录应用，缺迁移就该显式失败，而不是静默清库。
                     // 仅 v1-3 例外：它们是早期开发版本、schema 未归档（schemas/ 只有 4.json 起，

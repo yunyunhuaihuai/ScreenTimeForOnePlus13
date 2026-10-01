@@ -93,7 +93,10 @@ class RoomMigrationTest {
 
     private fun buildRoom(): AppDatabase =
         Room.databaseBuilder(context, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_4_5, AppDatabase.MIGRATION_5_6, AppDatabase.MIGRATION_6_7)
+            .addMigrations(
+                AppDatabase.MIGRATION_4_5, AppDatabase.MIGRATION_5_6,
+                AppDatabase.MIGRATION_6_7, AppDatabase.MIGRATION_7_8,
+            )
             .allowMainThreadQueries()
             .build()
 
@@ -111,10 +114,11 @@ class RoomMigrationTest {
     fun migrate4ToLatest_allTenTablesDataPreserved() = runBlocking {
         createLegacyDb(4, atV5 = false).use { seedAllTables(it) }
 
-        val dao = buildRoom().usageDao()  // 首次访问触发 4→5→6→7 迁移 + Room schema 校验
+        val dao = buildRoom().usageDao()  // 首次访问触发 4→5→6→7→8 迁移 + Room schema 校验
 
         assertEquals(1, dao.sessionsOfDay(20656).size)
         assertEquals(60000L, dao.sessionsOfDay(20656)[0].endTs - dao.sessionsOfDay(20656)[0].startTs)
+        assertEquals("历史会话迁移后按 LEGACY（权威）对待", com.local.screentime.data.SESSION_SOURCE_LEGACY, dao.sessionsOfDay(20656)[0].source)
         assertEquals(60000L, dao.dailyAggRows(20656)[0].totalMs)
         assertEquals(42L, dao.getState("event_watermark"))
         assertEquals("微信", dao.appInfo("com.tencent.mm")?.label)

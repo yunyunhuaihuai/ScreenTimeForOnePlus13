@@ -343,13 +343,12 @@ class UsageRepository(
         val events = if (rootUsed) emptyList() else reader.queryEvents(windowStart, now)
         var sessionCount = rootSessionCount
         if (!rootUsed) {
-            val sessions = buildSessions(events, windowStart, now)
+            // API 事件流兜底（P0-2）：ColorOS queryEvents 被深度裁剪，绝不能让残缺 API
+            // 数据删除 root 建立的权威历史——只清理自己的旧 fallback 数据，且新 API 会话
+            // 与 ROOT/LEGACY 权威会话时间重叠的一律丢弃
+            val sessions = buildSessions(events, windowStart, now, SESSION_SOURCE_API)
             sessionCount = sessions.size
-            db.withTransaction {
-                dao.deleteSessionsStartingAfter(windowStart)
-                if (sessions.isNotEmpty()) dao.insertSessions(sessions)
-                dao.putState(SyncStateEntity(KEY_WATERMARK, now))
-            }
+            applyApiFallbackSessions(db, dao, sessions, windowStart, now)
             // day_stats/unlock_stats 是整行 REPLACE：API 事件残缺时算出的拿起/首开次数偏小，
             // 只有 root 路径没拿到事件时才允许 API 兜底（v0.16.7）
             runCatching { syncDayEventStats(events, ZoneId.systemDefault()) }
@@ -670,8 +669,9 @@ class UsageRepository(
         if (events.isNotEmpty()) {
             val start = events.minOf { it.ts }
             val end = events.maxOf { it.ts }
-            val sessions = buildSessions(events, start, end)
+            val sessions = buildSessions(events, start, end, SESSION_SOURCE_ROOT)
             db.withTransaction {
+                // root 全量重建：ROOT 可修正对应窗口内的一切来源（含此前的 API fallback）
                 dao.deleteSessionsStartingAfter(start)
                 if (sessions.isNotEmpty()) dao.insertSessions(sessions)
             }
@@ -1224,7 +1224,12 @@ class UsageRepository(
          *  注意不能用 ACTIVITY_STOPPED 关会话：ColorOS 应用内切 Activity 恒为
          *  PAUSED(旧)→RESUMED(新)→STOPPED(旧) 同戳三连，STOPPED(旧) 与新会话同包，
          *  会把刚开的会话 0 秒关掉，导致多 Activity 应用整段丢时长（实测知乎丢 ~90%）。 */
-        fun buildSessions(events: List<RawEvent>, windowStart: Long, windowEnd: Long): List<UsageSession> {
+        fun buildSessions(
+            events: List<RawEvent>,
+            windowStart: Long,
+            windowEnd: Long,
+            source: Int = SESSION_SOURCE_ROOT,
+        ): List<UsageSession> {
             val zone = ZoneId.systemDefault()
             val out = ArrayList<UsageSession>()
             var openPkg: String? = null
@@ -1241,7 +1246,12 @@ class UsageRepository(
                     val day = Instant.ofEpochMilli(cur).atZone(zone).toLocalDate()
                     val nextDayStart = day.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
                     val end = minOf(at, nextDayStart)
-                    out.add(UsageSession(packageName = pkg, startTs = cur, endTs = end, day = day.toEpochDay()))
+                    out.add(
+                        UsageSession(
+                            packageName = pkg, startTs = cur, endTs = end,
+                            day = day.toEpochDay(), source = source,
+                        )
+                    )
                     cur = end
                 }
             }

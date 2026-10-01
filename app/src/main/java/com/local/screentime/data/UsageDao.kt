@@ -18,6 +18,14 @@ interface UsageDao {
     @Query("DELETE FROM sessions WHERE startTs >= :fromTs")
     suspend fun deleteSessionsStartingAfter(fromTs: Long)
 
+    /** source-aware 删除（P0-2）：API fallback 只清理自己的旧 fallback 数据 */
+    @Query("DELETE FROM sessions WHERE source = :source AND startTs >= :fromTs")
+    suspend fun deleteSessionsBySourceStartingAfter(source: Int, fromTs: Long)
+
+    /** 窗口内仍存活的会话（含跨界行，startTs 可早于 fromTs），供 API fallback 做重叠过滤 */
+    @Query("SELECT * FROM sessions WHERE endTs >= :fromTs")
+    suspend fun sessionsActiveSince(fromTs: Long): List<UsageSession>
+
     @Query(
         "SELECT packageName, day, SUM(endTs - startTs) AS totalMs FROM sessions " +
             "WHERE day = :day GROUP BY packageName ORDER BY totalMs DESC"
