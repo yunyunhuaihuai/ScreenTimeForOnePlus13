@@ -87,6 +87,8 @@ class OwnerPackageTest {
         assertEquals(CaptureHealth.FAIL_NONE, s.lastFailureCode)
     }
 
+    // ---------- 采样健康状态机（P1-1） ----------
+
     @Test
     fun captureHealth_failCodeMapping() {
         assertEquals(
@@ -109,5 +111,74 @@ class OwnerPackageTest {
             CaptureHealth.FAIL_NONE,
             CaptureHealth.failCodeOf(BatteryCaptureOutcome.Success),
         )
+    }
+
+    // ---------- batteryForPackages 归属/聚合（P0-3 纯函数） ----------
+    private fun row(uidKey: String, total: Double, day: Long = 100L) =
+        com.local.screentime.data.BatteryDailyEntity(
+            uidKey = uidKey, day = day, packageName = null, totalMah = total, fgMah = total / 2,
+            bgMah = 0.0, fgsMah = 0.0, screenMah = 0.0, cpuMah = total / 2, audioMah = 0.0,
+            videoMah = 0.0, cameraMah = 0.0, gnssMah = 0.0, wifiMah = 0.0, btMah = 0.0,
+            wakelockMah = 0.0, sensorsMah = 0.0, otherMah = 0.0,
+        )
+
+    @Test
+    fun groupRows_sharedUid_neverAttachedToAnyPackage() {
+        // 真机：42 个非唯一映射 UID（系统+共享）。共享 UID 行必须整行跳过，不得挂给查询包
+        val rows = listOf(row("u0a334", 319.0), row("10235", 88.0))
+        val out = UsageRepository.groupBatteryRowsByOwner(
+            rows,
+            ownerOf = { k -> if (k == "u0a334") "tv.danmaku.bili" else null },  // 10235 共享 → null
+            wanted = setOf("tv.danmaku.bili", "com.google.process.gms"),
+        )
+        assertEquals(1, out.size)
+        assertEquals(319.0, out["tv.danmaku.bili"]!!.totalMah, 1e-9)
+    }
+
+    @Test
+    fun groupRows_multiUserSamePackage_aggregatedNotDropped() {
+        // 真机：QQ=u0a351+u999a351 两行唯一归属同一包名 —— 求和聚合，不得静默覆盖/忽略
+        val rows = listOf(row("u0a351", 261.0), row("u999a351", 40.0), row("u0a334", 319.0))
+        val out = UsageRepository.groupBatteryRowsByOwner(
+            rows,
+            ownerOf = { k ->
+                when (k) {
+                    "u0a351", "u999a351" -> "com.tencent.mobileqq"
+                    "u0a334" -> "tv.danmaku.bili"
+                    else -> null
+                }
+            },
+            wanted = setOf("com.tencent.mobileqq", "tv.danmaku.bili"),
+        )
+        assertEquals(301.0, out["com.tencent.mobileqq"]!!.totalMah, 1e-9)
+        assertEquals("u0a351+u999a351", out["com.tencent.mobileqq"]!!.uidKey)
+        assertEquals(319.0, out["tv.danmaku.bili"]!!.totalMah, 1e-9)
+    }
+
+    @Test
+    fun groupRows_systemUidAndUnwanted_excluded() {
+        val rows = listOf(row("1000", 147.0), row("u0a334", 319.0), row("u0a999", 5.0))
+        val out = UsageRepository.groupBatteryRowsByOwner(
+            rows,
+            ownerOf = { k ->
+                when (k) {
+                    "u0a334" -> "tv.danmaku.bili"
+                    "u0a999" -> "com.other.app"
+                    else -> null  // 1000 系统 UID
+                }
+            },
+            wanted = setOf("tv.danmaku.bili"),
+        )
+        assertEquals(1, out.size)
+        assertNull(out["com.other.app"])
+    }
+
+    @Test
+    fun sumBatteryDaily_sumsAllFields() {
+        val s = UsageRepository.sumBatteryDaily(listOf(row("u0a351", 261.0), row("u999a351", 40.0)), "com.tencent.mobileqq")
+        assertEquals(301.0, s.totalMah, 1e-9)
+        assertEquals(150.5, s.fgMah, 1e-9)   // total/2 求和
+        assertEquals(150.5, s.cpuMah, 1e-9)
+        assertEquals("com.tencent.mobileqq", s.packageName)
     }
 }

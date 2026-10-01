@@ -376,20 +376,34 @@ class UsageRepository(
 
     suspend fun batteryGlobalRows(day: Long): List<BatteryGlobalEntity> = dao.batteryGlobalRows(day)
 
-    /** 把当天列表里的包映射到其 UID 耗电记录 */
+    /**
+     * 把当天列表里的包映射到其 UID 耗电记录（v0.17.1 重写，P0-3）。
+     *
+     * 旧实现 `byUid[uidKeyOf(uid)]` 绕过了写入侧的「不猜 shared UID」约束：
+     *  - 共享 UID（多包同 UID）的耗电行会被挂到查询的任意一个包上（双计/误导）；
+     *  - 分身场景（真机确认 QQ=u0a351+u999a351、微信=u0a350+u999a350 各两行）
+     *    只剩 user0 行，user999 行被静默忽略。
+     *
+     * 新实现：逐行解析归属（与写入侧 ownerPackageOf 同一判据——UID 唯一对应一个
+     * 包才归属；系统 UID/共享 UID 恒 null），再把同 package 的多个「唯一归属 UID」
+     * **求和聚合**。usage 会话层只有 packageName、无法区分 user，因此 package 级
+     * 口径必须聚合，而不是二选一静默丢弃；shared UID 仍然不拆分。
+     */
     suspend fun batteryForPackages(
         day: Long,
         packages: List<String>,
-    ): Map<String, BatteryDailyEntity> {
-        val byUid = dao.batteryDailyRows(day).associateBy { it.uidKey }
-        val pm = context.packageManager
-        val out = HashMap<String, BatteryDailyEntity>()
-        for (p in packages) {
-            val uid = uidOfPackage(p)
-            if (uid <= 0) continue
-            byUid[uidKeyOf(uid)]?.let { out[p] = it }
+    ): Map<String, BatteryDailyEntity> =
+        groupBatteryRowsByOwner(dao.batteryDailyRows(day), ::resolveRowOwnerPackage, packages.toHashSet())
+
+    /** 逐行归属解析：uidKey → 唯一归属包名（系统 UID / 共享 UID → null） */
+    private fun resolveRowOwnerPackage(uidKey: String): String? {
+        val uid = uidOf(uidKey)
+        if (uid < 10000) return null
+        return try {
+            ownerPackageOf(uid, context.packageManager.getPackagesForUid(uid))
+        } catch (e: Exception) {
+            null
         }
-        return out
     }
 
     suspend fun dayStats(day: Long): DayStatsEntity? = dao.getDayStats(day)
@@ -875,6 +889,52 @@ class UsageRepository(
             if (uid < 10000) return null
             val pkgs = packagesForUid?.filter { !it.isNullOrBlank() }
             return if (pkgs?.size == 1) pkgs[0] else null
+        }
+
+        /**
+         * 耗电行按唯一归属包分组并聚合（P0-3 纯函数）。
+         * ownerOf：uidKey → 唯一归属包名（null = 系统/共享 UID，不可归属，整行跳过）。
+         * 同一包的多个唯一归属 UID（分身场景 user0 与 user999 各一行）求和为一个展示实体；
+         * uidKey 以 "+" 连接以示聚合，禁止静默丢弃其中任意一份。
+         */
+        fun groupBatteryRowsByOwner(
+            rows: List<BatteryDailyEntity>,
+            ownerOf: (String) -> String?,
+            wanted: Set<String>,
+        ): Map<String, BatteryDailyEntity> {
+            val grouped = LinkedHashMap<String, MutableList<BatteryDailyEntity>>()
+            for (row in rows) {
+                val owner = ownerOf(row.uidKey) ?: continue
+                if (owner !in wanted) continue
+                grouped.getOrPut(owner) { ArrayList() }.add(row)
+            }
+            return grouped.mapValues { (pkg, list) -> sumBatteryDaily(list, pkg) }
+        }
+
+        /** 同包多 UID 聚合：全部数值字段求和；uidKey 为各 UID 的 "+" 连接 */
+        fun sumBatteryDaily(rows: List<BatteryDailyEntity>, packageName: String?): BatteryDailyEntity {
+            require(rows.isNotEmpty()) { "sumBatteryDaily: empty rows" }
+            val uidKeys = rows.map { it.uidKey }.distinct()
+            return BatteryDailyEntity(
+                uidKey = if (uidKeys.size == 1) uidKeys[0] else uidKeys.joinToString("+"),
+                day = rows.first().day,
+                packageName = packageName,
+                totalMah = rows.sumOf { it.totalMah },
+                fgMah = rows.sumOf { it.fgMah },
+                bgMah = rows.sumOf { it.bgMah },
+                fgsMah = rows.sumOf { it.fgsMah },
+                screenMah = rows.sumOf { it.screenMah },
+                cpuMah = rows.sumOf { it.cpuMah },
+                audioMah = rows.sumOf { it.audioMah },
+                videoMah = rows.sumOf { it.videoMah },
+                cameraMah = rows.sumOf { it.cameraMah },
+                gnssMah = rows.sumOf { it.gnssMah },
+                wifiMah = rows.sumOf { it.wifiMah },
+                btMah = rows.sumOf { it.btMah },
+                wakelockMah = rows.sumOf { it.wakelockMah },
+                sensorsMah = rows.sumOf { it.sensorsMah },
+                otherMah = rows.sumOf { it.otherMah },
+            )
         }
 
         fun encodeComps(comps: Map<String, Double>): String =
