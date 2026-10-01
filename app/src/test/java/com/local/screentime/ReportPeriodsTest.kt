@@ -160,6 +160,58 @@ class ReportPeriodsTest {
         assertEquals(2L, ReportPeriods.backfillLimit(ReportPeriods.REPORT_YEARLY))
     }
 
+    // ---------- 有界回溯计划（P1-12：break→continue 修复） ----------
+
+    private val today = LocalDate.of(2026, 9, 28)  // 周一
+
+    private fun keyOf(shift: Long): String =
+        ReportPeriods.lastCompletedShifted(today, ReportPeriods.REPORT_WEEKLY, shift).key
+
+    private fun fakeReport(key: String, premature: Boolean): com.local.screentime.data.ReportEntity {
+        val endTs = ReportPeriods.periodEndInstantTs(
+            ReportPeriods.lastCompletedShifted(today, ReportPeriods.REPORT_WEEKLY, 0), zone,
+        )
+        // key 对应周期不确定时用近似值：测试只关心存在性/过早性两种形态
+        val ts = if (premature) endTs - 86_400_000L else endTs + 3_600_000L
+        return com.local.screentime.data.ReportEntity(ReportPeriods.REPORT_WEEKLY, key, ts, "text", finalized = true)
+    }
+
+    @Test
+    fun backfillPlan_gapInMiddle_isFilled() = kotlinx.coroutines.runBlocking {
+        // 核心回归（P1-12）：shift0 已有（正式）、shift1 缺失、shift2 已有 → 只补 shift1。
+        // 旧 break 实现在 shift0 就停止，shift1 永远不会补。
+        val keys = setOf(keyOf(0), keyOf(2))
+        val plan = ReportPeriods.backfillPlan(today, ReportPeriods.REPORT_WEEKLY, lookup = { _, k ->
+            if (k in keys) fakeReport(k, premature = false) else null
+        }, zone)
+        // 关键回归：shift1（中间缺口）必须进计划——旧 break 实现在 shift0 就停止，
+        // shift1 永远不会补；continue 语义下更早的缺失周期（shift3..7）也按有界回溯补齐
+        assertEquals(keyOf(1), plan[0].second.key)
+        assertEquals(1L, plan[0].first)
+        assertTrue("已有的 shift0/shift2 不得重写", plan.none { it.second.key == keyOf(0) || it.second.key == keyOf(2) })
+    }
+
+    @Test
+    fun backfillPlan_prematureLatest_isRegenerated_andOlderUntouched() = kotlinx.coroutines.runBlocking {
+        // shift0 过早（周期最后一天生成的旧"正式"报告）、shift1/2 已正式 → 只重生成 shift0
+        val keys = setOf(keyOf(1), keyOf(2))
+        val plan = ReportPeriods.backfillPlan(today, ReportPeriods.REPORT_WEEKLY, lookup = { _, k ->
+            when (k) {
+                in keys -> fakeReport(k, premature = false)
+                else -> fakeReport(k, premature = true)  // shift0 过早
+            }
+        }, zone)
+        assertEquals(listOf(keyOf(0)), plan.map { it.second.key })
+    }
+
+    @Test
+    fun backfillPlan_allPresent_empty_allMissing_fullDepth() = kotlinx.coroutines.runBlocking {
+        val allFinal: (String, String) -> com.local.screentime.data.ReportEntity? = { _, k -> fakeReport(k, premature = false) }
+        assertTrue(ReportPeriods.backfillPlan(today, ReportPeriods.REPORT_WEEKLY, allFinal, zone).isEmpty())
+        val none: (String, String) -> com.local.screentime.data.ReportEntity? = { _, _ -> null }
+        assertEquals(8, ReportPeriods.backfillPlan(today, ReportPeriods.REPORT_WEEKLY, none, zone).size)
+    }
+
     // ---------- 回归保护：weekStart 不得漂移 ----------
 
     @Test

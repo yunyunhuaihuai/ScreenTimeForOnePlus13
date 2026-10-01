@@ -46,6 +46,32 @@ object ReportPeriods {
     }
 
     /**
+     * 有界回溯补生成计划（P1-12）：逐周期检查——已有正式报告的**跳过并继续检查更早
+     * 周期**（continue），缺失/过早的进入计划（generate）。
+     *
+     * 旧实现 `if (!needsFinalizedGeneration) break`：shift0 已存在就停止扫描——
+     * 「shift0 已有、shift1 缺失、shift2 已有」时 shift1 永远不会补（例如 ColorOS
+     * 连杀两周后台后第三周恢复，中间周的报告永久缺失）。
+     *
+     * 返回 (shift, period) 对；shift==0 的最新周期由调用方决定是否推送通知。
+     */
+    suspend fun backfillPlan(
+        today: LocalDate,
+        type: String,
+        lookup: suspend (type: String, periodKey: String) -> ReportEntity?,
+        zone: ZoneId,
+    ): List<Pair<Long, ReportPeriod>> {
+        val out = ArrayList<Pair<Long, ReportPeriod>>()
+        for (shift in 0 until backfillLimit(type)) {
+            val p = lastCompletedShifted(today, type, shift)
+            val existing = lookup(p.type, p.key)
+            if (!needsFinalizedGeneration(existing, p, zone)) continue
+            out.add(shift to p)
+        }
+        return out
+    }
+
+    /**
      * 第 shift 个「已完整结束」的周期（shift=0 即最近一个）。
      * 周报用 previous(SUNDAY)（严格早于 today 的最近周日）：周一→昨天，周日→7 天前，
      * 因此该 Mon–Sun 周此时必然已完整结束，无需再按星期几分支。

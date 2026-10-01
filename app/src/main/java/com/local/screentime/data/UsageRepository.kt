@@ -849,10 +849,8 @@ class UsageRepository(
         val now = System.currentTimeMillis()
         val made = ArrayList<String>()
         for (type in listOf(ReportPeriods.REPORT_WEEKLY, ReportPeriods.REPORT_MONTHLY, ReportPeriods.REPORT_YEARLY)) {
-            for (shift in 0 until ReportPeriods.backfillLimit(type)) {
-                val p = ReportPeriods.lastCompletedShifted(today, type, shift)
-                val existing = dao.getReport(p.type, p.key)
-                if (!ReportPeriods.needsFinalizedGeneration(existing, p, zone)) break
+            // 逐周期检查（P1-12）：已有正式报告的 continue 到更早周期，缺失/过早的补生成
+            for ((shift, p) in ReportPeriods.backfillPlan(today, type, lookup = { t, k -> dao.getReport(t, k) }, zone)) {
                 val text = buildReportText(p)
                 dao.putReport(
                     ReportEntity(type = p.type, periodKey = p.key, generatedTs = now, text = text, finalized = true)
@@ -904,7 +902,10 @@ class UsageRepository(
         if (!p.finalized) sb.appendLine("⚠️ 预览：本周期尚未结束，以下数据不含剩余时间的用量")
         sb.appendLine("总使用：${formatMinutesShort(total)} · 日均 ${formatMinutesShort(total / days)}")
         if (pickups > 0) sb.appendLine("拿起：$pickups 次")
-        if (battery >= 1) sb.appendLine(String.format(Locale.US, "总耗电：%.0f mAh（模型估算）", battery))
+        // P1-11 语义修正：batteryBetween = SUM(battery_daily.totalMah) = UID 归因耗电
+        // （UID total 本身已含其 screen/cpu 等组件），不等于整机实际耗电/computedDrain/
+        // 电池容量；禁止与 battery_global 求和相加（组件与 UID 归因存在重叠语义）
+        if (battery >= 1) sb.appendLine(String.format(Locale.US, "应用归因耗电：%.0f mAh（UID 模型估算，非整机实际耗电）", battery))
         sb.appendLine()
         sb.appendLine("Top 应用（对比上一周期）：")
         if (top.isEmpty()) sb.appendLine("（无数据）")
