@@ -24,17 +24,34 @@ interface UsageDao {
     )
     suspend fun dailyUsage(day: Long): List<DailyRow>
 
+    /**
+     * effective usage（P0-4 唯一口径）：会话聚合与 usage_daily 回补值逐包/逐日取 MAX。
+     * 历史日（2026-09-04～09-12）的会话被旧版 STOPPED bug 丢 30~90%，由回补值兜底；
+     * 首页 dailyRows 与周/月/年报共用本查询，保证总量与 Top 应用完全一致。
+     */
+    @Query(
+        "SELECT packageName, day, MAX(ms) AS totalMs FROM (" +
+            "SELECT packageName, day, SUM(endTs - startTs) AS ms FROM sessions WHERE day = :day GROUP BY packageName, day " +
+            "UNION ALL " +
+            "SELECT packageName, day, totalMs AS ms FROM usage_daily WHERE day = :day" +
+            ") GROUP BY packageName, day ORDER BY totalMs DESC"
+    )
+    suspend fun effectiveUsageDay(day: Long): List<DailyRow>
+
+    /** 周期版 effective usage：对区间内每天的逐包取 MAX 结果再求和（报告总量/Top 用） */
+    @Query(
+        "SELECT packageName, 0 AS day, SUM(eff) AS totalMs FROM (" +
+            "SELECT packageName, day, MAX(ms) AS eff FROM (" +
+            "SELECT packageName, day, SUM(endTs - startTs) AS ms FROM sessions WHERE day BETWEEN :from AND :to GROUP BY packageName, day " +
+            "UNION ALL " +
+            "SELECT packageName, day, totalMs AS ms FROM usage_daily WHERE day BETWEEN :from AND :to" +
+            ") GROUP BY packageName, day" +
+            ") GROUP BY packageName ORDER BY totalMs DESC"
+    )
+    suspend fun effectiveUsageBetween(from: Long, to: Long): List<DailyRow>
+
     @Query("SELECT * FROM sessions WHERE day = :day ORDER BY startTs")
     suspend fun sessionsOfDay(day: Long): List<UsageSession>
-
-    @Query("SELECT COALESCE(SUM(endTs - startTs), 0) FROM sessions WHERE day BETWEEN :from AND :to")
-    suspend fun sessionsSumBetween(from: Long, to: Long): Long
-
-    @Query(
-        "SELECT packageName, 0 AS day, SUM(endTs - startTs) AS totalMs FROM sessions " +
-            "WHERE day BETWEEN :from AND :to GROUP BY packageName ORDER BY totalMs DESC LIMIT :limit"
-    )
-    suspend fun topSessionsBetween(from: Long, to: Long, limit: Int): List<DailyRow>
 
     @Query("SELECT DISTINCT packageName FROM sessions")
     suspend fun distinctPackages(): List<String>

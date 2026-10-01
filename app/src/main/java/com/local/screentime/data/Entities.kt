@@ -1,5 +1,6 @@
 package com.local.screentime.data
 
+import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.Index
 import androidx.room.PrimaryKey
@@ -71,6 +72,9 @@ data class ReportEntity(
     val periodKey: String,
     val generatedTs: Long,
     val text: String,
+    /** true=正式（周期已完整结束后生成）；false=手动生成的当前周期预览（数据不完整）。
+     *  DB 列默认 1：v6 迁移把既有报告全部按正式历史保留。 */
+    @ColumnInfo(defaultValue = "1") val finalized: Boolean = true,
 )
 
 /** 每日每 UID 耗电（mAh，模型估算），由快照差分累计；跨充满周期自动重置 */

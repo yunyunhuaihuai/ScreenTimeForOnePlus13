@@ -274,16 +274,14 @@ class UsageRepository(private val context: Context) {
         return SyncResult.Ok(windowStart, now, events.size, sessionCount, rootUsed)
     }
 
-    /** 展示用：会话表为主；usage_daily 若有历史自然日回补值（source=2，系统桶按会话分布切分）则逐包取较大值。
-     *  历史日（2026-09-04～09-12）的会话被旧版 STOPPED bug 丢了 30~90%，取 max 后由回补值兜底。 */
-    suspend fun dailyRows(day: Long): List<DailyRow> {
-        val out = LinkedHashMap<String, Long>()
-        for (r in dao.dailyUsage(day)) out[r.packageName] = maxOf(out[r.packageName] ?: 0L, r.totalMs)
-        for (r in dao.dailyAggRows(day)) out[r.packageName] = maxOf(out[r.packageName] ?: 0L, r.totalMs)
-        return out.map { DailyRow(it.key, day, it.value) }
-            .filter { it.totalMs > 0 }
-            .sortedByDescending { it.totalMs }
-    }
+    /**
+     * 展示口径（P0-4 唯一口径）：effective usage = 会话日聚合与 usage_daily 回补值
+     * 逐包/逐日取 MAX。历史日（2026-09-04～09-12）的会话被旧版 STOPPED bug 丢
+     * 30~90%，由回补值兜底。周报/月报/年报经 dao.effectiveUsageBetween 共用同一
+     * 口径，保证报告总量/Top 应用与首页完全一致。
+     */
+    suspend fun dailyRows(day: Long): List<DailyRow> =
+        dao.effectiveUsageDay(day).filter { it.totalMs > 0 }
 
     suspend fun dayTotalMs(day: Long): Long = dailyRows(day).sumOf { it.totalMs }
 
@@ -546,59 +544,54 @@ class UsageRepository(private val context: Context) {
         if (unlockRows.isNotEmpty()) dao.upsertUnlockStats(unlockRows)
     }
 
-    data class ReportPeriod(
-        val type: String,
-        val key: String,
-        val title: String,
-        val start: LocalDate,
-        val end: LocalDate,
-    )
-
-    fun currentPeriods(today: LocalDate): List<ReportPeriod> {
-        val weeklyEnd = today.with(java.time.temporal.TemporalAdjusters.nextOrSame(java.time.DayOfWeek.SUNDAY))
-        val weeklyStart = weeklyEnd.minusDays(6)
-        val monthEnd = today.withDayOfMonth(today.lengthOfMonth())
-        val monthStart = today.withDayOfMonth(1)
-        val yearEnd = LocalDate.of(today.year, 12, 31)
-        val yearStart = LocalDate.of(today.year, 1, 1)
-        return listOf(
-            ReportPeriod(
-                REPORT_WEEKLY, "W:$weeklyStart",
-                "$weeklyStart ~ $weeklyEnd 周报", weeklyStart, weeklyEnd
-            ),
-            ReportPeriod(
-                REPORT_MONTHLY, "M:${today.year}-${today.monthValue}",
-                "${today.year}年${today.monthValue}月 月报", monthStart, monthEnd
-            ),
-            ReportPeriod(
-                REPORT_YEARLY, "Y:${today.year}",
-                "${today.year} 年报", yearStart, yearEnd
-            ),
-        )
-    }
-
-    /** 周期结束时（含其后 2 天内补生成）自动生成；force=true 立即生成当前周期（数据可能未完整） */
+    /**
+     * 报告生成（v0.17.0 重设计，P0-3）。
+     *
+     * 自动路径（force=false）：为「最近已完整结束的周期」生成正式报告（finalized=true）。
+     * 既有记录若生成于周期结束之前（旧版在周期最后一天提前生成的"正式"报告、或手动
+     * 预览）视为过早，以正式报告覆盖；按 ReportPeriods.backfillLimit 有界回溯，补上
+     * 因后台被杀错过的周期（旧实现的 7 天补生成窗口因 currentPeriods 切换而从未生效）。
+     * 仅最新周期推送通知，更早的补生成静默进入历史列表，避免升级首日通知轰炸。
+     *
+     * force=true（手动）：额外为当前进行中的周期生成预览（finalized=false，数据不完整）。
+     */
     suspend fun generateDueReports(force: Boolean): List<String> {
         val zone = ZoneId.systemDefault()
         val today = LocalDate.now(zone)
         val now = System.currentTimeMillis()
         val made = ArrayList<String>()
-        for (p in currentPeriods(today)) {
-            val exists = dao.getReport(p.type, p.key) != null
-            // 补生成窗口从 2 天放宽到 7 天：ColorOS 杀后台激进，年报/周报若恰逢
-            // 窗口内一次同步都没跑成，2 天窗口会永久错过生成
-            val inWindow = !today.isBefore(p.end) && !today.isAfter(p.end.plusDays(7))
-            if (exists || !(force || inWindow)) continue
-            val text = buildReportText(p)
-            dao.putReport(
-                ReportEntity(type = p.type, periodKey = p.key, generatedTs = now, text = text)
-            )
-            Notifications.notifyReport(
-                context,
-                "屏幕时间 · ${p.title.substringAfterLast(' ')}已生成",
-                text.lines().take(3).joinToString("\n")
-            )
-            made.add(p.title)
+        for (type in listOf(ReportPeriods.REPORT_WEEKLY, ReportPeriods.REPORT_MONTHLY, ReportPeriods.REPORT_YEARLY)) {
+            for (shift in 0 until ReportPeriods.backfillLimit(type)) {
+                val p = ReportPeriods.lastCompletedShifted(today, type, shift)
+                val existing = dao.getReport(p.type, p.key)
+                if (!ReportPeriods.needsFinalizedGeneration(existing, p, zone)) break
+                val text = buildReportText(p)
+                dao.putReport(
+                    ReportEntity(type = p.type, periodKey = p.key, generatedTs = now, text = text, finalized = true)
+                )
+                if (shift == 0L) {
+                    Notifications.notifyReport(
+                        context,
+                        "屏幕时间 · ${p.title.substringAfterLast(' ')}已生成",
+                        text.lines().take(3).joinToString("\n")
+                    )
+                }
+                made.add(p.title)
+            }
+        }
+        if (force) {
+            for (p in ReportPeriods.currentPreview(today)) {
+                val text = buildReportText(p)
+                dao.putReport(
+                    ReportEntity(type = p.type, periodKey = p.key, generatedTs = now, text = text, finalized = false)
+                )
+                Notifications.notifyReport(
+                    context,
+                    "屏幕时间 · ${p.title.substringAfterLast(' ')}预览已生成（周期未结束）",
+                    text.lines().take(3).joinToString("\n")
+                )
+                made.add(p.title + "（预览）")
+            }
         }
         return made
     }
@@ -607,32 +600,20 @@ class UsageRepository(private val context: Context) {
         val from = p.start.toEpochDay()
         val to = p.end.toEpochDay()
         val days = p.start.datesUntil(p.end.plusDays(1)).count().toInt().coerceAtLeast(1)
-        val pkgSums = HashMap<String, Long>()
-        var total = 0L
-        for (d in from..to) {
-            for (r in dailyRows(d)) {
-                pkgSums[r.packageName] = (pkgSums[r.packageName] ?: 0L) + r.totalMs
-                total += r.totalMs
-            }
-        }
-        val top = pkgSums.entries
-            .sortedByDescending { it.value }
-            .take(5)
-            .map { DailyRow(it.key, 0L, it.value) }
+        // 统一口径（P0-4）：报告与首页 dailyRows 共用 effective usage
+        // （sessions 与 usage_daily 回补值逐包/逐日取 max），不再单独读 sessions 表
+        val pkgRows = dao.effectiveUsageBetween(from, to)
+        val total = pkgRows.sumOf { it.totalMs }
+        val top = pkgRows.take(5)
         val pickups = dao.pickupsBetween(from, to)
         val battery = dao.batteryBetween(from, to)
         val prevTo = from - 1
         val prevFrom = prevTo - days + 1
-        val prevPkgSums = HashMap<String, Long>()
-        for (d in prevFrom..prevTo) {
-            for (r in dailyRows(d)) {
-                prevPkgSums[r.packageName] = (prevPkgSums[r.packageName] ?: 0L) + r.totalMs
-            }
-        }
-        val prevTop = prevPkgSums
+        val prevPkgSums = dao.effectiveUsageBetween(prevFrom, prevTo).associate { it.packageName to it.totalMs }
         val pm = context.packageManager
         val sb = StringBuilder()
         sb.appendLine("期间：${p.start} ~ ${p.end}（$days 天）")
+        if (!p.finalized) sb.appendLine("⚠️ 预览：本周期尚未结束，以下数据不含剩余时间的用量")
         sb.appendLine("总使用：${formatMinutesShort(total)} · 日均 ${formatMinutesShort(total / days)}")
         if (pickups > 0) sb.appendLine("拿起：$pickups 次")
         if (battery >= 1) sb.appendLine(String.format(Locale.US, "总耗电：%.0f mAh（模型估算）", battery))
@@ -640,7 +621,7 @@ class UsageRepository(private val context: Context) {
         sb.appendLine("Top 应用（对比上一周期）：")
         if (top.isEmpty()) sb.appendLine("（无数据）")
         top.forEachIndexed { i, t ->
-            val prev = prevTop[t.packageName]
+            val prev = prevPkgSums[t.packageName]
             val delta = when {
                 prev == null -> "（新增）"
                 prev > 0 -> {
@@ -673,9 +654,7 @@ class UsageRepository(private val context: Context) {
         const val SOURCE_EVENT = 0
         const val SOURCE_AGG_API = 1
         const val SOURCE_ROOT = 2
-        const val REPORT_WEEKLY = "WEEKLY"
-        const val REPORT_MONTHLY = "MONTHLY"
-        const val REPORT_YEARLY = "YEARLY"
+        // 报告类型常量与周期解析已移入 ReportPeriods（v0.17.0）
         private const val TAG = "STLog"
         private const val OVERLAP_MS = 2 * 60 * 60 * 1000L
 

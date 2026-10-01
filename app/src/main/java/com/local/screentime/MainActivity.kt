@@ -741,7 +741,7 @@ fun UsageApp(
             text = {
                 Column {
                     Text(
-                        "周报（周日晚）/ 月报（月底）/ 年报（年底）生成时会推送到系统通知栏，这里可随时回看",
+                        "周报/月报/年报在周期完整结束后自动生成正式报告并推送通知；这里可随时回看，也可手动生成当前周期预览（数据不完整）",
                         fontSize = 11.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -757,13 +757,14 @@ fun UsageApp(
                                 else -> "年报"
                             }
                             val keyPart = r.periodKey.substringAfter(':')
+                            val previewMark = if (!r.finalized) " · 预览" else ""
                             Column(
                                 Modifier
                                     .fillMaxWidth()
                                     .clickable { open = true }
                                     .padding(vertical = 6.dp)
                             ) {
-                                Text("$typeName · $keyPart", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                                Text("$typeName · $keyPart$previewMark", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                                 Text(
                                     r.text.lines().take(2).joinToString("  "),
                                     fontSize = 10.sp,
@@ -797,7 +798,7 @@ fun UsageApp(
                                 reportsList = withContext(Dispatchers.IO) { repo.latestReports() }
                                 if (made.isNotEmpty()) statusText = "已生成：${made.joinToString()}"
                             }
-                        }) { Text("立即生成当前周期报告") }
+                        }) { Text("生成当前周期预览（正式报告待周期结束）") }
                     }
                 }
             }
