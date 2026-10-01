@@ -13,6 +13,8 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.withLock
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.time.LocalDate
@@ -206,7 +208,158 @@ class BatteryLedgerTest {
         assertEquals(10_600_000L, out.globalRows.single().durationMs)     // 10_000_000 + (3_600_000-3_000_000)
     }
 
-    // ---------- 批量读取覆盖：candidateDays 必须覆盖 compute 触碰的每一天 ----------
+    // ---------- epoch 判定与 GLOBAL RESET（P0-1，真机抖音吞量案例钉死） ----------
+
+    @Test
+    fun epochState_rules() {
+        val a = ts(2026, 10, 1, 18, 5)
+        val b = ts(2026, 10, 2, 9, 0)
+        assertEquals(BatteryLedger.EpochState.RESET, BatteryLedger.epochStateOf(a, b))
+        assertEquals(BatteryLedger.EpochState.SAME, BatteryLedger.epochStateOf(a, a))
+        assertEquals(BatteryLedger.EpochState.UNKNOWN, BatteryLedger.epochStateOf(null, a))
+        assertEquals(BatteryLedger.EpochState.UNKNOWN, BatteryLedger.epochStateOf(a, null))
+        assertEquals(BatteryLedger.EpochState.UNKNOWN, BatteryLedger.epochStateOf(null, null))
+    }
+
+    @Test
+    fun epochChange_newEpoch148DeltaIsFullNotSwallowed() {
+        // 真机案例：旧 epoch 快照 132.8（抖音 u0a333），新 epoch dump 148 mAh。
+        // 旧比例判据：148 < 66.4 为 false → delta=15.2（吞掉 132.8）。
+        // 新语义：窗口起点变化 = GLOBAL RESET → delta = 148（新 epoch 全量）。
+        val oldWindow = ts(2026, 10, 1, 18, 5)
+        val newWindow = ts(2026, 10, 2, 9, 0)
+        val now = ts(2026, 10, 2, 10, 0)
+        val existing = BatteryLedger.Existing(
+            snapshots = mapOf("u0a333" to BatterySnapshotEntity("u0a333", 132.8, "", ts(2026, 10, 1, 23, 0))),
+            daily = emptyMap(), global = emptyMap(),
+        )
+        val out = BatteryLedger.compute(
+            parsedOf(uidOf("u0a333", 148.0), windowStartTs = newWindow),
+            existing, now, zone, prevWindowStartTs = oldWindow,
+        )
+        assertTrue(out.epochChanged)
+        assertEquals(148.0, out.dailyRows.single().totalMah, 1e-9)
+        assertEquals(newWindow, out.newWindowStartTs)
+    }
+
+    @Test
+    fun sameEpoch_rescaleDip_neverResets() {
+        // 同 epoch 内 100→97 是模型回算：窗口起点未变时禁止任何数值型 reset
+        val window = ts(2026, 10, 1, 18, 5)
+        val now = ts(2026, 10, 1, 23, 0)
+        val existing = BatteryLedger.Existing(
+            snapshots = mapOf("u0a1" to BatterySnapshotEntity("u0a1", 100.0, "", ts(2026, 10, 1, 20, 0))),
+            daily = emptyMap(), global = emptyMap(),
+        )
+        val out = BatteryLedger.compute(
+            parsedOf(uidOf("u0a1", 97.0), windowStartTs = window),
+            existing, now, zone, prevWindowStartTs = window,
+        )
+        assertFalse(out.epochChanged)
+        assertEquals(0, out.dailyRows.size)  // 负差分 clamp 为 0，不记录
+        assertEquals(97.0, out.snapshots.single().cumMah, 1e-9)
+    }
+
+    @Test
+    fun epochChange_smallNewValue_fullDelta() {
+        // 旧 epoch 100，新 epoch（真重置）只剩 5：delta=5（全量语义，与比例判据结果一致但依据不同）
+        val oldWindow = ts(2026, 10, 1, 18, 5)
+        val newWindow = ts(2026, 10, 2, 9, 0)
+        val now = ts(2026, 10, 2, 9, 30)
+        val existing = BatteryLedger.Existing(
+            snapshots = mapOf("u0a1" to BatterySnapshotEntity("u0a1", 100.0, "", ts(2026, 10, 1, 23, 0))),
+            daily = emptyMap(), global = emptyMap(),
+        )
+        val out = BatteryLedger.compute(
+            parsedOf(uidOf("u0a1", 5.0), windowStartTs = newWindow),
+            existing, now, zone, prevWindowStartTs = oldWindow,
+        )
+        assertTrue(out.epochChanged)
+        assertEquals(5.0, out.dailyRows.single().totalMah, 1e-9)
+    }
+
+    @Test
+    fun epochChange_uidMissingInFirstFrame_neverDiffsAgainstOldEpoch() {
+        // 场景 4：epoch B 第一帧某 UID 缺失 → 旧快照必须被判定失效；
+        // 该 UID 之后在 epoch B 以 80 mAh 出现时，按新 epoch 全量处理，绝不能与 epoch A 的 100 做差。
+        val oldWindow = ts(2026, 10, 1, 18, 5)
+        val newWindow = ts(2026, 10, 2, 9, 0)
+        val now1 = ts(2026, 10, 2, 9, 30)
+        val now2 = ts(2026, 10, 2, 15, 0)
+
+        // 帧 1（epoch B 首帧）：u0a1 不在 dump 中（只有别的 UID）
+        val frame1 = BatteryLedger.compute(
+            parsedOf(uidOf("u0a2", 10.0), windowStartTs = newWindow),
+            BatteryLedger.Existing(
+                snapshots = mapOf("u0a1" to BatterySnapshotEntity("u0a1", 100.0, "", ts(2026, 10, 1, 23, 0))),
+                daily = emptyMap(), global = emptyMap(),
+            ),
+            now1, zone, prevWindowStartTs = oldWindow,
+        )
+        assertTrue(frame1.epochChanged)
+        // 帧 1 的事务语义：清空全部旧快照，只写本帧出现者的新快照
+        val snapshotsAfterFrame1 = frame1.snapshots.associateBy { it.uidKey }
+
+        // 帧 2：u0a1 以 80 mAh 重新出现——此时它不应有任何旧 epoch 基线
+        val existing2 = BatteryLedger.Existing(
+            snapshots = snapshotsAfterFrame1,
+            daily = emptyMap(), global = emptyMap(),
+        )
+        val frame2 = BatteryLedger.compute(
+            parsedOf(uidOf("u0a1", 80.0), windowStartTs = newWindow),
+            existing2, now2, zone, prevWindowStartTs = newWindow,
+        )
+        assertFalse(frame2.epochChanged)  // 同 epoch
+        assertEquals("80 必须按新 epoch 全量入账，而不是 80-100=0", 80.0, frame2.dailyRows.single().totalMah, 1e-9)
+    }
+
+    @Test
+    fun windowStartMissing_fallsBackToRatioHeuristic() {
+        // 场景 5：窗口起点缺失 → 退回比例 heuristic（真重置 0.0831→0.005 触发 full recount）
+        val now = ts(2026, 10, 2, 9, 30)
+        val existing = BatteryLedger.Existing(
+            snapshots = mapOf("u0a1" to BatterySnapshotEntity("u0a1", 0.0831, "", ts(2026, 10, 1, 23, 0))),
+            daily = emptyMap(), global = emptyMap(),
+        )
+        val out = BatteryLedger.compute(
+            parsedOf(uidOf("u0a1", 0.005), windowStartTs = null),
+            existing, now, zone, prevWindowStartTs = null,
+        )
+        assertFalse(out.epochChanged)
+        assertNull(out.newWindowStartTs)  // 旧标记保留
+        assertEquals(0.005, out.dailyRows.sumOf { it.totalMah }, 1e-9)
+    }
+
+    @Test
+    fun epochChange_globalAndDurShareSameReset() {
+        // 场景 6：UID/GLOBAL/GLOBAL_DUR 共用同一 epoch reset——整机 computedDrain 也按新 epoch 全量
+        val oldWindow = ts(2026, 10, 1, 18, 5)
+        val newWindow = ts(2026, 10, 2, 9, 0)
+        val now = ts(2026, 10, 2, 10, 0)
+        val day = epochDay(2026, 10, 2)
+        val existing = BatteryLedger.Existing(
+            snapshots = mapOf(
+                BatteryLedger.GLOBAL_SNAPSHOT_KEY to
+                    BatterySnapshotEntity(BatteryLedger.GLOBAL_SNAPSHOT_KEY, 1522.0, "screen=324.0", ts(2026, 10, 1, 23, 0)),
+                BatteryLedger.GLOBAL_DUR_SNAPSHOT_KEY to
+                    BatterySnapshotEntity(BatteryLedger.GLOBAL_DUR_SNAPSHOT_KEY, 7_000_000.0, "screen=7000000.0", ts(2026, 10, 1, 23, 0)),
+            ),
+            daily = emptyMap(),
+            global = mapOf(
+                BatteryLedger.globalKey("screen", day) to BatteryGlobalEntity("screen", day, 100.0, 1_000_000L)
+            ),
+        )
+        val parsed = BatteryParsed(
+            emptyList(),
+            linkedMapOf("screen" to (10.0 to 60_000L)),
+            computedDrain = 30.0, actualDrainLow = 0.0, windowStartTs = newWindow,
+        )
+        val out = BatteryLedger.compute(parsed, existing, now, zone, prevWindowStartTs = oldWindow)
+        assertTrue(out.epochChanged)
+        // epoch reset 只使快照基线失效：daily 行跨 epoch 累计（既有 100 + 新 epoch 全量增量 10）
+        assertEquals(110.0, out.globalRows.single().mah, 1e-9)
+        assertEquals(1_000_000L + 60_000L, out.globalRows.single().durationMs)
+    }
 
     @Test
     fun candidateDays_coverAllDaysComputeTouches_multiDayWindow() {

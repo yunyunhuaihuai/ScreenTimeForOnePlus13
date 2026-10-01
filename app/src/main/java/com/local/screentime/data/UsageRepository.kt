@@ -632,8 +632,22 @@ class UsageRepository(
         val zone = ZoneId.systemDefault()
 
         // —— 阶段二：单一事务（调用方已持 SYNC_MUTEX，差分基于串行化的快照状态） ——
+        // epoch 标记（上一帧窗口起点）在事务内读取、与新帧比较并在事务内推进（P0-1/P0-4）
+        val prevWindowStartTs = dao.getState(KEY_BATTERY_WINDOW_START_TS)
         try {
-            applyBatteryLedgerTx(db, dao, parsed, now, zone, pkgOf = ::resolveBatteryOwnerPackage)
+            val out = applyBatteryLedgerTx(
+                db, dao, parsed, now, zone,
+                pkgOf = ::resolveBatteryOwnerPackage,
+                prevWindowStartTs = prevWindowStartTs,
+            )
+            if (out.epochChanged) {
+                Log.i(
+                    TAG,
+                    "battery: GLOBAL RESET epoch " + (prevWindowStartTs?.let { Instant.ofEpochMilli(it).atZone(zone).toLocalDateTime().toString() } ?: "?") +
+                        " → " + parsed.windowStartTs?.let { Instant.ofEpochMilli(it).atZone(zone).toLocalDateTime().toString() } +
+                        "（旧 epoch 快照全部失效）",
+                )
+            }
         } catch (e: Exception) {
             // 事务已整体回滚：快照未推进、daily 未写入，本轮差分作废，
             // 下一轮采集会基于旧快照重算（宁可少记一轮，不可半提交）
@@ -806,10 +820,14 @@ class UsageRepository(
         const val KEY_BACKFILL = "backfill_natural_days_v18"
         const val KEY_SYSUID_FIX = "sysuid_labels_v18"
 
-        // —— 同步/采样诊断状态（P1-1/P1-5，sync_state 持久化，diagnosticJson 输出） ——
+        // —— 持久化诊断状态（P1-1/P1-5，sync_state 持久化，diagnosticJson 输出） ——
         const val KEY_LAST_USAGE_SOURCE = "last_usage_source"      // 1=ROOT 2=API
         const val KEY_LAST_BATTERY_SOURCE = "last_battery_source"  // 1=ROOT 2=DUMP
         const val KEY_LAST_SYNC_SUCCESS_TS = "last_sync_success_ts"
+        const val KEY_LAST_USAGE_SUCCESS_TS = "last_usage_success_ts"
+        const val KEY_LAST_BATTERY_SUCCESS_TS = "last_battery_success_ts"
+        const val KEY_LAST_BATTERY_FAIL_TS = "last_battery_fail_ts"
+        const val KEY_BATTERY_WINDOW_START_TS = "battery_window_start_ts" // batterystats epoch 标记（P0-1）
         const val KEY_CAP_ATTEMPT = "cap_last_attempt_ts"
         const val KEY_CAP_SUCCESS = "cap_last_success_ts"
         const val KEY_CAP_FAIL_CODE = "cap_last_fail_code"

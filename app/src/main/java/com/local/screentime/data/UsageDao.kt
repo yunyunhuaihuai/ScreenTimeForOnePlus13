@@ -113,6 +113,10 @@ interface UsageDao {
     @Upsert
     suspend fun upsertBatterySnapshots(rows: List<BatterySnapshotEntity>)
 
+    /** epoch 切换时清空全部旧快照（与差分写入同事务，P0-1） */
+    @Query("DELETE FROM battery_snapshot")
+    suspend fun clearBatterySnapshots()
+
     /** 批量读取（差分事务内一次取齐待写日的既有行，替代逐 UID 查询） */
     @Query("SELECT * FROM battery_daily WHERE day IN (:days)")
     suspend fun batteryDailyForDays(days: List<Long>): List<BatteryDailyEntity>

@@ -16,6 +16,7 @@ import com.local.screentime.data.applyBatteryLedgerTx
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -128,6 +129,58 @@ class BatteryLedgerTxTest {
         assertEquals(120.0, dao.getBatterySnapshot(BatteryLedger.GLOBAL_SNAPSHOT_KEY)!!.cumMah, 1e-9)
         assertEquals(60.0, dao.getBatteryDaily("u0a1", day)!!.totalMah, 1e-9)
         assertEquals(11.0, dao.getBatteryGlobal("screen", day)!!.mah, 1e-9)
+    }
+
+    @Test
+    fun epochChangeTx_realParsed_atomic() = runBlocking {
+        val oldWindow = ts(2026, 9, 18, 12, 0)
+        val newWindow = ts(2026, 9, 19, 9, 0)
+        val now = ts(2026, 9, 19, 10, 0)
+        dao.putBatterySnapshot(BatterySnapshotEntity("u0a1", 100.0, "", oldWindow))
+        dao.putBatterySnapshot(BatterySnapshotEntity("u0a9", 500.0, "", oldWindow))  // 本帧缺席的 UID
+        dao.putState(com.local.screentime.data.SyncStateEntity(
+            com.local.screentime.data.UsageRepository.KEY_BATTERY_WINDOW_START_TS, oldWindow))
+
+        val parsed = BatteryParsed(
+            uids = listOf(UidPower("u0a1", 20.0, 0.0, 0.0, 0.0, emptyMap())),
+            globals = LinkedHashMap(), computedDrain = 0.0, actualDrainLow = 0.0, windowStartTs = newWindow,
+        )
+        val out = applyBatteryLedgerTx(db, dao, parsed, now, zone, pkgOf = { null }, prevWindowStartTs = oldWindow)
+        assertTrue(out.epochChanged)
+        // 旧快照全部清除（含本帧缺席的 u0a9），只保留新 epoch 快照
+        assertNull(dao.getBatterySnapshot("u0a9"))
+        assertEquals(20.0, dao.getBatterySnapshot("u0a1")!!.cumMah, 1e-9)
+        // epoch 标记在同一事务推进
+        assertEquals(newWindow, dao.getState(com.local.screentime.data.UsageRepository.KEY_BATTERY_WINDOW_START_TS))
+        // u0a1 按「首次同步」语义全量入账（而非 20-100 → 0）
+        val day = epochDay(2026, 9, 19)
+        assertEquals(20.0, dao.getBatteryDaily("u0a1", day)!!.totalMah, 1e-9)
+    }
+
+    @Test
+    fun epochTxFailure_rollsBackEpochMarkerAndSnapshots() = runBlocking {
+        // P0-4：epoch 推进与数据写入必须同事务 —— 注入故障后旧快照与旧 epoch 标记原样保留
+        val oldWindow = ts(2026, 9, 18, 12, 0)
+        val newWindow = ts(2026, 9, 19, 9, 0)
+        val now = ts(2026, 9, 19, 10, 0)
+        dao.putBatterySnapshot(BatterySnapshotEntity("u0a1", 100.0, "", oldWindow))
+        dao.putState(com.local.screentime.data.SyncStateEntity(
+            com.local.screentime.data.UsageRepository.KEY_BATTERY_WINDOW_START_TS, oldWindow))
+
+        val parsed = BatteryParsed(
+            uids = listOf(UidPower("u0a1", 20.0, 0.0, 0.0, 0.0, emptyMap())),
+            globals = LinkedHashMap(), computedDrain = 0.0, actualDrainLow = 0.0, windowStartTs = newWindow,
+        )
+        class Injected : Exception("probe")
+        var threw = false
+        try {
+            applyBatteryLedgerTx(db, dao, parsed, now, zone, pkgOf = { null }, prevWindowStartTs = oldWindow,
+                probeAfterCompute = { throw Injected() })
+        } catch (e: Injected) { threw = true }
+        assertTrue(threw)
+        assertEquals("epoch 标记不得推进", oldWindow, dao.getState(com.local.screentime.data.UsageRepository.KEY_BATTERY_WINDOW_START_TS))
+        assertEquals("旧快照不得被删除", 100.0, dao.getBatterySnapshot("u0a1")!!.cumMah, 1e-9)
+        assertNull(dao.getBatteryDaily("u0a1", epochDay(2026, 9, 19)))
     }
 
     @Test
