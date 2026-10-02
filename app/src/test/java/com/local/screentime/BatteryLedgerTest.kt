@@ -214,6 +214,25 @@ class BatteryLedgerTest {
         assertEquals(0, BatteryLedger.ledgerInconsistencies(listOf(good)).size)
     }
 
+    @Test
+    fun mergeLedgerInconsistencies_keepsHistoryAcrossFrames() {
+        // 真机回归发现的覆写缺陷：干净帧不得抹掉此前帧的检出（QQ cpu 4.6 > total 4.0 案例）
+        val prev = "LEDGER_INCONSISTENT u0a351|day=20728: maxComponent=4.6 > total=4.0"
+        val merged = BatteryLedger.mergeLedgerInconsistencies(prev, emptyList())
+        assertEquals(prev, merged)  // 干净帧保留历史检出
+        val merged2 = BatteryLedger.mergeLedgerInconsistencies(
+            prev, listOf("LEDGER_INCONSISTENT u0a999|day=20728: maxComponent=2.0 > total=1.0"),
+        )
+        assertEquals(2, merged2!!.lineSequence().count())
+        // 去重 + 全空返回 null
+        val merged3 = BatteryLedger.mergeLedgerInconsistencies(prev, listOf(prev))
+        assertEquals(1, merged3!!.lineSequence().count())
+        assertNull(BatteryLedger.mergeLedgerInconsistencies(null, emptyList()))
+        // 上限裁剪
+        val many = (0 until 60).map { "LEDGER_INCONSISTENT u0a$it|day=1: 1.0 > 0.5" }
+        assertEquals(50, BatteryLedger.mergeLedgerInconsistencies(null, many)!!.lineSequence().count())
+    }
+
     // ---------- 全局组件 ----------
 
     @Test

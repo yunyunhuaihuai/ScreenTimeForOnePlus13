@@ -116,6 +116,19 @@ object BatteryLedger {
 
     const val LEDGER_COMPONENT_TOLERANCE_MAH = 0.05
 
+    /**
+     * 合并跨帧的 LEDGER_INCONSISTENT 样本（真机回归发现的记录缺陷：诊断只存最后一帧，
+     * 后续干净帧会把此前检出抹掉——真机 QQ u0a351 cpu 4.6 > total 4.0 的检出就被
+     * 下一帧无违规覆写）。去重保序、上限 cap 行；全空返回 null（调用方据此清 key）。
+     */
+    fun mergeLedgerInconsistencies(previous: String?, fresh: List<String>, cap: Int = 50): String? {
+        val merged = LinkedHashSet<String>()
+        previous?.lineSequence()?.filter { it.isNotBlank() }?.forEach { merged.add(it) }
+        fresh.filter { it.isNotBlank() }.forEach { merged.add(it) }
+        if (merged.isEmpty()) return null
+        return merged.take(cap).joinToString("\n")
+    }
+
     /** 充电重置判据（v0.16.11 引入的比例规则）。
      *  v0.17.1 起降级为 **fallback**：仅当窗口起点缺失、epoch 无法判定时使用；
      *  epoch 可判定时以 [epochStateOf] 为权威（见其注释中的真机实证）。 */

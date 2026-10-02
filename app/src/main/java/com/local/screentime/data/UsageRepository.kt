@@ -763,11 +763,16 @@ class UsageRepository(
             recordBatteryFailure("tx", "${e.javaClass.simpleName}: ${e.message}")
             return BatteryCaptureOutcome.Failed("tx", "${e.javaClass.simpleName}: ${e.message}")
         }
-        // 账本一致性不变量（P1-7）：任意单一组件 > total+容差 → LEDGER_INCONSISTENT（仅诊断，不阻断）
+        // 账本一致性不变量（P1-7）：任意单一组件 > total+容差 → LEDGER_INCONSISTENT（仅诊断，不阻断）。
+        // 跨帧合并（真机回归发现的覆写缺陷）：干净帧不得抹掉此前帧的检出
         val violations = BatteryLedger.ledgerInconsistencies(out.dailyRows)
-        prefs.edit()
-            .putString(PREF_LAST_LEDGER_INCONSISTENT, violations.take(20).joinToString("\n").ifEmpty { null })
-            .apply()
+        prefs.edit().putString(
+            PREF_LAST_LEDGER_INCONSISTENT,
+            BatteryLedger.mergeLedgerInconsistencies(
+                prefs.getString(PREF_LAST_LEDGER_INCONSISTENT, null),
+                violations,
+            ),
+        ).apply()
         if (violations.isNotEmpty()) {
             Log.w(TAG, "ledger invariant violations=${violations.size} first=${violations.first()}")
         }

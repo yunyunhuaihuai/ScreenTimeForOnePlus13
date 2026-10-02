@@ -152,6 +152,21 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/release/app-release.apk
   8. battery shell/parser/tx 失败时 diagnosticJson 的 battery 段独立显示 failure。
 - 严禁：`dumpsys batterystats --reset` / `--reset-all`；给 UID 功率乘经验系数；把 Actual−Computed 缺口按比例摊给 App；为迁移清库。
 
+### 4.0.17.1 真机回归记录（2026-10-02 上午，OnePlus 13 e4e1b43e，v0.17.1 debug 构建）
+
+方法同 4.0.16.1：run-as 拉库三件套 + node:sqlite 分析。基线 A=v6（升级前），B=装 0.17.1 首次同步，C=二次同步，D=`dumpsys battery unplug`→`set ac 1` 模拟插电（后 `dumpsys battery reset` 恢复）。
+
+- ✅ **迁移 v6→v8**：user_version=8；历史冻结校验——battery_global/usage_daily/reports/app_info 逐位一致；battery_daily(day<today) +0.32 mAh/+6 行为跨午夜窗口 dayWeights 的正确归属（非丢失）；sessions(day<today) +2 行/+629s 为 root 24h 窗口滑过午夜的正常重建。新列验证：历史会话 source=LEGACY(0)、历史行 mobileMah=0。
+- ✅ **诊断状态**：battery_window_start_ts=1790849132000（=2026-10-01 18:05:32，与审计窗口一致）；parser_baseline_uid_count=150；parser_had_window_baseline=1；last_usage/battery_source=ROOT；prefs 中的 last_battery_diag 完整（parserVersion 3、rawLineCount 11528、UID 150、computed 2492、actual **3197-3374**（P1-3 区间在真机生效）、uidAttributionRatio 0.633、anomalies=[]）。
+- ✅ **Item 1（同 epoch 二次采集）**：epoch 标记不变、快照 255 行 0 回退、batteryDailyTotal B→C delta=0.000000（第二次采集零幻影增量=无双计；间隔仅 2 分钟且设备闲置，所有 UID 增量低于 0.001 阈值属预期）。
+- ⚠️→待自然发生 **Item 2/3（epoch 切换）**：模拟插电（unplug→set ac 1）**不会**触发该 ROM 的 batterystats 窗口重置（epoch 标记与快照集不变，采集本身成功执行）——窗口重置只在真实充电事件发生。epoch 切换的正确性由 6 个单测场景钉死 + 真机已验证「无误重置」侧；**自然充电周期后的验证待办**：观察 epoch 标记更新、旧快照全清、当帧 UID 全量入账（即抖音式 148→15 吞量不再发生）。
+- ✅ **Item 4（账本不变量）**：真机数据检出 QQ u0a351 cpu 4.6 > total 4.0（系统自身 cpu/total 估算器分歧，非本应用 bug）；历史吞量遗留 screen>total 行 12 条（预期内不可回补）。**发现并修复记录缺陷**：诊断原来只存最后一帧，干净帧会抹掉此前检出——已改为跨帧合并（mergeLedgerInconsistencies，去重保序上限 50 行），单测钉死。
+- ✅ **Item 5（共享 UID）**：当日新增行中 u0a398/u0a259/u999a259/u0a64/u0a88 等共享 UID 均 packageName=null（不挂给任意单 App）。
+- ✅ **Item 6（分身双 UID）**：QQ=u0a351（4.0 mAh）+u999a351（3.82 mAh）两行并存且均归属 com.tencent.mobileqq，展示层聚合（batteryForPackages 求和），无静默覆盖。
+- ⚠️ **Item 7（root 失效降级）**：真机模拟需撤销 KernelSU 授权（用户侧动作，本轮未做）；行为由 SessionAuthorityTest（Robolectric）钉死。
+- ⚠️ **Item 8（failure 显示）**：成功路径的 battery 诊断段真机确认完整；failure 路径（shell/parse/tx）显示逻辑由单测覆盖，待一次真实失败事件在 diagnosticJson 中复核。
+- 冒烟：修复版装机后启动正常（今日 1h13m、小时图/拿起/电量去向渲染正常，进程存活）。UI 未做自动化操作（设备在机主手中）。
+
 ## 4.0.16.1 真机验证记录（2026-10-01 深夜，OnePlus 13 e4e1b43e，ColorOS 15）
 
 验证方法：升级前用 `run-as` 拉取 v5 库三件套（db/-wal/-shm，WAL 未 checkpoint 也一并保留）作基线 A；装 0.17.0（debug 构建，与 release 同 debug 签名，覆盖安装保留数据且 run-as 可用）；启动后拉 B（迁移+首次同步）、二次启动拉 C（第二次同步）、`dumpsys battery unplug`→`set ac 1` 模拟插电触发抢拍后拉 D（之后 `dumpsys battery reset` 恢复）。DB 分析用本机 Node 24 内置 `node:sqlite`（可回放 WAL），快照/逐行 diff 全程脚本化。快照总和含 `__global___dur` 行的毫秒时长值，**不能**当 mAh 看待。
