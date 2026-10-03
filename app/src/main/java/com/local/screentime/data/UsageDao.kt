@@ -166,6 +166,10 @@ interface UsageDao {
     @Query("SELECT * FROM reports ORDER BY generatedTs DESC LIMIT 10")
     suspend fun latestReports(): List<ReportEntity>
 
+    /** G：全量报告扫描（启动校验过早的「正式」报告用；报告量小） */
+    @Query("SELECT * FROM reports")
+    suspend fun allReports(): List<ReportEntity>
+
     @Query("SELECT * FROM reports WHERE type = :type AND periodKey = :periodKey")
     suspend fun getReport(type: String, periodKey: String): ReportEntity?
 
@@ -177,6 +181,14 @@ interface UsageDao {
 
     @Query("SELECT COALESCE(SUM(totalMah), 0) FROM battery_daily WHERE day BETWEEN :from AND :to")
     suspend fun batteryBetween(from: Long, to: Long): Double
+
+    /** G：区间内「有任何观测（会话/回补/耗电）」的日期集合——报告覆盖天数用 */
+    @Query(
+        "SELECT DISTINCT day FROM sessions WHERE day BETWEEN :from AND :to " +
+            "UNION SELECT DISTINCT day FROM usage_daily WHERE day BETWEEN :from AND :to " +
+            "UNION SELECT DISTINCT day FROM battery_daily WHERE day BETWEEN :from AND :to"
+    )
+    suspend fun observedDaysBetween(from: Long, to: Long): List<Long>
 
     // —— UID 成员历史（v9，P1-5）：采集时持久化，读取时按有效期解析历史归属 ——
 

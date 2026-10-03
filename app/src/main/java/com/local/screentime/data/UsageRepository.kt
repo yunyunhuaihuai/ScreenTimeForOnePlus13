@@ -386,6 +386,17 @@ class UsageRepository(
             dao.putState(SyncStateEntity(KEY_SYSUID_FIX, 1))
         }
 
+        // 0) 一次性清理 usage_daily（顺序敏感，P2-2 定向验证）：必须在回补导入
+        //    （syncViaRoot 内）**之前**清——两标志均缺失的新库若先导入回补再清理，
+        //    会把刚导入的回补一并删掉。ColorOS 的 API 日聚合是 ~16:40 锚点的滚动
+        //    24h 桶，无法按自然日拆分，v0.16 起展示只认会话表，历史桶值全部作废。
+        if (dao.getState(KEY_AGG_WIPED) == null) {
+            db.withTransaction {
+                dao.clearUsageDaily()
+                dao.putState(SyncStateEntity(KEY_AGG_WIPED, 1))
+            }
+        }
+
         // 1) root 全量 + 耗电（权威路径，见类头注释）
         //    getShell() 才会真正建立 su 通道：新进程首同步时 isAppGrantedRoot() 尚为 null
         //    （unknown），会被误判为无 root 而降级到 API/DUMP 兜底（真机实测：冷启动首同步
@@ -451,16 +462,10 @@ class UsageRepository(
             runCatching { syncDayEventStats(events, ZoneId.systemDefault(), SESSION_SOURCE_API, now) }
         }
         runCatching { dao.deleteUnlockLauncherRows() }
-        // 3) 一次性清理 usage_daily：ColorOS 的 API 日聚合是 ~16:40 锚点的滚动 24h 桶，
-        //    无法按自然日拆分，v0.16 起展示只认会话表，历史桶值全部作废
-        if (dao.getState(KEY_AGG_WIPED) == null) {
-            db.withTransaction {
-                dao.clearUsageDaily()
-                dao.putState(SyncStateEntity(KEY_AGG_WIPED, 1))
-            }
-        }
 
         refreshAppRegistry()
+        // G：过早「正式」报告降级为预览（旧进行中年度报告不得冒充正式结论）
+        runCatching { demotePrematureFinalizedReports(LocalDate.now()) }
         runCatching { generateDueReports(force = false) }
         // 持久化「实际同步结果」（P1-5 / P1-1）：usage 与 battery 两条独立健康线——
         // UsageStats 成功不等于 batterystats 成功，diagnosticJson 分别呈现。
@@ -837,6 +842,8 @@ class UsageRepository(
                         db.withTransaction { dao.upsertDaily(list) }
                         runner.exec("rm -f /data/local/tmp/stlog_backfill.json")
                         dao.putState(SyncStateEntity(KEY_BACKFILL, 1))
+                        // 回补是数据修订（G）：相关正式报告需要重建
+                        bumpDataRevision()
                         Log.d(TAG, "backfill: ${list.size} rows")
                     }
                 }
@@ -1113,74 +1120,123 @@ class UsageRepository(
     }
 
     /**
-     * 报告生成（v0.17.0 重设计，P0-3）。
+     * 报告生成（v0.17.0 重设计，P0-3；v0.18 扩展，G）。
      *
      * 自动路径（force=false）：为「最近已完整结束的周期」生成正式报告（finalized=true）。
-     * 既有记录若生成于周期结束之前（旧版在周期最后一天提前生成的"正式"报告、或手动
-     * 预览）视为过早，以正式报告覆盖；按 ReportPeriods.backfillLimit 有界回溯，补上
-     * 因后台被杀错过的周期（旧实现的 7 天补生成窗口因 currentPeriods 切换而从未生效）。
-     * 仅最新周期推送通知，更早的补生成静默进入历史列表，避免升级首日通知轰炸。
+     * 重建触发条件（needsFinalizedGeneration）：缺失、过早（旧版提前生成）、
+     * 数据修订版本落后（ROOT 纠错/回补/统计纠错后相关报告可重建）、或文本格式
+     * 版本落后（旧「总耗电」文案更新为「应用归因耗电」）。修订/格式触发的重建
+     * **静默**，只有「新正式化」的最新周期才推送通知，不重复打扰。
      *
      * force=true（手动）：额外为当前进行中的周期生成预览（finalized=false，数据不完整）。
      */
     suspend fun generateDueReports(force: Boolean): List<String> {
         val zone = ZoneId.systemDefault()
-        val today = LocalDate.now(zone)
+        // today 从 nowMs() 推导（与生成时间戳同一时钟；测试可注入）
         val now = nowMs()
+        val today = Instant.ofEpochMilli(now).atZone(zone).toLocalDate()
+        val currentRevision = dao.getState(KEY_DATA_REVISION) ?: 0L
         val made = ArrayList<String>()
         for (type in listOf(ReportPeriods.REPORT_WEEKLY, ReportPeriods.REPORT_MONTHLY, ReportPeriods.REPORT_YEARLY)) {
             // 逐周期检查（P1-12）：已有正式报告的 continue 到更早周期，缺失/过早的补生成
-            for ((shift, p) in ReportPeriods.backfillPlan(today, type, lookup = { t, k -> dao.getReport(t, k) }, zone)) {
-                val text = buildReportText(p)
+            for ((shift, p) in ReportPeriods.backfillPlan(
+                today, type, lookup = { t, k -> dao.getReport(t, k) }, zone,
+                currentRevision = currentRevision, currentFormatVersion = REPORT_FORMAT_VERSION,
+            )) {
+                val existing = dao.getReport(type, p.key)
+                val text = buildReportText(p, today)
                 dao.putReport(
-                    ReportEntity(type = p.type, periodKey = p.key, generatedTs = now, text = text, finalized = true)
-                )
-                if (shift == 0L) {
-                    Notifications.notifyReport(
-                        context,
-                        "屏幕时间 · ${p.title.substringAfterLast(' ')}已生成",
-                        text.lines().take(3).joinToString("\n")
+                    ReportEntity(
+                        type = p.type, periodKey = p.key, generatedTs = now, text = text,
+                        finalized = true, dataRevision = currentRevision, formatVersion = REPORT_FORMAT_VERSION,
                     )
+                )
+                // 只在「新正式化」（此前无记录或过早）且为最新周期时通知；
+                // 修订/格式触发的重建静默（不重复通知）
+                val isNewlyFinalized = existing == null || ReportPeriods.premature(existing, p, zone)
+                if (shift == 0L && isNewlyFinalized) {
+                    runCatching {
+                        Notifications.notifyReport(
+                            context,
+                            "屏幕时间 · ${p.title.substringAfterLast(' ')}已生成",
+                            text.lines().take(3).joinToString("\n")
+                        )
+                    }
                 }
                 made.add(p.title)
             }
         }
         if (force) {
             for (p in ReportPeriods.currentPreview(today)) {
-                val text = buildReportText(p)
+                val text = buildReportText(p, today)
                 dao.putReport(
-                    ReportEntity(type = p.type, periodKey = p.key, generatedTs = now, text = text, finalized = false)
+                    ReportEntity(
+                        type = p.type, periodKey = p.key, generatedTs = now, text = text,
+                        finalized = false, dataRevision = currentRevision, formatVersion = REPORT_FORMAT_VERSION,
+                    )
                 )
-                Notifications.notifyReport(
-                    context,
-                    "屏幕时间 · ${p.title.substringAfterLast(' ')}预览已生成（周期未结束）",
-                    text.lines().take(3).joinToString("\n")
-                )
+                runCatching {
+                    Notifications.notifyReport(
+                        context,
+                        "屏幕时间 · ${p.title.substringAfterLast(' ')}预览已生成（周期未结束）",
+                        text.lines().take(3).joinToString("\n")
+                    )
+                }
                 made.add(p.title + "（预览）")
             }
         }
         return made
     }
 
-    private suspend fun buildReportText(p: ReportPeriod): String {
+    /**
+     * 启动/同步时校验：旧版本在周期结束前生成的「正式」报告且该周期**至今未结束**
+     * （如 9/12 生成、finalized=1 的 Y:2026）→ 降级为预览，不得继续冒充正式结论。
+     * 周期已结束的过早报告不在此处理——generateDueReports 会以完整口径重新正式化。
+     */
+    internal suspend fun demotePrematureFinalizedReports(today: LocalDate) {
+        for (r in dao.allReports()) {
+            if (!r.finalized) continue
+            val p = ReportPeriods.periodFromKey(r.type, r.periodKey) ?: continue
+            if (today <= p.end) {
+                // 周期尚未结束：finalized=1 一定是过早生成的，降级为预览
+                dao.putReport(r.copy(finalized = false))
+            }
+        }
+    }
+
+    private suspend fun buildReportText(p: ReportPeriod, today: LocalDate): String {
         val from = p.start.toEpochDay()
         val to = p.end.toEpochDay()
         val days = p.start.datesUntil(p.end.plusDays(1)).count().toInt().coerceAtLeast(1)
         // 统一口径（P0-4）：报告与首页 dailyRows 共用 effective usage
-        // （sessions 与 usage_daily 回补值逐包/逐日取 max），不再单独读 sessions 表
         val pkgRows = dao.effectiveUsageBetween(from, to)
         val total = pkgRows.sumOf { it.totalMs }
         val top = pkgRows.take(5)
         val pickups = dao.pickupsBetween(from, to)
         val battery = dao.batteryBetween(from, to)
-        val prevTo = from - 1
-        val prevFrom = prevTo - days + 1
+        // 环比对照（v0.18，P1-4/G）：按上一自然周期解析；预览对照上一周期的同期天数
+        // （进行中的周期与上一完整周期直接比会必然「下降」）
+        val prevPeriod = ReportPeriods.previousPeriod(p)
+        val prevFrom: Long
+        val prevTo: Long
+        if (p.finalized) {
+            prevFrom = prevPeriod.start.toEpochDay()
+            prevTo = prevPeriod.end.toEpochDay()
+        } else {
+            val elapsed = (today.toEpochDay() - from + 1).coerceIn(1, days.toLong())
+            prevFrom = prevPeriod.start.toEpochDay()
+            prevTo = prevFrom + elapsed - 1
+        }
         val prevPkgSums = dao.effectiveUsageBetween(prevFrom, prevTo).associate { it.packageName to it.totalMs }
+        val prevObserved = dao.observedDaysBetween(prevFrom, prevTo).isNotEmpty()
+        // 覆盖天数（G）：无观测的日期不得被解释为「零使用/下降」
+        val observedDays = dao.observedDaysBetween(from, to).size
         val pm = context.packageManager
         val sb = StringBuilder()
         sb.appendLine("期间：${p.start} ~ ${p.end}（$days 天）")
         if (!p.finalized) sb.appendLine("⚠️ 预览：本周期尚未结束，以下数据不含剩余时间的用量")
         sb.appendLine("总使用：${formatMinutesShort(total)} · 日均 ${formatMinutesShort(total / days)}")
+        sb.appendLine("数据覆盖：$observedDays/$days 天" + if (observedDays < days) "（其余天数无观测记录，不计为使用）" else "")
         if (pickups > 0) sb.appendLine("拿起：$pickups 次")
         // P1-11 语义修正：batteryBetween = SUM(battery_daily.totalMah) = UID 归因耗电
         // （UID total 本身已含其 screen/cpu 等组件），不等于整机实际耗电/computedDrain/
@@ -1192,6 +1248,8 @@ class UsageRepository(
         top.forEachIndexed { i, t ->
             val prev = prevPkgSums[t.packageName]
             val delta = when {
+                // 上一周期完全无观测：不能把缺数据说成「新增」或算出下降比例
+                prev == null && !prevObserved -> "（上一周期无数据）"
                 prev == null -> "（新增）"
                 prev > 0 -> {
                     val chg = ((t.totalMs - prev).toDouble() / prev * 100).toInt()
@@ -1250,6 +1308,13 @@ class UsageRepository(
         const val KEY_BATTERY_LOST_TAIL_TO = "battery_lost_tail_to_ts"
         /** capture_log 有界保留条数（P2-2：控制磁盘占用） */
         const val CAPTURE_LOG_LIMIT = 64
+
+        /**
+         * 报告文本格式版本（v0.18，G）：文案/口径修正后递增，存量报告据此静默重建。
+         * v2 = 「应用归因耗电（UID 模型估算，非整机实际耗电）」+ 数据覆盖天数 +
+         * 上一自然周期环比；v1 = 旧「总耗电」文案时代（存量月报仍是该文案）。
+         */
+        const val REPORT_FORMAT_VERSION = 2
         const val SOURCE_EVENT = 0
         const val SOURCE_AGG_API = 1
         const val SOURCE_ROOT = 2

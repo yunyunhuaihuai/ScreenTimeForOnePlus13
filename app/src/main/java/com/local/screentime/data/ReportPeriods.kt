@@ -60,12 +60,14 @@ object ReportPeriods {
         type: String,
         lookup: suspend (type: String, periodKey: String) -> ReportEntity?,
         zone: ZoneId,
+        currentRevision: Long = 0L,
+        currentFormatVersion: Int = 1,
     ): List<Pair<Long, ReportPeriod>> {
         val out = ArrayList<Pair<Long, ReportPeriod>>()
         for (shift in 0 until backfillLimit(type)) {
             val p = lastCompletedShifted(today, type, shift)
             val existing = lookup(p.type, p.key)
-            if (!needsFinalizedGeneration(existing, p, zone)) continue
+            if (!needsFinalizedGeneration(existing, p, zone, currentRevision, currentFormatVersion)) continue
             out.add(shift to p)
         }
         return out
@@ -97,6 +99,57 @@ object ReportPeriods {
                 LocalDate.of(year, 1, 1), LocalDate.of(year, 12, 31), finalized = true,
             )
         }
+    }
+
+    /**
+     * 上一自然周期（v0.18，P1-4/G）：环比对照按日历解析——周报=前一个 Mon–Sun、
+     * 月报=上一个自然月（28/30/31 天自动对齐，含闰年 2 月）、年报=上一个自然年。
+     * 禁止「按本期天数向前平移」（30 天月会错位比较到上月中间，闰年也不正确）。
+     */
+    fun previousPeriod(p: ReportPeriod): ReportPeriod = when (p.type) {
+        REPORT_WEEKLY -> p.copy(
+            key = "W:${p.start.minusDays(7)}",
+            start = p.start.minusDays(7),
+            end = p.end.minusDays(7),
+        )
+        REPORT_MONTHLY -> {
+            val s = p.start.minusMonths(1)
+            p.copy(
+                key = "M:${s.year}-${s.monthValue}",
+                start = s,
+                end = s.withDayOfMonth(s.lengthOfMonth()),
+            )
+        }
+        else -> {
+            val y = p.start.year - 1
+            p.copy(key = "Y:$y", start = LocalDate.of(y, 1, 1), end = LocalDate.of(y, 12, 31))
+        }
+    }
+
+    /**
+     * 由 (type, periodKey) 重建周期区间（v0.18，G）：用于启动时校验既有报告——
+     * 旧版本在周期结束前生成的「正式」报告（如 9/12 就生成、finalized=1 的
+     * Y:2026）需降级为预览。key 格式沿用旧版（W:<周一> / M:<年>-<月> / Y:<年>）。
+     */
+    fun periodFromKey(type: String, key: String): ReportPeriod? = try {
+        when (type) {
+            REPORT_WEEKLY -> {
+                val s = LocalDate.parse(key.substringAfter("W:"))
+                ReportPeriod(type, key, "", s, s.plusDays(6), finalized = true)
+            }
+            REPORT_MONTHLY -> {
+                val parts = key.substringAfter("M:").split("-")
+                val s = LocalDate.of(parts[0].toInt(), parts[1].toInt(), 1)
+                ReportPeriod(type, key, "", s, s.withDayOfMonth(s.lengthOfMonth()), finalized = true)
+            }
+            REPORT_YEARLY -> {
+                val y = key.substringAfter("Y:").toInt()
+                ReportPeriod(type, key, "", LocalDate.of(y, 1, 1), LocalDate.of(y, 12, 31), finalized = true)
+            }
+            else -> null
+        }
+    } catch (e: Exception) {
+        null
     }
 
     /** 最近一个已完整结束的周期（周/月/年三类） */
@@ -133,10 +186,26 @@ object ReportPeriods {
         p.end.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
 
     /**
-     * 正式报告是否需要（重新）生成：无记录，或既有记录生成于周期结束之前
-     * （旧版本在周期最后一天提前生成的「正式」报告、或手动预览）。
+     * 正式报告是否需要（重新）生成（v0.18 扩展，G）：
+     *  - 无记录；
+     *  - 生成于周期结束之前（旧版提前生成的「正式」报告、或手动预览）；
+     *  - 生成时的数据修订版本低于当前（ROOT 纠错/回补/统计纠错后重建，静默）；
+     *  - 生成时的文本格式版本低于当前（旧「总耗电」文案更新）。
      * 预览与正式报告共用同一 periodKey，周期结束后由正式报告覆盖。
      */
-    fun needsFinalizedGeneration(existing: ReportEntity?, p: ReportPeriod, zone: ZoneId): Boolean =
-        existing == null || existing.generatedTs < periodEndInstantTs(p, zone)
+    fun needsFinalizedGeneration(
+        existing: ReportEntity?,
+        p: ReportPeriod,
+        zone: ZoneId,
+        currentRevision: Long = 0L,
+        currentFormatVersion: Int = 1,
+    ): Boolean =
+        existing == null ||
+            existing.generatedTs < periodEndInstantTs(p, zone) ||
+            existing.dataRevision < currentRevision ||
+            existing.formatVersion < currentFormatVersion
+
+    /** 报告是否为「过早生成」：生成时间早于周期结束（提前的正式/预览，需重生成） */
+    fun premature(existing: ReportEntity, p: ReportPeriod, zone: ZoneId): Boolean =
+        existing.generatedTs < periodEndInstantTs(p, zone)
 }
