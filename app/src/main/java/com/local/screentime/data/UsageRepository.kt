@@ -59,6 +59,19 @@ sealed class BatteryCaptureOutcome {
 
 data class AppDisplay(val label: String, val frozen: Boolean)
 
+/** computeDayEventStats 的返回值：每日拿起次数 + 每日「解锁后首开应用」计数 */
+data class DayEventStatsResult(
+    val pickups: Map<Long, Long>,
+    val unlockFirst: Map<Long, Map<String, Long>>,
+)
+
+/** planDayEventStatsWrites 的返回值：需整日原子替换的日期与对应新行 */
+data class DayStatsPlan(
+    val replaceDays: List<Long>,
+    val dayRows: List<DayStatsEntity>,
+    val unlockRows: List<UnlockStatsEntity>,
+)
+
 data class UidPower(
     val uidKey: String,
     val totalMah: Double,
@@ -433,9 +446,9 @@ class UsageRepository(
             val sessions = buildSessions(events, windowStart, now, SESSION_SOURCE_API)
             sessionCount = sessions.size
             applyApiFallbackSessions(db, dao, sessions, windowStart, now)
-            // day_stats/unlock_stats 是整行 REPLACE：API 事件残缺时算出的拿起/首开次数偏小，
-            // 只有 root 路径没拿到事件时才允许 API 兜底（v0.16.7）
-            runCatching { syncDayEventStats(events, ZoneId.systemDefault()) }
+            // day_stats/unlock_stats 是按日权威来源管理（P1-3/F）：API 事件残缺时算出的
+            // 拿起/首开次数偏小，只允许写无 ROOT/LEGACY 权威数据的日期
+            runCatching { syncDayEventStats(events, ZoneId.systemDefault(), SESSION_SOURCE_API, now) }
         }
         runCatching { dao.deleteUnlockLauncherRows() }
         // 3) 一次性清理 usage_daily：ColorOS 的 API 日聚合是 ~16:40 锚点的滚动 24h 桶，
@@ -851,7 +864,7 @@ class UsageRepository(
                 dao.deleteSessionsStartingAfter(start)
                 if (sessions.isNotEmpty()) dao.insertSessions(sessions)
             }
-            runCatching { syncDayEventStats(events, zone) }
+            runCatching { syncDayEventStats(events, zone, SESSION_SOURCE_ROOT, observedAt) }
             Log.d(TAG, "root: events=${events.size} sessions=${sessions.size}")
             return sessions.size
         }
@@ -1011,6 +1024,15 @@ class UsageRepository(
         return BatteryCaptureOutcome.Success(commandEndTs)
     }
 
+    /** 数据修订版本递增（v0.18，G）；返回新版本号。
+     *  修订号全局递增：ROOT 纠错/回补/统计替换实际改变数据时 +1，
+     *  低于当前修订号的正式报告需要重建。 */
+    private suspend fun bumpDataRevision(): Long {
+        val next = (dao.getState(KEY_DATA_REVISION) ?: 0L) + 1
+        dao.putState(SyncStateEntity(KEY_DATA_REVISION, next))
+        return next
+    }
+
     /** 采集失败的持久化记录（人类可读原因进 prefs；时间戳进 sync_state，供 P1-1 健康键拆分） */
     private suspend fun recordBatteryFailure(stage: String, error: String) {
         prefs.edit().putString(PREF_LAST_BATTERY_FAIL, "[$stage] $error").apply()
@@ -1045,19 +1067,49 @@ class UsageRepository(
         }
     }
 
-    /** 拿起次数（KEYGUARD_HIDDEN 计数）与“解锁后首开应用”统计 */
-    private suspend fun syncDayEventStats(events: List<RawEvent>, zone: ZoneId) {
+    /**
+     * 拿起次数（KEYGUARD_HIDDEN 计数）与“解锁后首开应用”统计。
+     *
+     * 来源与覆盖语义（v0.18，P1-3/F）：day_stats/unlock_stats 按日记录来源（source 列），
+     * ROOT 是权威——可整日原子替换（含清除已消失包的首开旧行、可纠错历史过计数）；
+     * API 事件流被 ColorOS 深度裁剪，**只允许写无权威来源的日期**，绝不把完整 ROOT 日
+     * 计数覆盖偏小。窗口首日（不从本地零点起）除非是「今天」（今天已过时间被窗口完整
+     * 覆盖），否则不替换——部分窗口不得当整天覆盖。
+     */
+    internal suspend fun syncDayEventStats(events: List<RawEvent>, zone: ZoneId, source: Int, observedAt: Long) {
         if (events.isEmpty()) return
         val res = computeDayEventStats(events, zone)
-        // 事件窗口首日通常不从零点起，而 day_stats/unlock_stats 是整行 REPLACE，
-        // 写残窗值会把该日既有计数覆盖偏小；随 ~7 天 root 窗口滑动，首日恒残缺。
-        // 该日更早的同步里曾位于窗口内被完整写入，跳过首日即可保住正确值。
-        val firstDay = Instant.ofEpochMilli(events.minOf { it.ts }).atZone(zone).toLocalDate().toEpochDay()
-        val statRows = res.pickups.filterKeys { it != firstDay }.map { (d, c) -> DayStatsEntity(d, c) }
-        if (statRows.isNotEmpty()) dao.upsertDayStats(statRows)
-        val unlockRows = res.unlockFirst.filterKeys { it != firstDay }
-            .flatMap { (d, m) -> m.map { (p, c) -> UnlockStatsEntity(d, p, c) } }
-        if (unlockRows.isNotEmpty()) dao.upsertUnlockStats(unlockRows)
+        val windowStartTs = events.minOf { it.ts }
+        val candidateDays = (res.pickups.keys + res.unlockFirst.keys).toList()
+        if (candidateDays.isEmpty()) return
+        // 每个候选日当前存储的权威来源 = day_stats/unlock_stats 中该日来源的最大值
+        val existingSources: Map<Long, Int> = run {
+            val ds = dao.dayStatsForDays(candidateDays).associate { it.day to it.source }
+            val us = dao.unlockStatsForDays(candidateDays)
+                .groupBy { it.day }
+                .mapValues { (_, rows) -> rows.maxOf { it.source } }
+            candidateDays.associateWith { d -> maxOf(ds[d] ?: 0, us[d] ?: 0) }
+        }
+        val existingDayStats = dao.dayStatsForDays(candidateDays).associateBy { it.day }
+        val existingUnlock = dao.unlockStatsForDays(candidateDays).groupBy { it.day }
+        val plan = planDayEventStatsWrites(res, windowStartTs, observedAt, zone, source, existingSources)
+        if (plan.replaceDays.isEmpty()) return
+        val changed = plan.replaceDays.any { d ->
+            val oldDay = existingDayStats[d]
+            val oldUnlock = existingUnlock[d]?.associate { it.packageName to it.count } ?: emptyMap()
+            val newUnlock = plan.unlockRows.filter { it.day == d }.associate { it.packageName to it.count }
+            oldDay?.pickups != (res.pickups[d] ?: 0L) || oldUnlock != newUnlock
+        }
+        db.withTransaction {
+            for (d in plan.replaceDays) {
+                dao.deleteDayStatsFor(d)
+                dao.deleteUnlockStatsFor(d)
+            }
+            if (plan.dayRows.isNotEmpty()) dao.upsertDayStats(plan.dayRows)
+            if (plan.unlockRows.isNotEmpty()) dao.upsertUnlockStats(plan.unlockRows)
+        }
+        // ROOT 纠错实际改变了统计值 → 视为数据修订（相关报告可重建，见 generateDueReports）
+        if (changed && source == SESSION_SOURCE_ROOT) bumpDataRevision()
     }
 
     /**
@@ -1168,6 +1220,8 @@ class UsageRepository(
         const val KEY_AGG_WIPED = "usage_daily_wiped_v16"
         const val KEY_BACKFILL = "backfill_natural_days_v18"
         const val KEY_SYSUID_FIX = "sysuid_labels_v18"
+        /** 数据修订版本（v0.18，G）：低于当前修订号的正式报告需要重建 */
+        const val KEY_DATA_REVISION = "data_revision"
 
         // —— 持久化诊断状态（P1-1/P1-5，sync_state 持久化，diagnosticJson 输出） ——
         // usage 与 battery 是两条独立健康线（P1-1）：UsageStats 成功不代表 batterystats 成功
@@ -1593,10 +1647,46 @@ class UsageRepository(
             return out
         }
 
-        data class DayEventStatsResult(
-            val pickups: Map<Long, Long>,
-            val unlockFirst: Map<Long, Map<String, Long>>
-        )
+        /**
+         * 事件统计写入计划（纯函数，JVM 可测）。
+         * 可写日 = (窗口起点 ≤ 该日本地零点，即完整覆盖) 或 该日是「今天」（已过时段被
+         * 窗口完整覆盖，计数为「截至目前」的完整值）；窗口首日不满足两者 → 跳过（部分
+         * 窗口不当整天覆盖）。API 来源只写无权威来源（无任何行/已是 API）的日期；
+         * ROOT 写任何可写日。替换是**整日原子**的：先删该日全部行再插入新值，已消失
+         * 包的首开旧行随之清除。
+         */
+        fun planDayEventStatsWrites(
+            res: DayEventStatsResult,
+            windowStartTs: Long,
+            observedAt: Long,
+            zone: ZoneId,
+            source: Int,
+            existingDaySources: Map<Long, Int>,
+        ): DayStatsPlan {
+            val today = Instant.ofEpochMilli(observedAt).atZone(zone).toLocalDate().toEpochDay()
+            val candidateDays = (res.pickups.keys + res.unlockFirst.keys).toSortedSet()
+            val replaceDays = ArrayList<Long>()
+            val dayRows = ArrayList<DayStatsEntity>()
+            val unlockRows = ArrayList<UnlockStatsEntity>()
+            for (d in candidateDays) {
+                val dayStart = LocalDate.ofEpochDay(d).atStartOfDay(zone).toInstant().toEpochMilli()
+                val coveredFromMidnight = windowStartTs <= dayStart
+                val isToday = d == today
+                if (!coveredFromMidnight && !isToday) continue
+                if (source == SESSION_SOURCE_API) {
+                    // API 只能写「无任何已存行」或「已是 API 自己写的」日期；
+                    // 有 ROOT/LEGACY 权威行的日期一律保护
+                    when (existingDaySources[d]) {
+                        null, SESSION_SOURCE_API -> Unit
+                        else -> continue
+                    }
+                }
+                replaceDays.add(d)
+                dayRows.add(DayStatsEntity(d, res.pickups[d] ?: 0L, source))
+                res.unlockFirst[d]?.forEach { (p, c) -> unlockRows.add(UnlockStatsEntity(d, p, c, source)) }
+            }
+            return DayStatsPlan(replaceDays, dayRows, unlockRows)
+        }
 
         /**
          * 纯函数：根据事件流计算每日拿起次数与解锁后应用统计。

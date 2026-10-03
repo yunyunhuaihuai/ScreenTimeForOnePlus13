@@ -138,6 +138,22 @@ interface UsageDao {
     @Upsert
     suspend fun upsertDayStats(rows: List<DayStatsEntity>)
 
+    /** F：按日原子替换（先删后插，清除该日已消失包的行） */
+    @Query("DELETE FROM day_stats WHERE day = :day")
+    suspend fun deleteDayStatsFor(day: Long)
+
+    @Query("DELETE FROM unlock_stats WHERE day = :day")
+    suspend fun deleteUnlockStatsFor(day: Long)
+
+    @Query("SELECT * FROM day_stats WHERE day IN (:days)")
+    suspend fun dayStatsForDays(days: List<Long>): List<DayStatsEntity>
+
+    @Query("SELECT * FROM unlock_stats WHERE day IN (:days)")
+    suspend fun unlockStatsForDays(days: List<Long>): List<UnlockStatsEntity>
+
+    @Query("SELECT * FROM unlock_stats WHERE day = :day ORDER BY count DESC")
+    suspend fun unlockStatsForDay(day: Long): List<UnlockStatsEntity>
+
     @Query("SELECT * FROM unlock_stats WHERE day = :day ORDER BY count DESC LIMIT :limit")
     suspend fun unlockTop(day: Long, limit: Int): List<UnlockStatsEntity>
 
