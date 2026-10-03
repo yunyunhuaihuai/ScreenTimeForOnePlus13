@@ -321,13 +321,15 @@ object BatteryLedger {
 }
 
 /**
- * 原子提交一次 batterystats 差分（v0.17.0 引入；v0.17.1 加入 epoch 状态）。
+ * 原子提交一次 batterystats 差分（v0.17.0 引入；v0.17.1 加入 epoch 状态；v0.18 加入
+ * 解析健康基线的协调推进）。
  *
  * 单一 Room 事务内完成：批量读旧状态 → 纯差分计算 → 批量写 battery_daily /
  * battery_global → （epoch 变化时删除全部旧快照）→ 推进 battery_snapshot →
- * 推进 epoch 标记（sync_state.KEY_BATTERY_WINDOW_START_TS）。任一步抛异常
+ * 推进 epoch 标记（sync_state.KEY_BATTERY_WINDOW_START_TS）→ 推进解析健康基线
+ * （KEY_PARSER_BASELINE_UIDS / KEY_PARSER_HAD_WINDOW）。任一步抛异常
  * （含差分计算后注入的故障）整个事务回滚：快照不推进、daily/global 不推进、
- * **epoch 标记也不推进**（P0-4：下一次同步可基于完整旧状态重新计算）。
+ * **epoch 标记与已接受基线也不推进**（P0-4：下一次同步可基于完整旧状态重新计算）。
  *
  * epoch 变化时删除**全部**旧快照——不仅是本帧出现的 UID：新 epoch 第一帧缺席的
  * 应用之后重新出现时，绝不能拿旧 epoch 的基线做差（否则重演抖音吞量）。
@@ -343,6 +345,8 @@ internal suspend fun applyBatteryLedgerTx(
     zone: ZoneId,
     pkgOf: (Int) -> String?,
     prevWindowStartTs: Long? = null,
+    newBaselineUidCount: Long? = null,
+    hadWindowBaseline: Boolean? = null,
     probeAfterCompute: (suspend () -> Unit)? = null,
 ): BatteryLedger.Result =
     db.withTransaction {
@@ -367,6 +371,11 @@ internal suspend fun applyBatteryLedgerTx(
         }
         dao.upsertBatterySnapshots(out.snapshots)
         out.newWindowStartTs?.let { dao.putState(SyncStateEntity(UsageRepository.KEY_BATTERY_WINDOW_START_TS, it)) }
+        // 解析健康基线与数据同事务推进（v0.18）：门控拒绝/事务失败都不得推进已接受基线
+        newBaselineUidCount?.let { dao.putState(SyncStateEntity(UsageRepository.KEY_PARSER_BASELINE_UIDS, it)) }
+        if (hadWindowBaseline == true) {
+            dao.putState(SyncStateEntity(UsageRepository.KEY_PARSER_HAD_WINDOW, 1L))
+        }
         out
     }
 

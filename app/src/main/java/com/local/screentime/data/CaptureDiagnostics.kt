@@ -67,13 +67,16 @@ data class CaptureDiagnostics(
     }
 
     companion object {
-        /** parser 结构版本：section 边界/字段变更时递增，随诊断落盘 */
-        const val PARSER_VERSION = 3
+        /** parser 结构版本：section 边界/字段变更时递增，随诊断落盘。
+         *  v4（v0.18）：computedDrainPresent 区分「合法零耗电」与「结构截断」；
+         *  异常判据按 epoch 隔离（新窗口不继承旧窗口 UID 数量下限）。 */
+        const val PARSER_VERSION = 4
 
         fun fromParsed(
             parsed: BatteryParsed,
             baselineUidCount: Long?,
             hadWindowBaseline: Boolean,
+            epoch: BatteryLedger.EpochState? = null,
         ): CaptureDiagnostics = CaptureDiagnostics(
             parserVersion = PARSER_VERSION,
             rawLineCount = parsed.rawLineCount,
@@ -85,23 +88,36 @@ data class CaptureDiagnostics(
             actualDrainLowMah = parsed.actualDrainLow.takeIf { it > 0 },
             actualDrainHighMah = parsed.actualDrainHigh,
             sumUidTotalMah = parsed.uids.sumOf { it.totalMah },
-            anomalies = detectAnomalies(parsed, baselineUidCount, hadWindowBaseline),
+            anomalies = detectAnomalies(parsed, baselineUidCount, hadWindowBaseline, epoch),
         )
 
-        /** 异常检测（纯函数）。baseline 为 null/0 表示尚无健康基线，跳过相对判据 */
+        /**
+         * 异常检测（纯函数）。baseline 为 null/0 表示尚无健康基线，跳过相对判据。
+         *
+         * epoch 隔离（v0.18，P0-1 复审）：uid_count_drop 是「同窗口内结构截断」的判据，
+         * 只对 SAME/UNKNOWN 生效。RESET 帧是全新统计窗口——刚充满时合法帧可能只有
+         * 少数 UID 甚至个位数，旧窗口的 142 UID 基线对新窗口没有任何意义；先识别
+         * epoch、再应用适用的完整性判据，否则「旧 142 → 新 20」的合法帧会被拒绝，
+         * epoch 标记与基线永远无法推进。
+         */
         fun detectAnomalies(
             parsed: BatteryParsed,
             baselineUidCount: Long?,
             hadWindowBaseline: Boolean,
+            epoch: BatteryLedger.EpochState? = null,
         ): List<String> {
             val a = ArrayList<String>()
             if (parsed.uids.isEmpty() && parsed.globals.isEmpty()) {
                 a.add("power_section_unparsed")
             }
-            if (parsed.computedDrain <= 0.0) a.add("computed_drain_missing")
+            // computed=0 本身不是异常（刚充满/极低耗电的合法帧）；只有 drain 概要行
+            // 整行缺失（结构截断/parser 失配）才是异常
+            if (!parsed.computedDrainPresent) a.add("computed_drain_missing")
             if (parsed.windowStartTs == null && hadWindowBaseline) a.add("window_start_missing")
             val baseline = baselineUidCount ?: 0L
-            if (baseline > 0 && parsed.uids.size < baseline * 0.5) {
+            if (epoch != BatteryLedger.EpochState.RESET &&
+                baseline > 0 && parsed.uids.size < baseline * 0.5
+            ) {
                 a.add("uid_count_drop(baseline=$baseline,parsed=${parsed.uids.size})")
             }
             return a

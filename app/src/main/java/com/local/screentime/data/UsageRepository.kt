@@ -81,6 +81,10 @@ data class BatteryParsed(
     val batteryCapacityMah: Double? = null,
     /** 传入 parser 的原始行数（P1-2 完整性诊断用） */
     val rawLineCount: Int = 0,
+    /** drain 概要行（Capacity/Computed drain/actual drain）是否真的解析到。
+     *  v0.18（A）：computed=0 不再一概等同解析失败——刚充满的合法帧 drain 就是 0；
+     *  只有整行缺失（结构截断）才算异常。手工构造的测试数据默认视为已解析。 */
+    val computedDrainPresent: Boolean = true,
 )
 
 /**
@@ -96,9 +100,12 @@ class UsageRepository(
     private val context: Context,
     /** 高权限命令后端（P1-3）：默认 libsu root，行为与旧直用 Shell.cmd 完全一致 */
     private val runner: PrivilegedCommandRunner = RootCommandRunner(),
+    /** 测试注入用：默认单例文件库；Robolectric 入口级测试传 in-memory 库（规避
+     *  Robolectric 文件库跨线程连接 shadow 的已知问题，且不落盘） */
+    dbOverride: AppDatabase? = null,
 ) {
 
-    private val db = AppDatabase.get(context)
+    private val db = dbOverride ?: AppDatabase.get(context)
     private val dao = db.usageDao()
     private val reader = UsageStatsReader(context)
     private val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
@@ -700,7 +707,28 @@ class UsageRepository(
      * 成功后持久化「实际使用的通道」（P1-5：last_battery_source = ROOT/DUMP），
      * 失败原因写入诊断 prefs——diagnosticJson 输出真实历史状态而非现场探测。
      */
-    private suspend fun syncBattery(now: Long, source: BatterySource): BatteryCaptureOutcome {
+    private suspend fun syncBattery(now: Long, source: BatterySource): BatteryCaptureOutcome =
+        syncBattery(now, now, now, source)
+
+    /**
+     * 耗电采集核心（internal 供入口级回归测试）。
+     *
+     * 时间语义（v0.18，P2-2）：attemptTs/commandStartTs/commandEndTs 分开记录；
+     * 差分日归属与成功时间戳一律用 observedTs（commandEnd ≈ dump 实际观测时刻），
+     * 不再复用拿锁前的 now（跨午夜会把当天增量记到昨天）。
+     *
+     * 门控顺序（v0.18，P0-1 复审）：先读 epoch 标记、识别本帧窗口状态，再应用适用
+     * 的完整性判据——新 epoch（RESET）不继承旧窗口的 UID 数量下限。
+     *
+     * 协调推进（v0.18）：解析健康基线（UID 数/有无窗口）挪进差分事务内，与 epoch
+     * 标记、快照、日账本同事务提交；门控拒绝或事务失败都不推进已接受基线。
+     */
+    internal suspend fun syncBattery(
+        attemptTs: Long,
+        commandStartTs: Long,
+        observedTs: Long,
+        source: BatterySource,
+    ): BatteryCaptureOutcome {
         // —— 阶段一：shell + 解析（事务外） ——
         // P1-10：区分 NO_PRIVILEGE（isRootAvailable=false，调用方处理）/ COMMAND_FAILED
         // （exit≠0）/ VALID_EMPTY_OUTPUT（exit=0 且 stdout 空）/ PARSE_FAILED（有输出但无 power 段）
@@ -710,6 +738,7 @@ class UsageRepository(
             recordBatteryFailure("shell", "${e.javaClass.simpleName}: ${e.message}")
             return BatteryCaptureOutcome.Failed("shell", "${e.javaClass.simpleName}: ${e.message}")
         }
+        val commandEndTs = System.currentTimeMillis()
         if (!res.success) {
             val err = res.stderrFirstLine ?: ""
             Log.w(TAG, "battery shell exit=${res.exitCode}: $err")
@@ -718,11 +747,15 @@ class UsageRepository(
         }
         val lines = res.stdout
         val parsed = parseBatteryPower(lines)
-        // 完整性诊断（P1-2）：无论成败先落盘，diagnosticJson 可回查本帧解析画像
+        // 完整性诊断（P1-2）：无论成败先落盘，diagnosticJson 可回查本帧解析画像。
+        // epoch 先于门控识别（v0.18）：诊断判据按窗口状态隔离
+        val prevWindowStartTs = dao.getState(KEY_BATTERY_WINDOW_START_TS)
+        val epoch = BatteryLedger.epochStateOf(prevWindowStartTs, parsed.windowStartTs)
         val diag = CaptureDiagnostics.fromParsed(
             parsed,
             baselineUidCount = dao.getState(KEY_PARSER_BASELINE_UIDS),
             hadWindowBaseline = dao.getState(KEY_PARSER_HAD_WINDOW) != null,
+            epoch = epoch,
         )
         prefs.edit().putString(PREF_LAST_BATTERY_DIAG, diag.toJson().toString()).apply()
         if (parsed.uids.isEmpty() && parsed.globals.isEmpty()) {
@@ -736,29 +769,30 @@ class UsageRepository(
                 BatteryCaptureOutcome.ParseFailed("stdout ${lines.size} 行无可解析内容")
             }
         }
-        // parser anomaly 门控（P1-2）：禁止静默推进部分快照——fgs 字段失配史的教训
+        // parser anomaly 门控（P1-2）：禁止静默推进部分快照——fgs 字段失配史的教训。
+        // 拒绝时基线/epoch 标记/账本一概不动（协调推进原则）
         if (diag.anomalies.isNotEmpty()) {
             Log.w(TAG, "battery parser anomaly: ${diag.anomalies} —— 本帧不提交")
             recordBatteryFailure("parser", "anomaly: ${diag.anomalies.joinToString(";")}")
             return BatteryCaptureOutcome.Failed("parser", diag.anomalies.joinToString(";"))
         }
-        // 健康帧 → 更新基线（供后续帧的相对异常判据；不设固定 UID 阈值）
-        dao.putState(SyncStateEntity(KEY_PARSER_BASELINE_UIDS, parsed.uids.size.toLong()))
-        if (parsed.windowStartTs != null) dao.putState(SyncStateEntity(KEY_PARSER_HAD_WINDOW, 1L))
         val zone = ZoneId.systemDefault()
 
         // —— 阶段二：单一事务（调用方已持 SYNC_MUTEX，差分基于串行化的快照状态） ——
-        // epoch 标记（上一帧窗口起点）在事务内读取、与新帧比较并在事务内推进（P0-1/P0-4）
-        val prevWindowStartTs = dao.getState(KEY_BATTERY_WINDOW_START_TS)
+        // epoch 标记（上一帧窗口起点）在事务内读取、与新帧比较并在事务内推进（P0-1/P0-4）；
+        // 解析健康基线同事务推进（v0.18：成功提交才接受新基线）
         val out: BatteryLedger.Result = try {
             applyBatteryLedgerTx(
-                db, dao, parsed, now, zone,
+                db, dao, parsed, observedTs, zone,
                 pkgOf = ::resolveBatteryOwnerPackage,
                 prevWindowStartTs = prevWindowStartTs,
+                newBaselineUidCount = parsed.uids.size.toLong(),
+                hadWindowBaseline = parsed.windowStartTs != null,
             )
         } catch (e: Exception) {
-            // 事务已整体回滚：快照未推进、daily 未写入、epoch 标记未推进，本轮差分作废，
-            // 下一轮采集会基于旧快照重算（宁可少记一轮，不可半提交）
+            // 事务已整体回滚：快照未推进、daily 未写入、epoch 标记未推进、
+            // 解析基线未推进，本轮差分作废，下一轮采集会基于完整旧状态重算
+            // （宁可少记一轮，不可半提交）
             Log.w(TAG, "battery tx failed (rolled back)", e)
             recordBatteryFailure("tx", "${e.javaClass.simpleName}: ${e.message}")
             return BatteryCaptureOutcome.Failed("tx", "${e.javaClass.simpleName}: ${e.message}")
@@ -776,7 +810,7 @@ class UsageRepository(
         if (violations.isNotEmpty()) {
             Log.w(TAG, "ledger invariant violations=${violations.size} first=${violations.first()}")
         }
-        dao.putState(SyncStateEntity(KEY_LAST_BATTERY_SUCCESS_TS, now))
+        dao.putState(SyncStateEntity(KEY_LAST_BATTERY_SUCCESS_TS, observedTs))
         dao.putState(SyncStateEntity(KEY_LAST_BATTERY_SOURCE, if (source == BatterySource.ROOT) 1L else 2L))
         prefs.edit().putString(PREF_LAST_BATTERY_FAIL, null).apply()
         Log.d(
@@ -1125,6 +1159,7 @@ class UsageRepository(
         fun parseBatteryPower(lines: List<String>): BatteryParsed {
             var inPower = false
             var computedDrain = 0.0
+            var computedDrainPresent = false
             var actualLow = 0.0
             var actualHigh = 0.0
             var capacity: Double? = null
@@ -1181,6 +1216,7 @@ class UsageRepository(
                 if (dm != null) {
                     capacity = dm.groupValues[1].toDoubleOrNull()
                     computedDrain = dm.groupValues[2].toDoubleOrNull() ?: 0.0
+                    computedDrainPresent = true
                     actualLow = dm.groupValues[3].toDoubleOrNull() ?: 0.0
                     actualHigh = dm.groupValues[4].toDoubleOrNull() ?: actualLow
                     continue
@@ -1215,7 +1251,7 @@ class UsageRepository(
             }
             return BatteryParsed(
                 uids, globals, computedDrain, actualLow, actualHigh, windowStartTs,
-                capacity, lines.size,
+                capacity, lines.size, computedDrainPresent,
             )
         }
 

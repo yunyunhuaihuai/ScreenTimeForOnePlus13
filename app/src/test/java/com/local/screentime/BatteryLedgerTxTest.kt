@@ -184,6 +184,41 @@ class BatteryLedgerTxTest {
     }
 
     @Test
+    fun txFailure_rollsBackParserBaselineToo() = runBlocking {
+        // v0.18（A）：解析健康基线与数据同事务推进 —— 提交失败后「已接受基线」不得变化
+        val now = ts(2026, 9, 18, 13, 0)
+        dao.putState(com.local.screentime.data.SyncStateEntity(
+            com.local.screentime.data.UsageRepository.KEY_PARSER_BASELINE_UIDS, 142))
+        class Injected : Exception("probe")
+        var threw = false
+        try {
+            applyBatteryLedgerTx(
+                db, dao,
+                parsedOf(uidTotal = 110.0, computedDrain = 120.0),
+                now, zone, pkgOf = { null },
+                newBaselineUidCount = 20, hadWindowBaseline = true,
+                probeAfterCompute = { throw Injected() },
+            )
+        } catch (e: Injected) { threw = true }
+        assertTrue(threw)
+        assertEquals("注入失败后解析基线不变", 142L,
+            dao.getState(com.local.screentime.data.UsageRepository.KEY_PARSER_BASELINE_UIDS))
+    }
+
+    @Test
+    fun successPath_advancesParserBaselineInTx() = runBlocking {
+        val now = ts(2026, 9, 18, 13, 0)
+        applyBatteryLedgerTx(
+            db, dao,
+            parsedOf(uidTotal = 110.0, computedDrain = 120.0),
+            now, zone, pkgOf = { null },
+            newBaselineUidCount = 20, hadWindowBaseline = true,
+        )
+        assertEquals(20L, dao.getState(com.local.screentime.data.UsageRepository.KEY_PARSER_BASELINE_UIDS))
+        assertEquals(1L, dao.getState(com.local.screentime.data.UsageRepository.KEY_PARSER_HAD_WINDOW))
+    }
+
+    @Test
     fun multiDayWindow_batchReadPreservesExistingRows_onEveryTouchedDay() {
         runBlocking {
             val lastTs = ts(2026, 9, 17, 18, 0)

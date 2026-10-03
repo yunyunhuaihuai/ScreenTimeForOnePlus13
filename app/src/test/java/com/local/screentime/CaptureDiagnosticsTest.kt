@@ -1,7 +1,9 @@
 package com.local.screentime
 
+import com.local.screentime.data.BatteryLedger
 import com.local.screentime.data.BatteryParsed
 import com.local.screentime.data.CaptureDiagnostics
+import com.local.screentime.data.UsageRepository
 import com.local.screentime.data.UidPower
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -48,8 +50,69 @@ class CaptureDiagnosticsTest {
 
     @Test
     fun computedDrainMissing_isAnomaly() {
-        val d = CaptureDiagnostics.fromParsed(parsed(computedDrain = 0.0), baselineUidCount = 142, hadWindowBaseline = true)
-        assertTrue(d.anomalies.contains("computed_drain_missing"))
+        // v0.18 语义：只有 drain 概要行整行缺失（结构截断）才算异常——
+        // 手工构造数据须显式声明 computedDrainPresent=false
+        val d = CaptureDiagnostics.detectAnomalies(
+            parsed(computedDrain = 0.0).copy(computedDrainPresent = false),
+            baselineUidCount = 142, hadWindowBaseline = true,
+        )
+        assertTrue(d.contains("computed_drain_missing"))
+    }
+
+    @Test
+    fun legalZeroDrain_isNotAnomaly() {
+        // v0.18（A）：刚充满的合法帧 Computed drain 就是 0——只要行存在就不判异常，
+        // 不把「合法零耗电」等同「解析失败」
+        val d = CaptureDiagnostics.fromParsed(
+            parsed(computedDrain = 0.0, uidCount = 3),
+            baselineUidCount = null, hadWindowBaseline = false,
+        )
+        assertFalse(d.anomalies.contains("computed_drain_missing"))
+    }
+
+    @Test
+    fun parserDetectsDrainLinePresence() {
+        // drain 行存在（值为 0）→ present=true；整行缺失 → present=false
+        val withZero = UsageRepository.parseBatteryPower(
+            listOf(
+                "Estimated power use (mAh):",
+                "  Capacity: 5920, Computed drain: 0, actual drain: 0",
+                "  UID u0a1: 1.0 ( screen: 1.0 )",
+            )
+        )
+        assertTrue(withZero.computedDrainPresent)
+        assertEquals(0.0, withZero.computedDrain, 1e-9)
+        val without = UsageRepository.parseBatteryPower(
+            listOf(
+                "Estimated power use (mAh):",
+                "  UID u0a1: 1.0 ( screen: 1.0 )",
+            )
+        )
+        assertFalse(without.computedDrainPresent)
+    }
+
+    @Test
+    fun newEpochSmallSample_notRejectedByOldUidBaseline() {
+        // v0.18（A/P0-1 复审）：旧窗口 142 UID 的健康基线对新 epoch 无意义——
+        // 刚充满的新窗口合法帧可能只有 20 UID，必须放行（否则 epoch/基线永远无法推进）
+        val d = CaptureDiagnostics.detectAnomalies(
+            parsed(uidCount = 20), baselineUidCount = 142, hadWindowBaseline = true,
+            epoch = BatteryLedger.EpochState.RESET,
+        )
+        assertFalse(d.any { it.startsWith("uid_count_drop") })
+    }
+
+    @Test
+    fun sameEpochTruncation_stillDetected() {
+        // 同 epoch 内 UID 灾难性下降 = 结构截断，判据保持生效
+        val d = CaptureDiagnostics.detectAnomalies(
+            parsed(uidCount = 60), baselineUidCount = 142, hadWindowBaseline = true,
+            epoch = BatteryLedger.EpochState.SAME,
+        )
+        assertTrue(d.any { it.startsWith("uid_count_drop") })
+        // epoch 未识别（手工调用）时保持旧行为：仍然检测
+        val d2 = CaptureDiagnostics.detectAnomalies(parsed(uidCount = 60), baselineUidCount = 142, hadWindowBaseline = true)
+        assertTrue(d2.any { it.startsWith("uid_count_drop") })
     }
 
     @Test
@@ -84,6 +147,7 @@ class CaptureDiagnosticsTest {
         val empty = BatteryParsed(
             uids = emptyList(), globals = linkedMapOf(), computedDrain = 0.0,
             actualDrainLow = 0.0, windowStartTs = null, rawLineCount = 5000,
+            computedDrainPresent = false,
         )
         val d = CaptureDiagnostics.detectAnomalies(empty, baselineUidCount = null, hadWindowBaseline = false)
         assertTrue(d.contains("power_section_unparsed"))
