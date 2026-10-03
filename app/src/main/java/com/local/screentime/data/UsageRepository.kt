@@ -504,32 +504,86 @@ class UsageRepository(
     suspend fun batteryGlobalRows(day: Long): List<BatteryGlobalEntity> = dao.batteryGlobalRows(day)
 
     /**
-     * 把当天列表里的包映射到其 UID 耗电记录（v0.17.1 重写，P0-3）。
+     * 把当天列表里的包映射到其 UID 耗电记录（v0.17.1 重写，P0-3；v0.18 接入历史归属，P1-5/H）。
      *
-     * 旧实现 `byUid[uidKeyOf(uid)]` 绕过了写入侧的「不猜 shared UID」约束：
-     *  - 共享 UID（多包同 UID）的耗电行会被挂到查询的任意一个包上（双计/误导）；
-     *  - 分身场景（真机确认 QQ=u0a351+u999a351、微信=u0a350+u999a350 各两行）
-     *    只剩 user0 行，user999 行被静默忽略。
+     * 归属优先级：**行上冻结的 packageName（采集时归属）** → uid_packages 按日有效的
+     * 成员存档（该日恰唯一 → 归属；该日多包 → 共享不拆分；该日无存档但 uidKey 从未
+     * 存档过 → 回退当前 pm，旧行兼容）。此后卸载不再让历史耗电消失，UID 复用也不会
+     * 把旧耗电挂给新包。
      *
-     * 新实现：逐行解析归属（与写入侧 ownerPackageOf 同一判据——UID 唯一对应一个
-     * 包才归属；系统 UID/共享 UID 恒 null），再把同 package 的多个「唯一归属 UID」
-     * **求和聚合**。usage 会话层只有 packageName、无法区分 user，因此 package 级
-     * 口径必须聚合，而不是二选一静默丢弃；shared UID 仍然不拆分。
+     * 同 package 的多个「唯一归属 UID」（分身 user0/user999 各一行）求和聚合；
+     * shared UID 仍然不拆分。
      */
     suspend fun batteryForPackages(
         day: Long,
         packages: List<String>,
-    ): Map<String, BatteryDailyEntity> =
-        groupBatteryRowsByOwner(dao.batteryDailyRows(day), ::resolveRowOwnerPackage, packages.toHashSet())
+    ): Map<String, BatteryDailyEntity> {
+        val rows = dao.batteryDailyRows(day)
+        val memberships = dao.uidPackagesForKeys(rows.map { it.uidKey }.distinct())
+            .groupBy { it.uidKey }
+        // 行上冻结的采集时归属（packageName）优先——对 v9 之前写入、无成员存档的历史行，
+        // 这是唯一可靠的归属证据（卸载后 current pm 已查不到，不能因此让历史耗电消失）
+        val frozenOwner = rows.associate { it.uidKey to it.packageName }
+        return groupBatteryRowsByOwner(
+            rows,
+            { uidKey -> frozenOwner[uidKey] ?: historicalOwnerOf(uidKey, day, memberships) },
+            packages.toHashSet(),
+        )
+    }
 
-    /** 逐行归属解析：uidKey → 唯一归属包名（系统 UID / 共享 UID → null） */
-    private fun resolveRowOwnerPackage(uidKey: String): String? {
+    /**
+     * 历史归属解析（v0.18，H）：
+     *  - uid < 10000 → 系统 UID（null，交给 systemUidLabel）；
+     *  - 该日有效的成员存档：唯一包 → 该包；多包 → 共享（null，不猜拆分）；
+     *  - uidKey 有存档但该日无覆盖（安装间隙/复用空档）→ null（不确定，不猜）；
+     *  - uidKey 从未存档（本版本之前的历史行）→ 回退当前 getPackagesForUid（现状兼容，
+     *    无法追溯的归属保持现状，不盲目回填）。
+     */
+    private fun historicalOwnerOf(
+        uidKey: String,
+        day: Long,
+        memberships: Map<String, List<UidPackageEntity>>,
+        zone: ZoneId = ZoneId.systemDefault(),
+    ): String? {
         val uid = uidOf(uidKey)
         if (uid < 10000) return null
-        return try {
-            ownerPackageOf(uid, context.packageManager.getPackagesForUid(uid))
+        val dayStart = LocalDate.ofEpochDay(day).atStartOfDay(zone).toInstant().toEpochMilli()
+        val dayEnd = dayStart + 24 * 60 * 60 * 1000L
+        val rows = memberships[uidKey]
+        return if (rows.isNullOrEmpty()) {
+            // 从未存档：旧行兼容路径（与本版本之前的解析一致）
+            resolveBatteryOwnerPackage(uid)
+        } else {
+            val active = rows.filter { it.firstSeenTs <= dayEnd && it.lastSeenTs >= dayStart }
+                .map { it.packageName }.distinct()
+            if (active.size == 1) active[0] else null
+        }
+    }
+
+    /** 共享 UID 的展示名（v0.18 可按日使用成员存档；无存档回退当前解析）。唯一包名/系统 UID 返回 null。 */
+    suspend fun sharedUidLabel(uidKey: String, day: Long? = null): String? {
+        val uid = uidOf(uidKey)
+        if (uid < 10000) return null
+        if (day != null) {
+            val rows = dao.uidPackagesFor(uidKey)
+            if (rows.isNotEmpty()) {
+                val zone = ZoneId.systemDefault()
+                val dayStart = LocalDate.ofEpochDay(day).atStartOfDay(zone).toInstant().toEpochMilli()
+                val dayEnd = dayStart + 24 * 60 * 60 * 1000L
+                val active = rows.filter { it.firstSeenTs <= dayEnd && it.lastSeenTs >= dayStart }
+                    .map { it.packageName }.distinct()
+                if (active.isEmpty()) return "共享 UID（$uidKey）"
+                return "共享 UID：" + active.joinToString(" / ")
+            }
+        }
+        val pkgs = try {
+            context.packageManager.getPackagesForUid(uid)?.filter { !it.isNullOrBlank() }
         } catch (e: Exception) {
             null
+        } ?: return "共享 UID（$uidKey）"
+        return when {
+            pkgs.isEmpty() -> "共享 UID（$uidKey）"
+            else -> "共享 UID：" + pkgs.joinToString(" / ")
         }
     }
 
@@ -756,15 +810,13 @@ class UsageRepository(
         )
         root.put("battery", battery)
         if (perUid) {
-            // 逐 UID 调试段：归属结果（唯一包 / 共享 / 系统）+ 组件明细，top 30 by totalMah
+            // 逐 UID 调试段：归属结果（采集时归属 / 历史存档 / 共享 / 系统）+ 组件明细
             val uidArr = JSONArray()
-            for (r in dao.batteryDailyRows(day).sortedByDescending { it.totalMah }.take(30)) {
+            val rowsForDay = dao.batteryDailyRows(day).sortedByDescending { it.totalMah }.take(30)
+            val memberships = dao.uidPackagesForKeys(rowsForDay.map { it.uidKey }.distinct()).groupBy { it.uidKey }
+            for (r in rowsForDay) {
                 val uid = uidOf(r.uidKey)
-                val owner = if (uid >= 10000) try {
-                    ownerPackageOf(uid, context.packageManager.getPackagesForUid(uid))
-                } catch (e: Exception) {
-                    null
-                } else null
+                val owner = r.packageName ?: historicalOwnerOf(r.uidKey, day, memberships)
                 val o = JSONObject()
                 o.put("rawUidKey", r.uidKey)
                 o.put(
@@ -772,7 +824,7 @@ class UsageRepository(
                     when {
                         uid < 10000 -> "system"
                         owner != null -> owner
-                        else -> sharedUidLabel(r.uidKey) ?: "shared"
+                        else -> sharedUidLabel(r.uidKey, day) ?: "shared"
                     },
                 )
                 o.put("totalMah", r.totalMah)
@@ -1019,6 +1071,9 @@ class UsageRepository(
         dao.putState(SyncStateEntity(KEY_LAST_BATTERY_SUCCESS_TS, commandEndTs))
         dao.putState(SyncStateEntity(KEY_LAST_BATTERY_SOURCE, if (source == BatterySource.ROOT) 1L else 2L))
         prefs.edit().putString(PREF_LAST_BATTERY_FAIL, null).apply()
+        // 采集时持久化 UID→包名成员存档（v0.18，P1-5/H）：历史归属从此不随当前
+        // 安装状态漂移（卸载保留历史、UID 复用按存档区间解析、共享不猜拆分）
+        runCatching { persistUidPackages(parsed, commandEndTs) }
         logCapture(attemptTs, commandStartTs, commandEndTs, source, BatteryCaptureOutcome.Success(commandEndTs),
             parsed = parsed,
             detail = "uids=${parsed.uids.size} epochChanged=${out.epochChanged}")
@@ -1031,9 +1086,40 @@ class UsageRepository(
         return BatteryCaptureOutcome.Success(commandEndTs)
     }
 
-    /** 数据修订版本递增（v0.18，G）；返回新版本号。
-     *  修订号全局递增：ROOT 纠错/回补/统计替换实际改变数据时 +1，
-     *  低于当前修订号的正式报告需要重建。 */
+    /**
+     * 采集时持久化 UID→包名成员存档（v0.18，P1-5/H）。
+     * 对本帧出现的每个 UID 记录当前包成员及有效期 [firstSeenTs, lastSeenTs]：
+     * 同 (uidKey, packageName) 再次出现时 lastSeenTs 前移、firstSeenTs 取最早。
+     * pm 返回空（UID 已卸载/不可见）时不写——存档描述的是「可命名成员」的有效期。
+     */
+    private suspend fun persistUidPackages(parsed: BatteryParsed, observedAt: Long) {
+        val keys = parsed.uids.map { it.uidKey }.distinct()
+        if (keys.isEmpty()) return
+        val existing = dao.uidPackagesForKeys(keys).associateBy { it.uidKey to it.packageName }
+        val rows = ArrayList<UidPackageEntity>()
+        for (uidKey in keys) {
+            val uid = uidOf(uidKey)
+            if (uid < 10000) continue  // 系统 UID 由 systemUidLabel 命名，无需存档
+            val pkgs = try {
+                context.packageManager.getPackagesForUid(uid)?.filter { !it.isNullOrBlank() }
+            } catch (e: Exception) {
+                null
+            } ?: continue
+            for (pkg in pkgs) {
+                val prev = existing[uidKey to pkg]
+                rows.add(
+                    UidPackageEntity(
+                        uidKey = uidKey, packageName = pkg,
+                        firstSeenTs = prev?.firstSeenTs?.coerceAtMost(observedAt) ?: observedAt,
+                        lastSeenTs = observedAt,
+                    )
+                )
+            }
+        }
+        if (rows.isNotEmpty()) dao.upsertUidPackages(rows)
+    }
+
+    /** 数据修订版本递增（v0.18，G）；返回新版本号。 */
     private suspend fun bumpDataRevision(): Long {
         val next = (dao.getState(KEY_DATA_REVISION) ?: 0L) + 1
         dao.putState(SyncStateEntity(KEY_DATA_REVISION, next))
@@ -1058,21 +1144,6 @@ class UsageRepository(
         } catch (e: Exception) {
             null
         })
-
-    /** 共享 UID 的展示名（动态解析包列表，不落库、不猜归属）。唯一包名/系统 UID 返回 null。 */
-    suspend fun sharedUidLabel(uidKey: String): String? {
-        val uid = uidOf(uidKey)
-        if (uid < 10000) return null
-        val pkgs = try {
-            context.packageManager.getPackagesForUid(uid)?.filter { !it.isNullOrBlank() }
-        } catch (e: Exception) {
-            null
-        } ?: return "共享 UID（$uidKey）"
-        return when {
-            pkgs.isEmpty() -> "共享 UID（$uidKey）"
-            else -> "共享 UID：" + pkgs.joinToString(" / ")
-        }
-    }
 
     /**
      * 拿起次数（KEYGUARD_HIDDEN 计数）与“解锁后首开应用”统计。

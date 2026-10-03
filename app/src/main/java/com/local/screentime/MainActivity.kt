@@ -394,11 +394,13 @@ fun UsageApp(
             allPackages.associateWith { repo.resolveDisplay(it) }
         }
     }
-    // 共享 UID（packageName=null 的耗电行）的展示名：动态解析包列表，不猜归属（P1-2）
-    val sharedUidLabels by produceState<Map<String, String>>(emptyMap(), batteryAll) {
+    // 共享 UID（packageName=null 的耗电行）的展示名：优先用当日成员存档，动态回退（P1-2/H）
+    val sharedUidLabels by produceState<Map<String, String>>(emptyMap(), batteryAll, selectedDay) {
         val keys = batteryAll.filter { it.packageName == null }.map { it.uidKey }.distinct()
         value = withContext(Dispatchers.IO) {
-            keys.mapNotNull { k -> repo.sharedUidLabel(k)?.let { k to it } }.toMap()
+            keys.mapNotNull { k ->
+                repo.sharedUidLabel(k, selectedDay.toEpochDay())?.let { k to it }
+            }.toMap()
         }
     }
 
