@@ -842,8 +842,10 @@ class UsageRepository(
         val events = parseDumpsysEvents(dump, zone)
         if (events.isNotEmpty()) {
             val start = events.minOf { it.ts }
-            val end = events.maxOf { it.ts }
-            val sessions = buildSessions(events, start, end, SESSION_SOURCE_ROOT)
+            // 可信采集上界（P1-2/E）：最后事件时间 ≠ 前台结束时间。仍前台的开放会话
+            // 以采集实际时刻为暂定尾段，后续每次 root 全量重建自然纠正
+            val observedAt = nowMs()
+            val sessions = buildSessions(events, start, observedAt, SESSION_SOURCE_ROOT)
             db.withTransaction {
                 // root 全量重建：ROOT 可修正对应窗口内的一切来源（含此前的 API fallback）
                 dao.deleteSessionsStartingAfter(start)
@@ -1204,6 +1206,10 @@ class UsageRepository(
         /** API 兜底路径允许回看的最长窗口：queryEvents 保留期 ~7 天，再早的删了也重建不回 */
         private const val API_MAX_LOOKBACK_MS = 6 * 24 * 60 * 60 * 1000L
         private const val MIN_SESSION_MS = 2_000L
+        /** 同包相邻会话合并间隔（E）：= dump 的时间精度（秒级）。Activity 切换的
+         *  同戳三连把一次使用拆成多个 1 秒段，先按同包微间隔合并再套最小阈值，
+         *  避免「Activity 切换短段被无差别丢弃」；跨包/大间隔不受影响 */
+        private const val SHORT_MERGE_GAP_MS = 2_000L
         // GLOBAL_SNAPSHOT_KEY / KNOWN_COMPS 已随差分计算移入 BatteryLedger（v0.17.0）
 
         /** uid ↔ uidKey 支持多用户：ColorOS 分身/隐私空间是 u999a*（曾因只认 u0a 前缀，
@@ -1496,19 +1502,34 @@ class UsageRepository(
             "KEYGUARD_SHOWN" to UsageEvents.Event.KEYGUARD_SHOWN,
         )
 
-        /** 会话重建：RESUMED 开会话；PAUSED/息屏或下一个 RESUMED 关会话；
-         *  跨本地午夜切分；短于 2 秒的碎片丢弃（推送拉起的秒级“使用”）。
-         *  注意不能用 ACTIVITY_STOPPED 关会话：ColorOS 应用内切 Activity 恒为
-         *  PAUSED(旧)→RESUMED(新)→STOPPED(旧) 同戳三连，STOPPED(旧) 与新会话同包，
-         *  会把刚开的会话 0 秒关掉，导致多 Activity 应用整段丢时长（实测知乎丢 ~90%）。 */
+        /**
+         * 会话重建：RESUMED 开会话；PAUSED/息屏或下一个 RESUMED 关会话；
+         * 跨本地午夜切分；短于 2 秒的碎片丢弃（推送拉起的秒级“使用”）。
+         * 注意不能用 ACTIVITY_STOPPED 关会话：ColorOS 应用内切 Activity 恒为
+         * PAUSED(旧)→RESUMED(新)→STOPPED(旧) 同戳三连，STOPPED(旧) 与新会话同包，
+         * 会把刚开的会话 0 秒关掉，导致多 Activity 应用整段丢时长（实测知乎丢 ~90%）。
+         *
+         * v0.18（E，P1-2）两处语义修正：
+         *  1) **可信采集上界**：参数改为 trustedEnd（= 本次采集实际发生时刻）。
+         *     旧实现把「最后一个事件的时间」当窗口结束——最后事件是 RESUMED、
+         *     其后无关闭事件时，仍在前台的会话尾段被截断（10:00 RESUMED、10:20
+         *     采集 → 少记 20 分钟）。现在开放中的会话按暂定尾段延伸到 trustedEnd；
+         *     root 每次同步全量重建窗口，后续事件自然纠正该暂定值。缺关闭事件与
+         *     真实仍前台无法在单帧内区分，暂定尾段不对外宣称「精准」。
+         *  2) **同包短段合并**：先合并「同包且间隔 ≤ SHORT_MERGE_GAP_MS」的相邻会话，
+         *     再套用 2 秒最小阈值。Activity 切换（同戳三连）会把一次真实使用拆成
+         *     多个 1 秒段，旧算法逐段丢弃（本机审计：376 段共 376 秒被丢，其中
+     *     一部分是真实使用）；独立秒级噪声（前后都有大空档）仍被过滤。
+         */
         fun buildSessions(
             events: List<RawEvent>,
             windowStart: Long,
-            windowEnd: Long,
+            trustedEnd: Long,
             source: Int = SESSION_SOURCE_ROOT,
         ): List<UsageSession> {
             val zone = ZoneId.systemDefault()
-            val out = ArrayList<UsageSession>()
+            // —— 收集原始会话（事件序） ——
+            val raw = ArrayList<Triple<String, Long, Long>>()  // pkg, start, end
             var openPkg: String? = null
             var openTs = 0L
 
@@ -1517,20 +1538,7 @@ class UsageRepository(
                 val start = openTs
                 openPkg = null
                 if (at <= start) return
-                if (at - start < MIN_SESSION_MS) return
-                var cur = start
-                while (cur < at) {
-                    val day = Instant.ofEpochMilli(cur).atZone(zone).toLocalDate()
-                    val nextDayStart = day.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
-                    val end = minOf(at, nextDayStart)
-                    out.add(
-                        UsageSession(
-                            packageName = pkg, startTs = cur, endTs = end,
-                            day = day.toEpochDay(), source = source,
-                        )
-                    )
-                    cur = end
-                }
+                raw.add(Triple(pkg, start, at))
             }
 
             for (ev in events) {
@@ -1549,7 +1557,39 @@ class UsageRepository(
                     }
                 }
             }
-            close(windowEnd)
+            // 尾段：缺关闭事件时以可信采集上界为暂定结束（后续全量重建可纠正）
+            close(trustedEnd)
+
+            // —— 同包短段合并（间隔 ≤ 2s = dump 秒级精度） ——
+            raw.sortBy { it.third }
+            val merged = ArrayList<Triple<String, Long, Long>>()
+            for (r in raw) {
+                val last = merged.lastOrNull()
+                if (last != null && last.first == r.first && r.second - last.third <= SHORT_MERGE_GAP_MS) {
+                    merged[merged.size - 1] = last.copy(third = maxOf(last.third, r.third))
+                } else {
+                    merged.add(r)
+                }
+            }
+
+            // —— 最小阈值 + 跨午夜切分 ——
+            val out = ArrayList<UsageSession>()
+            for ((pkg, start, end) in merged) {
+                if (end - start < MIN_SESSION_MS) continue
+                var cur = start
+                while (cur < end) {
+                    val day = Instant.ofEpochMilli(cur).atZone(zone).toLocalDate()
+                    val nextDayStart = day.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
+                    val segEnd = minOf(end, nextDayStart)
+                    out.add(
+                        UsageSession(
+                            packageName = pkg, startTs = cur, endTs = segEnd,
+                            day = day.toEpochDay(), source = source,
+                        )
+                    )
+                    cur = segEnd
+                }
+            }
             return out
         }
 
