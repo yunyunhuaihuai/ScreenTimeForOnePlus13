@@ -244,7 +244,8 @@ class RoomMigrationTest {
         dao.insertCaptureLog(
             com.local.screentime.data.CaptureLogEntity(
                 ts = 1, attemptTs = 1, commandStartTs = 1, commandEndTs = 1, zoneId = "Asia/Shanghai",
-                source = 1, outcome = "SUCCESS", epochWindowStartTs = null, uidCount = 0, globalCount = 0,
+                source = 1, parserVersion = 4, ledgerVersion = 2, outcome = "SUCCESS",
+                epochWindowStartTs = null, uidCount = 0, globalCount = 0,
                 computedDrainMah = 0.0, actualDrainLowMah = null, actualDrainHighMah = null,
                 sumUidTotalMah = 0.0, detail = "",
             )

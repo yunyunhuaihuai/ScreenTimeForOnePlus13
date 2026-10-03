@@ -38,8 +38,9 @@ enum class BatterySource { ROOT, DUMP }
 
 /** 单次 batterystats 采集/差分的结果（P1-1/P1-10：区分语义，供 Worker 决定是否 retry） */
 sealed class BatteryCaptureOutcome {
-    /** shell 成功、解析非空、差分事务提交成功 */
-    data object Success : BatteryCaptureOutcome()
+    /** shell 成功、解析非空、差分事务提交成功。observedTs = dump 实际观测时刻
+     *  （commandEnd；此前拿锁前的 now 被当成观测时刻，跨午夜会记错日） */
+    data class Success(val observedTs: Long) : BatteryCaptureOutcome()
 
     /** shell 成功但输出为合法空（VALID_EMPTY_OUTPUT：batterystats 尚未就绪等系统状态）——
      *  等下一周期自然重试即可 */
@@ -106,21 +107,24 @@ class UsageRepository(
 ) {
 
     private val db = dbOverride ?: AppDatabase.get(context)
+
+    /** 可注入时钟（测试用）：采集路径的 attempt/command/observed 时刻统一从这里取，
+     *  生产路径等价于 System.currentTimeMillis()。观测时刻绝不复用拿锁前的旧值。 */
+    internal var nowMs: () -> Long = System::currentTimeMillis
     private val dao = db.usageDao()
     private val reader = UsageStatsReader(context)
     private val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
     private val displayCache = java.util.concurrent.ConcurrentHashMap<String, AppDisplay>()
     private val uidCache = java.util.concurrent.ConcurrentHashMap<String, Int>()
 
-    /** 采样健康状态：进程内驻留一份，首次采集时从 sync_state 加载，每次变更后写回 */
+    /** 采样健康状态：每次进入采集路径（持锁）都从 sync_state **重新读取**——
+     *  多实例（MainActivity/SyncWorker/BatteryCaptureWorker/PowerEventReceiver 各自
+     *  new 仓库）交替写入时，实例缓存会把其他实例刚写入的更新指标覆盖回旧值（P2-2）。 */
     @Volatile
     private var captureHealth: CaptureHealth.State = CaptureHealth.State()
-    @Volatile
-    private var captureHealthLoaded = false
 
-    /** 历史健康状态从 sync_state 加载；调用前提：处于采集路径（suspend 上下文、持 SYNC_MUTEX） */
-    private suspend fun ensureCaptureHealthLoaded() {
-        if (captureHealthLoaded) return
+    /** 从 sync_state 重新加载健康状态；调用前提：处于采集路径（持 SYNC_MUTEX） */
+    private suspend fun reloadCaptureHealth() {
         captureHealth = CaptureHealth.State(
             lastAttemptTs = dao.getState(KEY_CAP_ATTEMPT),
             lastSuccessTs = dao.getState(KEY_CAP_SUCCESS),
@@ -128,7 +132,6 @@ class UsageRepository(
             lastFailureTs = dao.getState(KEY_CAP_FAIL_TS),
             maxObservedCaptureGapMs = dao.getState(KEY_CAP_MAX_GAP),
         )
-        captureHealthLoaded = true
     }
 
     private suspend fun saveCaptureHealth() {
@@ -265,30 +268,40 @@ class UsageRepository(
      * 目的是在系统充电重置前把累计值存下来，让「日汇总」不缺「上次同步～插电」段（v0.16.8）。
      * root 或 DUMP 权限（adb 可授）任一可用即可。
      *
-     * 每次调用都会更新采样健康状态（P1-1：lastCaptureAttemptTs / lastCaptureSuccessTs /
-     * lastCaptureFailure / maxObservedCaptureGap），diagnosticJson 输出这些持久化数据。
+     * 时间语义（v0.18，P2-2）：attempt/commandStart/commandEnd/observed 四个时刻分开
+     * 记录，全部在**拿到进程锁之后**取值——拿锁前的 now 既不是观测时刻，跨午夜还会把
+     * 增量记错日。健康状态持锁重新从 sync_state 读取（多实例不互相覆盖）。
+     * 每次尝试都写入有界采集日志 capture_log（P1-1：diagnosticJson 输出）。
      */
     suspend fun captureBatteryNow(): BatteryCaptureOutcome {
-        val now = System.currentTimeMillis()
         return try {
             SYNC_MUTEX.withLock {
-                ensureCaptureHealthLoaded()
-                captureHealth = CaptureHealth.onAttempt(captureHealth, now)
+                val attemptTs = nowMs()
+                reloadCaptureHealth()
+                captureHealth = CaptureHealth.onAttempt(captureHealth, attemptTs)
                 saveCaptureHealth()
                 // root 与 DUMP 权限都不可用时重试无意义（需用户侧动作），直接归类
                 val rootOk = runner.isRootAvailable()
                 if (!rootOk && !hasDumpAccess()) {
-                    captureHealth = CaptureHealth.onFailure(captureHealth, now, CaptureHealth.FAIL_NO_SOURCE)
+                    val ts = nowMs()
+                    captureHealth = CaptureHealth.onFailure(captureHealth, ts, CaptureHealth.FAIL_NO_SOURCE)
                     saveCaptureHealth()
                     // 无源也是一次 battery failure（P1-1 健康线）
-                    dao.putState(SyncStateEntity(KEY_LAST_BATTERY_FAIL_TS, now))
+                    dao.putState(SyncStateEntity(KEY_LAST_BATTERY_FAIL_TS, ts))
+                    logCapture(attemptTs, ts, ts, BatterySource.ROOT, BatteryCaptureOutcome.SourceUnavailable,
+                        parsed = null, detail = "root 与 DUMP 权限均不可用")
                     BatteryCaptureOutcome.SourceUnavailable
                 } else {
-                    val outcome = syncBattery(now, if (rootOk) BatterySource.ROOT else BatterySource.DUMP)
-                    if (outcome is BatteryCaptureOutcome.Success) {
-                        captureHealth = CaptureHealth.onSuccess(captureHealth, now)
-                    } else {
-                        captureHealth = CaptureHealth.onFailure(captureHealth, now, CaptureHealth.failCodeOf(outcome))
+                    val commandStartTs = nowMs()
+                    val outcome = syncBattery(
+                        attemptTs, commandStartTs,
+                        if (rootOk) BatterySource.ROOT else BatterySource.DUMP,
+                    )
+                    captureHealth = when (outcome) {
+                        is BatteryCaptureOutcome.Success ->
+                            CaptureHealth.onSuccess(captureHealth, outcome.observedTs)
+                        else ->
+                            CaptureHealth.onFailure(captureHealth, nowMs(), CaptureHealth.failCodeOf(outcome))
                     }
                     saveCaptureHealth()
                     outcome
@@ -296,7 +309,55 @@ class UsageRepository(
             }
         } catch (e: Exception) {
             Log.w(TAG, "captureBatteryNow failed", e)
+            runCatching {
+                val ts = nowMs()
+                logCapture(ts, ts, ts, BatterySource.ROOT,
+                    BatteryCaptureOutcome.Failed("capture", "${e.javaClass.simpleName}: ${e.message}"),
+                    parsed = null, detail = "capture 异常：${e.message}")
+            }
             BatteryCaptureOutcome.Failed("capture", "${e.javaClass.simpleName}: ${e.message}")
+        }
+    }
+
+    /** 有界采集日志（capture_log，上限 64 条）：成功/各类失败都记录，供诊断回放 */
+    private suspend fun logCapture(
+        attemptTs: Long,
+        commandStartTs: Long,
+        commandEndTs: Long,
+        source: BatterySource,
+        outcome: BatteryCaptureOutcome,
+        parsed: BatteryParsed?,
+        detail: String,
+    ) {
+        runCatching {
+            dao.insertCaptureLog(
+                CaptureLogEntity(
+                    ts = commandEndTs,
+                    attemptTs = attemptTs,
+                    commandStartTs = commandStartTs,
+                    commandEndTs = commandEndTs,
+                    zoneId = ZoneId.systemDefault().id,
+                    source = if (source == BatterySource.ROOT) 1 else 2,
+                    parserVersion = CaptureDiagnostics.PARSER_VERSION,
+                    ledgerVersion = BatteryLedger.LEDGER_VERSION,
+                    outcome = when (outcome) {
+                        is BatteryCaptureOutcome.Success -> "SUCCESS"
+                        is BatteryCaptureOutcome.NoData -> "NO_DATA"
+                        is BatteryCaptureOutcome.ParseFailed -> "PARSE_FAILED"
+                        is BatteryCaptureOutcome.SourceUnavailable -> "SOURCE_UNAVAILABLE"
+                        is BatteryCaptureOutcome.Failed -> "FAILED:${outcome.stage}"
+                    },
+                    epochWindowStartTs = parsed?.windowStartTs,
+                    uidCount = parsed?.uids?.size ?: 0,
+                    globalCount = parsed?.globals?.size ?: 0,
+                    computedDrainMah = parsed?.computedDrain ?: 0.0,
+                    actualDrainLowMah = parsed?.actualDrainLow?.takeIf { it > 0 },
+                    actualDrainHighMah = parsed?.actualDrainHigh,
+                    sumUidTotalMah = parsed?.uids?.sumOf { it.totalMah } ?: 0.0,
+                    detail = detail,
+                )
+            )
+            dao.pruneCaptureLog(CAPTURE_LOG_LIMIT)
         }
     }
 
@@ -305,8 +366,7 @@ class UsageRepository(
             android.content.pm.PackageManager.PERMISSION_GRANTED
 
     private suspend fun syncNowLocked(): SyncResult {
-        val now = System.currentTimeMillis()
-
+        val now = nowMs()
         // 一次性修正：存量耗电行里系统 UID 被写上了共享包名，清空交给 systemUidLabel 命名
         if (dao.getState(KEY_SYSUID_FIX) == null) {
             dao.clearSystemUidPackageNames()
@@ -321,21 +381,38 @@ class UsageRepository(
         var rootUsed = false
         var rootSessionCount = 0
         var batteryOk = true
+        // battery 分支与 captureBatteryNow 共用同一健康状态机（P2-2 统一：syncNow 的
+        // 耗电采集同样更新 cap_* 健康线；attempt/观测时刻都在锁内取值）
+        reloadCaptureHealth()
+        captureHealth = CaptureHealth.onAttempt(captureHealth, now)
+        saveCaptureHealth()
+        var batteryOutcome: BatteryCaptureOutcome? = null
         try {
             val rootOk = runner.isRootAvailable()
             if (rootOk) {
                 rootSessionCount = syncViaRoot()
                 rootUsed = rootSessionCount > 0
-                batteryOk = syncBattery(now, BatterySource.ROOT) is BatteryCaptureOutcome.Success
+                batteryOutcome = syncBattery(now, nowMs(), BatterySource.ROOT)
+                batteryOk = batteryOutcome is BatteryCaptureOutcome.Success
             } else if (hasDumpAccess()) {
                 // 无 root 但持有 DUMP（debug 构建 adb 可授）：应用侧 dumpsys 采集耗电，
                 // 同样需要在系统充电重置前抢拍（v0.16.8）
-                batteryOk = syncBattery(now, BatterySource.DUMP) is BatteryCaptureOutcome.Success
+                batteryOutcome = syncBattery(now, nowMs(), BatterySource.DUMP)
+                batteryOk = batteryOutcome is BatteryCaptureOutcome.Success
             }
         } catch (e: Exception) {
             Log.w(TAG, "root sync failed", e)
             prefs.edit().putString(PREF_LAST_SYNC_ERROR, "root sync: ${e.javaClass.simpleName}: ${e.message}").apply()
         }
+        // battery 实际尝试过才更新结果健康线（usage 阶段异常时 battery 未发生，不得记为无源）
+        when (val bo = batteryOutcome) {
+            null -> Unit
+            is BatteryCaptureOutcome.Success ->
+                captureHealth = CaptureHealth.onSuccess(captureHealth, bo.observedTs)
+            else ->
+                captureHealth = CaptureHealth.onFailure(captureHealth, nowMs(), CaptureHealth.failCodeOf(bo))
+        }
+        saveCaptureHealth()
 
         // 2) API 事件流兜底：仅当 root 没拿到事件时才用它重建（ColorOS 会裁剪 queryEvents，
         //    丢 PAUSED 事件会使会话跨息屏虚高；root 正常时绝不能让裁剪数据入库/覆盖）
@@ -373,10 +450,20 @@ class UsageRepository(
         refreshAppRegistry()
         runCatching { generateDueReports(force = false) }
         // 持久化「实际同步结果」（P1-5 / P1-1）：usage 与 battery 两条独立健康线——
-        // UsageStats 成功不等于 batterystats 成功，diagnosticJson 分别呈现
-        dao.putState(SyncStateEntity(KEY_LAST_USAGE_SOURCE, if (rootUsed) 1L else 2L))
-        dao.putState(SyncStateEntity(KEY_LAST_USAGE_SUCCESS_TS, now))
-        prefs.edit().putString(PREF_LAST_SYNC_ERROR, null).apply()
+        // UsageStats 成功不等于 batterystats 成功，diagnosticJson 分别呈现。
+        // v0.18（P2-2）：只有真正观测到数据（root 事件或 API 事件非空）才写成功并清
+        // 错误——此前 source 错误/空 API/捕获异常之后仍无条件写成功，健康线失真
+        val usageObserved = rootSessionCount > 0 || (!rootUsed && events.isNotEmpty())
+        if (usageObserved) {
+            dao.putState(SyncStateEntity(KEY_LAST_USAGE_SOURCE, if (rootUsed) 1L else 2L))
+            dao.putState(SyncStateEntity(KEY_LAST_USAGE_SUCCESS_TS, now))
+            prefs.edit().putString(PREF_LAST_SYNC_ERROR, null).apply()
+        } else {
+            val reason = "无观测（rootUsed=$rootUsed rootSessions=$rootSessionCount apiEvents=${events.size}）"
+            prefs.edit().putString(PREF_LAST_SYNC_ERROR, "sync: $reason").apply()
+            dao.putState(SyncStateEntity(KEY_LAST_USAGE_FAIL_TS, now))
+            Log.w(TAG, "sync: $reason")
+        }
         Log.d(TAG, "sync: root=$rootUsed apiEvents=${events.size} sessions=$sessionCount batteryOk=$batteryOk")
         return SyncResult.Ok(windowStart, now, events.size, sessionCount, rootUsed, batteryOk)
     }
@@ -435,6 +522,41 @@ class UsageRepository(
     suspend fun latestReports(): List<ReportEntity> = dao.latestReports()
 
     fun hasPermission(): Boolean = reader.hasPermission()
+
+    /**
+     * 首页紧凑状态行的数据（v0.18，C）：「数据更新至 / 采集健康」可核验状态。
+     * usage 与 battery 两条健康线取最新者作为「更新至」；无观测/长期无成功时
+     * 明确呈现而不是把未知说成健康。长时间无成功（> 2 个名义同步周期）提示
+     * 可能中断（Android 15 强停后应用自身无法恢复采集，需要用户打开一次）。
+     */
+    suspend fun dataHealthSummary(): DataHealthSummary = DataHealthSummary(
+        lastUsageSuccessTs = dao.getState(KEY_LAST_USAGE_SUCCESS_TS),
+        lastUsageFailTs = dao.getState(KEY_LAST_USAGE_FAIL_TS),
+        lastBatterySuccessTs = dao.getState(KEY_LAST_BATTERY_SUCCESS_TS),
+        lastBatteryFailTs = dao.getState(KEY_LAST_BATTERY_FAIL_TS),
+        maxCaptureGapMs = dao.getState(KEY_CAP_MAX_GAP),
+        lastUsageSource = when (dao.getState(KEY_LAST_USAGE_SOURCE)) {
+            1L -> "ROOT"; 2L -> "API"; else -> null
+        },
+        lastBatterySource = when (dao.getState(KEY_LAST_BATTERY_SOURCE)) {
+            1L -> "ROOT"; 2L -> "DUMP"; else -> null
+        },
+        lostTailFromTs = dao.getState(KEY_BATTERY_LOST_TAIL_FROM),
+        lostTailToTs = dao.getState(KEY_BATTERY_LOST_TAIL_TO),
+    )
+
+    data class DataHealthSummary(
+        val lastUsageSuccessTs: Long?,
+        val lastUsageFailTs: Long?,
+        val lastBatterySuccessTs: Long?,
+        val lastBatteryFailTs: Long?,
+        val maxCaptureGapMs: Long?,
+        val lastUsageSource: String?,
+        val lastBatterySource: String?,
+        val lostTailFromTs: Long?,
+        val lostTailToTs: Long?,
+    )
+
 
     /** 冻结/卸载后的包依然能拿到 label（PackageManager 对 disabled 包照常返回）。
      *  API 35 起 ApplicationInfo.enabled 是 boolean（不再区分禁用方式），
@@ -571,6 +693,49 @@ class UsageRepository(
                 ?: JSONObject.NULL,
         )
         battery.put("ledgerInconsistent", prefs.getString(PREF_LAST_LEDGER_INCONSISTENT, null) ?: JSONObject.NULL)
+        // v0.18（C）：覆盖缺口证据——充电重置导致的「不可恢复尾段」（上次成功采集到
+        // 新窗口起点之间的估算耗电已被系统重置丢弃）
+        val lostFrom = dao.getState(KEY_BATTERY_LOST_TAIL_FROM)
+        val lostTo = dao.getState(KEY_BATTERY_LOST_TAIL_TO)
+        if (lostFrom != null && lostTo != null) {
+            battery.put("lostTail", JSONObject().apply {
+                put("fromTs", tsString(lostFrom))
+                put("toTs", tsString(lostTo))
+                put("note", "该段估算耗电已被充电重置丢弃，不可回补")
+            })
+        }
+        // v0.18（C）：有界采集日志（最近 8 条）——attempt/command/observed 时刻、
+        // 通道、结果、epoch 证据。采集健康（本段）与账本现存异常（下方 audit）分开呈现
+        val logArr = JSONArray()
+        for (e in dao.recentCaptureLogs(8)) {
+            logArr.put(JSONObject().apply {
+                put("observedTs", tsString(e.ts))
+                put("attemptTs", tsString(e.attemptTs))
+                put("commandStartTs", tsString(e.commandStartTs))
+                put("commandEndTs", tsString(e.commandEndTs))
+                put("zoneId", e.zoneId)
+                put("source", if (e.source == 1) "ROOT" else "DUMP")
+                put("outcome", e.outcome)
+                put("epochWindowStartTs", e.epochWindowStartTs?.let { tsString(it) } ?: JSONObject.NULL)
+                put("uidCount", e.uidCount)
+                put("globalCount", e.globalCount)
+                put("computedDrainMah", e.computedDrainMah)
+                put("parserVersion", e.parserVersion)
+                put("ledgerVersion", e.ledgerVersion)
+                put("detail", e.detail)
+            })
+        }
+        battery.put("captureLog", logArr)
+        // v0.18（I/C）：账本现存异常全库审计——与采集健康分开；「历史告警是否已解除」
+        // 以本扫描为准（只报当前仍违反的行，历史已修复的行不再出现）
+        val audit = BatteryLedger.ledgerInconsistencies(dao.allBatteryDaily())
+        battery.put(
+            "ledgerAudit",
+            JSONObject().apply {
+                put("violatingRows", audit.size)
+                put("samples", JSONArray(audit.take(5)))
+            },
+        )
         root.put("battery", battery)
         if (perUid) {
             // 逐 UID 调试段：归属结果（唯一包 / 共享 / 系统）+ 组件明细，top 30 by totalMah
@@ -708,43 +873,40 @@ class UsageRepository(
      *
      * 成功后持久化「实际使用的通道」（P1-5：last_battery_source = ROOT/DUMP），
      * 失败原因写入诊断 prefs——diagnosticJson 输出真实历史状态而非现场探测。
-     */
-    private suspend fun syncBattery(now: Long, source: BatterySource): BatteryCaptureOutcome =
-        syncBattery(now, now, now, source)
-
-    /**
-     * 耗电采集核心（internal 供入口级回归测试）。
      *
-     * 时间语义（v0.18，P2-2）：attemptTs/commandStartTs/commandEndTs 分开记录；
-     * 差分日归属与成功时间戳一律用 observedTs（commandEnd ≈ dump 实际观测时刻），
-     * 不再复用拿锁前的 now（跨午夜会把当天增量记到昨天）。
-     *
-     * 门控顺序（v0.18，P0-1 复审）：先读 epoch 标记、识别本帧窗口状态，再应用适用
-     * 的完整性判据——新 epoch（RESET）不继承旧窗口的 UID 数量下限。
-     *
-     * 协调推进（v0.18）：解析健康基线（UID 数/有无窗口）挪进差分事务内，与 epoch
-     * 标记、快照、日账本同事务提交；门控拒绝或事务失败都不推进已接受基线。
+     * v0.18 补充：attemptTs/commandStartTs 分开传入，观测时刻 = commandEnd（shell
+     * 返回时刻），差分日归属与成功时间戳一律用它；每个出口写入有界采集日志
+     * （capture_log）；诊断门控先识别 epoch 再应用适用判据（见 CaptureDiagnostics）；
+     * 解析健康基线在差分事务内协调推进；RESET 成功时记录「不可恢复尾段」。
      */
     internal suspend fun syncBattery(
         attemptTs: Long,
         commandStartTs: Long,
-        observedTs: Long,
         source: BatterySource,
     ): BatteryCaptureOutcome {
+        // 成功时间戳在事务后写；先读旧值供 RESET 时的「不可恢复尾段」记录
+        val prevBatterySuccessTs = dao.getState(KEY_LAST_BATTERY_SUCCESS_TS)
         // —— 阶段一：shell + 解析（事务外） ——
         // P1-10：区分 NO_PRIVILEGE（isRootAvailable=false，调用方处理）/ COMMAND_FAILED
         // （exit≠0）/ VALID_EMPTY_OUTPUT（exit=0 且 stdout 空）/ PARSE_FAILED（有输出但无 power 段）
         val res = try {
             runner.exec("dumpsys batterystats --charged")
         } catch (e: Exception) {
+            val ts = nowMs()
             recordBatteryFailure("shell", "${e.javaClass.simpleName}: ${e.message}")
+            logCapture(attemptTs, commandStartTs, ts, source,
+                BatteryCaptureOutcome.Failed("shell", e.message ?: "shell 异常"), parsed = null,
+                detail = "shell 异常：${e.message}")
             return BatteryCaptureOutcome.Failed("shell", "${e.javaClass.simpleName}: ${e.message}")
         }
-        val commandEndTs = System.currentTimeMillis()
+        val commandEndTs = nowMs()
         if (!res.success) {
             val err = res.stderrFirstLine ?: ""
             Log.w(TAG, "battery shell exit=${res.exitCode}: $err")
             recordBatteryFailure("shell", "exit=${res.exitCode} $err")
+            logCapture(attemptTs, commandStartTs, commandEndTs, source,
+                BatteryCaptureOutcome.Failed("shell", "exit=${res.exitCode} $err"), parsed = null,
+                detail = "exit=${res.exitCode} $err")
             return BatteryCaptureOutcome.Failed("shell", "exit=${res.exitCode} $err")
         }
         val lines = res.stdout
@@ -764,10 +926,15 @@ class UsageRepository(
             return if (lines.isEmpty()) {
                 Log.i(TAG, "battery: shell 成功但输出为空（VALID_EMPTY_OUTPUT，batterystats 未就绪？）")
                 recordBatteryFailure("parse", "合法空输出（exit=0，0 行）")
+                logCapture(attemptTs, commandStartTs, commandEndTs, source, BatteryCaptureOutcome.NoData,
+                    parsed = parsed, detail = "合法空输出（exit=0，0 行）")
                 BatteryCaptureOutcome.NoData
             } else {
                 Log.w(TAG, "battery: 输出 ${lines.size} 行但解析不出 power 段（PARSE_FAILED）")
                 recordBatteryFailure("parser", "PARSE_FAILED: ${lines.size} 行无可解析内容")
+                logCapture(attemptTs, commandStartTs, commandEndTs, source,
+                    BatteryCaptureOutcome.ParseFailed("${lines.size} 行无可解析内容"), parsed = parsed,
+                    detail = "PARSE_FAILED: ${lines.size} 行无可解析内容")
                 BatteryCaptureOutcome.ParseFailed("stdout ${lines.size} 行无可解析内容")
             }
         }
@@ -776,6 +943,9 @@ class UsageRepository(
         if (diag.anomalies.isNotEmpty()) {
             Log.w(TAG, "battery parser anomaly: ${diag.anomalies} —— 本帧不提交")
             recordBatteryFailure("parser", "anomaly: ${diag.anomalies.joinToString(";")}")
+            logCapture(attemptTs, commandStartTs, commandEndTs, source,
+                BatteryCaptureOutcome.Failed("parser", diag.anomalies.joinToString(";")), parsed = parsed,
+                detail = "anomaly: ${diag.anomalies.joinToString(";")}")
             return BatteryCaptureOutcome.Failed("parser", diag.anomalies.joinToString(";"))
         }
         val zone = ZoneId.systemDefault()
@@ -785,7 +955,7 @@ class UsageRepository(
         // 解析健康基线同事务推进（v0.18：成功提交才接受新基线）
         val out: BatteryLedger.Result = try {
             applyBatteryLedgerTx(
-                db, dao, parsed, observedTs, zone,
+                db, dao, parsed, commandEndTs, zone,
                 pkgOf = ::resolveBatteryOwnerPackage,
                 prevWindowStartTs = prevWindowStartTs,
                 newBaselineUidCount = parsed.uids.size.toLong(),
@@ -797,6 +967,9 @@ class UsageRepository(
             // （宁可少记一轮，不可半提交）
             Log.w(TAG, "battery tx failed (rolled back)", e)
             recordBatteryFailure("tx", "${e.javaClass.simpleName}: ${e.message}")
+            logCapture(attemptTs, commandStartTs, commandEndTs, source,
+                BatteryCaptureOutcome.Failed("tx", "${e.javaClass.simpleName}: ${e.message}"), parsed = parsed,
+                detail = "tx 失败已回滚：${e.message}")
             return BatteryCaptureOutcome.Failed("tx", "${e.javaClass.simpleName}: ${e.message}")
         }
         // 账本一致性不变量（P1-7）：任意单一组件 > total+容差 → LEDGER_INCONSISTENT（仅诊断，不阻断）。
@@ -812,22 +985,34 @@ class UsageRepository(
         if (violations.isNotEmpty()) {
             Log.w(TAG, "ledger invariant violations=${violations.size} first=${violations.first()}")
         }
-        dao.putState(SyncStateEntity(KEY_LAST_BATTERY_SUCCESS_TS, observedTs))
+        // epoch RESET 成功提交：记录「不可恢复尾段」——上次成功采集（旧 epoch）到新窗口
+        // 起点（≈充电时刻）之间的估算耗电已被系统重置永久丢弃，覆盖状态必须如实呈现
+        if (out.epochChanged) {
+            val lostTo = parsed.windowStartTs
+            if (prevBatterySuccessTs != null && lostTo != null && lostTo > prevBatterySuccessTs) {
+                dao.putState(SyncStateEntity(KEY_BATTERY_LOST_TAIL_FROM, prevBatterySuccessTs))
+                dao.putState(SyncStateEntity(KEY_BATTERY_LOST_TAIL_TO, lostTo))
+            }
+        }
+        dao.putState(SyncStateEntity(KEY_LAST_BATTERY_SUCCESS_TS, commandEndTs))
         dao.putState(SyncStateEntity(KEY_LAST_BATTERY_SOURCE, if (source == BatterySource.ROOT) 1L else 2L))
         prefs.edit().putString(PREF_LAST_BATTERY_FAIL, null).apply()
+        logCapture(attemptTs, commandStartTs, commandEndTs, source, BatteryCaptureOutcome.Success(commandEndTs),
+            parsed = parsed,
+            detail = "uids=${parsed.uids.size} epochChanged=${out.epochChanged}")
         Log.d(
             TAG,
             "battery: uids=${parsed.uids.size} globals=${parsed.globals.size} drain=${parsed.computedDrain} " +
                 "src=$source epochChanged=${out.epochChanged} " +
                 "window=${parsed.windowStartTs?.let { Instant.ofEpochMilli(it).atZone(zone).toLocalDateTime() } ?: "?"}",
         )
-        return BatteryCaptureOutcome.Success
+        return BatteryCaptureOutcome.Success(commandEndTs)
     }
 
     /** 采集失败的持久化记录（人类可读原因进 prefs；时间戳进 sync_state，供 P1-1 健康键拆分） */
     private suspend fun recordBatteryFailure(stage: String, error: String) {
         prefs.edit().putString(PREF_LAST_BATTERY_FAIL, "[$stage] $error").apply()
-        dao.putState(SyncStateEntity(KEY_LAST_BATTERY_FAIL_TS, System.currentTimeMillis()))
+        dao.putState(SyncStateEntity(KEY_LAST_BATTERY_FAIL_TS, nowMs()))
     }
 
     /**
@@ -887,7 +1072,7 @@ class UsageRepository(
     suspend fun generateDueReports(force: Boolean): List<String> {
         val zone = ZoneId.systemDefault()
         val today = LocalDate.now(zone)
-        val now = System.currentTimeMillis()
+        val now = nowMs()
         val made = ArrayList<String>()
         for (type in listOf(ReportPeriods.REPORT_WEEKLY, ReportPeriods.REPORT_MONTHLY, ReportPeriods.REPORT_YEARLY)) {
             // 逐周期检查（P1-12）：已有正式报告的 continue 到更早周期，缺失/过早的补生成
@@ -1003,6 +1188,12 @@ class UsageRepository(
         const val KEY_CAP_FAIL_CODE = "cap_last_fail_code"
         const val KEY_CAP_FAIL_TS = "cap_last_fail_ts"
         const val KEY_CAP_MAX_GAP = "cap_max_gap_ms"
+        // v0.18（C）：usage 独立失败线 + 充电重置不可恢复尾段（覆盖缺口证据）
+        const val KEY_LAST_USAGE_FAIL_TS = "last_usage_fail_ts"
+        const val KEY_BATTERY_LOST_TAIL_FROM = "battery_lost_tail_from_ts"
+        const val KEY_BATTERY_LOST_TAIL_TO = "battery_lost_tail_to_ts"
+        /** capture_log 有界保留条数（P2-2：控制磁盘占用） */
+        const val CAPTURE_LOG_LIMIT = 64
         const val SOURCE_EVENT = 0
         const val SOURCE_AGG_API = 1
         const val SOURCE_ROOT = 2
@@ -1111,6 +1302,44 @@ class UsageRepository(
             val h = totalMin / 60
             val m = totalMin % 60
             return if (h > 0) "${h}小时${m}分钟" else "${m}分钟"
+        }
+
+        /** 超过 2 个名义同步周期（6h 对账 + 15min 采样受 Doze 调制）无任何成功观测，
+         *  视为「可能中断」；不写绝对化「最大损失 ≤15 分钟」 */
+        val STALE_AFTER_MS = 12 * 60 * 60 * 1000L
+
+        /**
+         * 首页状态行文本（纯函数，JVM 可测）。
+         * 形如「数据更新至 M-d HH:mm · 耗电采集 M-d HH:mm（ROOT）」；
+         * 无任何成功观测、或最新成功距 now 过久时给出中断提示（不承诺自动恢复——
+         * Android 15 强停后应用自身无法后台运行）。
+         */
+        fun dataHealthLine(h: DataHealthSummary, now: Long, zone: ZoneId): String {
+            fun fmt(ts: Long?): String? = ts?.let {
+                Instant.ofEpochMilli(it).atZone(zone)
+                    .format(DateTimeFormatter.ofPattern("M-d HH:mm"))
+            }
+            val lastUsage = h.lastUsageSuccessTs
+            val lastBattery = h.lastBatterySuccessTs
+            if (lastUsage == null && lastBattery == null) {
+                return "尚无采集记录（打开应用或等待后台对账后更新）"
+            }
+            val latest = listOfNotNull(lastUsage, lastBattery).max()
+            val sb = StringBuilder("数据更新至 ").append(fmt(latest))
+            if (lastBattery != null && (lastUsage == null || lastBattery > lastUsage)) {
+                sb.append(" · 耗电采集 ").append(fmt(lastBattery))
+                h.lastBatterySource?.let { sb.append("（").append(it).append("）") }
+            } else if (lastUsage != null) {
+                h.lastUsageSource?.let { sb.append("（").append(it).append("）") }
+            }
+            // 实际观测到的最大采样间隔（不是名义 15 分钟的绝对化表述）
+            h.maxCaptureGapMs?.takeIf { it > 60 * 60 * 1000L }?.let {
+                sb.append(" · 采样最大间隔 ").append(formatMinutesShort(it))
+            }
+            if (now - latest > STALE_AFTER_MS) {
+                sb.append(" · ⚠采集可能已中断：若刚强停/清理过本应用，请打开一次以恢复")
+            }
+            return sb.toString()
         }
 
         fun parseDurationMs(s: String?): Long {

@@ -49,10 +49,17 @@ class BatteryCaptureEntryTest {
     private val window1 = ts(2026, 10, 1, 18, 5)
     private val window2 = ts(2026, 10, 2, 18, 5)
 
-    /** 可编程 fake：只应答 dumpsys batterystats --charged */
-    private class FakeRunner(var batteryLines: List<String>) : PrivilegedCommandRunner {
+    /** 可编程 fake：按命令分发应答（batterystats / usagestats） */
+    private class FakeRunner(
+        var batteryLines: List<String> = emptyList(),
+        var usageLines: List<String> = emptyList(),
+    ) : PrivilegedCommandRunner {
         override suspend fun isRootAvailable(): Boolean = true
-        override suspend fun exec(cmd: String): CommandResult = CommandResult(batteryLines, emptyList(), 0)
+        override suspend fun exec(cmd: String): CommandResult = when {
+            cmd.contains("batterystats") -> CommandResult(batteryLines, emptyList(), 0)
+            cmd.contains("usagestats") -> CommandResult(usageLines, emptyList(), 0)
+            else -> CommandResult(emptyList(), emptyList(), 0)
+        }
     }
 
     /** 构造一帧 dump 文本：drain 概要 + 窗口起点 + n 个 UID */
@@ -68,7 +75,8 @@ class BatteryCaptureEntryTest {
     }
 
     private fun capture(observedTs: Long): BatteryCaptureOutcome = runBlocking {
-        repo.syncBattery(observedTs, observedTs - 100, observedTs, com.local.screentime.data.BatterySource.ROOT)
+        repo.nowMs = { observedTs }   // 注入时钟：commandEnd/观测时刻可控
+        repo.syncBattery(observedTs, observedTs - 100, com.local.screentime.data.BatterySource.ROOT)
     }
 
     @Before
@@ -184,5 +192,71 @@ class BatteryCaptureEntryTest {
         assertEquals(5, diag.parsedUidCount)
         assertEquals("拒绝后基线保持此前健康帧的值", 20L, dao().getState(UsageRepository.KEY_PARSER_BASELINE_UIDS))
         assertEquals("拒绝后 epoch 标记不变", window2, dao().getState(UsageRepository.KEY_BATTERY_WINDOW_START_TS))
+    }
+
+    @Test
+    fun captureLog_recordsSuccessAndRejection_withTimesAndVersions() = runBlocking {
+        // v0.18（C）：每次尝试都进有界采集日志（成功与被拒帧都记），区分观测时刻与版本
+        runner.batteryLines = dump(window2, (0 until 20).map { 1.0 })
+        assertTrue(capture(ts(2026, 10, 2, 18, 6)) is BatteryCaptureOutcome.Success)
+        runner.batteryLines = dump(window2, (0 until 5).map { 1.0 })
+        capture(ts(2026, 10, 2, 18, 21))
+        val logs = dao().recentCaptureLogs(10)
+        assertEquals(2, logs.size)
+        val success = logs.first { it.outcome == "SUCCESS" }
+        assertEquals("观测时刻 = commandEnd", ts(2026, 10, 2, 18, 6), success.ts)
+        assertEquals("attempt 与 command 时刻分开记录", ts(2026, 10, 2, 18, 6), success.attemptTs)
+        assertEquals(window2, success.epochWindowStartTs)
+        assertEquals("Asia/Shanghai", success.zoneId)
+        assertEquals(20, success.uidCount)
+        assertTrue(success.ledgerVersion > 0)
+        assertTrue(success.parserVersion > 0)
+        val rejected = logs.first { it.outcome.startsWith("FAILED") }
+        assertTrue(rejected.detail.contains("uid_count_drop"))
+        assertTrue("有界：上限 64", dao().recentCaptureLogs(100).size <= 64)
+    }
+
+    @Test
+    fun epochReset_recordsLostTail() = runBlocking {
+        // C：RESET 成功提交后记录「不可恢复尾段」= 上次成功采集 → 新窗口起点
+        runner.batteryLines = dump(window1, (0 until 142).map { 1.0 })
+        assertTrue(capture(ts(2026, 10, 1, 19, 0)) is BatteryCaptureOutcome.Success)
+        // 新 epoch：充电发生在 10-02 18:05，上次成功采集 10-01 19:00 → [19:00, 18:05] 段永久丢失
+        runner.batteryLines = dump(window2, (0 until 20).map { 1.0 })
+        assertTrue(capture(ts(2026, 10, 2, 18, 6)) is BatteryCaptureOutcome.Success)
+        assertEquals(ts(2026, 10, 1, 19, 0), dao().getState(UsageRepository.KEY_BATTERY_LOST_TAIL_FROM))
+        assertEquals(window2, dao().getState(UsageRepository.KEY_BATTERY_LOST_TAIL_TO))
+        // 同 epoch 后续成功不清掉尾段记录（它描述的是最近一次 RESET 的损失范围）
+        runner.batteryLines = dump(window2, (0 until 20).map { 2.0 })
+        assertTrue(capture(ts(2026, 10, 2, 18, 21)) is BatteryCaptureOutcome.Success)
+        assertEquals(window2, dao().getState(UsageRepository.KEY_BATTERY_LOST_TAIL_TO))
+    }
+
+    @Test
+    fun dataHealthLine_variousStates() {
+        // C：首页状态行纯函数
+        val zone = ZoneId.systemDefault()
+        val now = ts(2026, 10, 2, 15, 0)
+        val healthy = UsageRepository.DataHealthSummary(
+            lastUsageSuccessTs = ts(2026, 10, 2, 9, 16), lastUsageFailTs = null,
+            lastBatterySuccessTs = ts(2026, 10, 2, 10, 23), lastBatteryFailTs = null,
+            maxCaptureGapMs = null, lastUsageSource = "ROOT", lastBatterySource = "ROOT",
+            lostTailFromTs = null, lostTailToTs = null,
+        )
+        val line = UsageRepository.dataHealthLine(healthy, now, zone)
+        assertTrue(line.contains("数据更新至 10-2 10:23"))
+        assertTrue(line.contains("耗电采集"))
+        assertTrue("新鲜状态不提示中断", !line.contains("中断"))
+
+        val staleLine = UsageRepository.dataHealthLine(healthy, now + 13 * 3600_000L, zone)
+        assertTrue("超 12h 无成功观测必须提示", staleLine.contains("采集可能已中断"))
+
+        val noData = healthy.copy(lastUsageSuccessTs = null, lastBatterySuccessTs = null)
+        assertTrue(UsageRepository.dataHealthLine(noData, now, zone).contains("尚无采集记录"))
+
+        val gappy = healthy.copy(maxCaptureGapMs = 4 * 3600_000L)
+        assertTrue("实际观测最大间隔超 1h 才显示", UsageRepository.dataHealthLine(gappy, now, zone).contains("采样最大间隔"))
+        val tiny = healthy.copy(maxCaptureGapMs = 15 * 60_000L)
+        assertTrue("名义间隔不显示", !UsageRepository.dataHealthLine(tiny, now, zone).contains("采样最大间隔"))
     }
 }

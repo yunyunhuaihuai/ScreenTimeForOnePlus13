@@ -206,6 +206,10 @@ data class CaptureLogEntity(
     val zoneId: String,
     /** 通道：1=ROOT 2=DUMP */
     val source: Int,
+    /** 采集时的解析器版本（CaptureDiagnostics.PARSER_VERSION） */
+    val parserVersion: Int,
+    /** 采集时的账本算法版本（BatteryLedger.LEDGER_VERSION） */
+    val ledgerVersion: Int,
     /** SUCCESS / NO_DATA / PARSE_FAILED / SOURCE_UNAVAILABLE / FAILED:<stage> */
     val outcome: String,
     /** 本帧解析出的统计窗口起点（epoch 证据；null=本帧未解析出） */

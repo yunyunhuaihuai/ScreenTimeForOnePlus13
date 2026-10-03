@@ -307,6 +307,7 @@ private data class DayLoad(
     val dayStats: DayStatsEntity?,
     val unlockTop: List<UnlockStatsEntity>,
     val reports: List<ReportEntity>,
+    val health: UsageRepository.DataHealthSummary?,
 )
 
 @Composable
@@ -355,6 +356,8 @@ fun UsageApp(
     var dayStats by remember { mutableStateOf<DayStatsEntity?>(null) }
     var unlockTop3 by remember { mutableStateOf<List<UnlockStatsEntity>>(emptyList()) }
     var reportsList by remember { mutableStateOf<List<ReportEntity>>(emptyList()) }
+    // 采集健康状态行数据（v0.18，C）：「数据更新至/覆盖缺口」可核验状态
+    var dataHealth by remember { mutableStateOf<UsageRepository.DataHealthSummary?>(null) }
     var sortByBattery by remember { mutableStateOf(false) }
     var detailFor by remember { mutableStateOf<UiRowInfo?>(null) }
     var showNotifs by remember { mutableStateOf(false) }
@@ -401,6 +404,7 @@ fun UsageApp(
                     dayStats = repo.dayStats(targetDay),
                     unlockTop = repo.unlockTop(targetDay, 100),
                     reports = repo.latestReports(),
+                    health = runCatching { repo.dataHealthSummary() }.getOrNull(),
                 )
             }
             if (selectedDay.toEpochDay() == targetDay) {
@@ -414,6 +418,7 @@ fun UsageApp(
                 dayStats = d.dayStats
                 unlockTop3 = d.unlockTop
                 reportsList = d.reports
+                dataHealth = d.health
             }
         }
     }
@@ -610,6 +615,16 @@ fun UsageApp(
                 ) { Text("›") }
             }
             Text(formatMinutes(dayTotal), fontSize = 34.sp, fontWeight = FontWeight.Bold)
+            // 紧凑采集健康状态行（v0.18，C）：数据更新至/耗电采集/采样实际最大间隔；
+            // 长期无成功观测时明确提示可能中断（强停后需用户打开恢复，不做虚假承诺）
+            dataHealth?.let { h ->
+                Text(
+                    UsageRepository.dataHealthLine(h, System.currentTimeMillis(), zone),
+                    fontSize = 10.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 2.dp)
+                )
+            }
         }
 
         // 此前四个模块按代码顺序硬编码 emit，moduleOrder 设置形同虚设；

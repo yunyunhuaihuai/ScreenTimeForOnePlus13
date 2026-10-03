@@ -97,7 +97,9 @@ abstract class AppDatabase : RoomDatabase() {
                         "`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
                         "`ts` INTEGER NOT NULL, `attemptTs` INTEGER NOT NULL, " +
                         "`commandStartTs` INTEGER NOT NULL, `commandEndTs` INTEGER NOT NULL, " +
-                        "`zoneId` TEXT NOT NULL, `source` INTEGER NOT NULL, `outcome` TEXT NOT NULL, " +
+                        "`zoneId` TEXT NOT NULL, `source` INTEGER NOT NULL, " +
+                        "`parserVersion` INTEGER NOT NULL, `ledgerVersion` INTEGER NOT NULL, " +
+                        "`outcome` TEXT NOT NULL, " +
                         "`epochWindowStartTs` INTEGER, `uidCount` INTEGER NOT NULL, `globalCount` INTEGER NOT NULL, " +
                         "`computedDrainMah` REAL NOT NULL, `actualDrainLowMah` REAL, `actualDrainHighMah` REAL, " +
                         "`sumUidTotalMah` REAL NOT NULL, `detail` TEXT NOT NULL)"

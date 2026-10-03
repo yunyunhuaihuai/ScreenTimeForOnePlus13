@@ -2,7 +2,7 @@
   "formatVersion": 1,
   "database": {
     "version": 9,
-    "identityHash": "f7fca687ec80a6b8aa025df6311ed01e",
+    "identityHash": "772a0c76882bfebcc755861b194eb02f",
     "entities": [
       {
         "tableName": "sessions",
@@ -641,7 +641,7 @@
       },
       {
         "tableName": "capture_log",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `ts` INTEGER NOT NULL, `attemptTs` INTEGER NOT NULL, `commandStartTs` INTEGER NOT NULL, `commandEndTs` INTEGER NOT NULL, `zoneId` TEXT NOT NULL, `source` INTEGER NOT NULL, `outcome` TEXT NOT NULL, `epochWindowStartTs` INTEGER, `uidCount` INTEGER NOT NULL, `globalCount` INTEGER NOT NULL, `computedDrainMah` REAL NOT NULL, `actualDrainLowMah` REAL, `actualDrainHighMah` REAL, `sumUidTotalMah` REAL NOT NULL, `detail` TEXT NOT NULL)",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `ts` INTEGER NOT NULL, `attemptTs` INTEGER NOT NULL, `commandStartTs` INTEGER NOT NULL, `commandEndTs` INTEGER NOT NULL, `zoneId` TEXT NOT NULL, `source` INTEGER NOT NULL, `parserVersion` INTEGER NOT NULL, `ledgerVersion` INTEGER NOT NULL, `outcome` TEXT NOT NULL, `epochWindowStartTs` INTEGER, `uidCount` INTEGER NOT NULL, `globalCount` INTEGER NOT NULL, `computedDrainMah` REAL NOT NULL, `actualDrainLowMah` REAL, `actualDrainHighMah` REAL, `sumUidTotalMah` REAL NOT NULL, `detail` TEXT NOT NULL)",
         "fields": [
           {
             "fieldPath": "id",
@@ -682,6 +682,18 @@
           {
             "fieldPath": "source",
             "columnName": "source",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "parserVersion",
+            "columnName": "parserVersion",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "ledgerVersion",
+            "columnName": "ledgerVersion",
             "affinity": "INTEGER",
             "notNull": true
           },
@@ -763,7 +775,7 @@
     "views": [],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'f7fca687ec80a6b8aa025df6311ed01e')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '772a0c76882bfebcc755861b194eb02f')"
     ]
   }
 }

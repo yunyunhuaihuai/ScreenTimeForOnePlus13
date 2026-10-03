@@ -109,7 +109,7 @@ class OwnerPackageTest {
         )
         assertEquals(
             CaptureHealth.FAIL_NONE,
-            CaptureHealth.failCodeOf(BatteryCaptureOutcome.Success),
+            CaptureHealth.failCodeOf(BatteryCaptureOutcome.Success(0L)),
         )
     }
 
