@@ -133,9 +133,9 @@ class BatteryLedgerTest {
     }
 
     @Test
-    fun tinyDelta_advancesSnapshot_butNoDailyRow() {
-        // 语义要点：快照无论 delta 多小都要推进（否则低用量 UID 的差分永远追不上累计值），
-        // daily 只在 delta > 0.001 时写
+    fun tinyDelta_recordedByHighWater_notSwallowed() {
+        // v0.18（P1-1）：记录阈值取消——快照推进不再吞掉微量增量，
+        // 100 次 +0.0005 必须累计 0.05 全部落库（旧实现 delta≤0.001 跳过但快照照推）
         val lastTs = ts(2026, 9, 18, 12, 0)
         val now = ts(2026, 9, 18, 12, 30)
         val existing = BatteryLedger.Existing(
@@ -144,7 +144,187 @@ class BatteryLedgerTest {
         )
         val out = BatteryLedger.compute(parsedOf(uidOf("u0a1", 1.0005)), existing, now, zone)
         assertEquals(1.0005, out.snapshots.single().cumMah, 1e-12)
-        assertEquals(0, out.dailyRows.size)  // 0.0005 ≤ 0.001
+        assertEquals("微量增量必须入账", 1, out.dailyRows.size)
+        assertEquals(0.0005, out.dailyRows.single().totalMah, 1e-12)
+    }
+
+    @Test
+    fun hundredMicroIncrements_accumulateFully() {
+        // 验收（P1-1）：100 次各 +0.0005 → 存储 0.05，不丢
+        var cum = 1.0
+        var recorded = 0.0
+        var snap = BatterySnapshotEntity("u0a1", cum, "", ts(2026, 9, 18, 12, 0))
+        for (i in 1..100) {
+            cum += 0.0005
+            val out = BatteryLedger.compute(
+                parsedOf(uidOf("u0a1", cum)),
+                BatteryLedger.Existing(mapOf("u0a1" to snap), emptyMap(), emptyMap()),
+                ts(2026, 9, 18, 12, 0) + i * 60_000L, zone,
+            )
+            recorded += out.dailyRows.sumOf { it.totalMah }
+            snap = out.snapshots.single()
+        }
+        assertEquals(0.05, recorded, 1e-9)
+        assertEquals("高水位 = 最新观测", cum, snap.recordedCumMah, 1e-9)
+    }
+
+    @Test
+    fun dipRecover_noDoubleCount_fullSequence() {
+        // 验收（P0-2）：100→97→100→105 只新增 5 而非 8（旧实现 max(new-old,0)+写回低快照
+        // 会在恢复时再记 3）；多次振荡不增长。序列覆盖 total/组件/fg-bg-fgs/global功率/global时长。
+        val window = ts(2026, 10, 1, 18, 5)
+        var snap = BatterySnapshotEntity(
+            "u0a1", 100.0, "screen=50.0|fg=40.0", ts(2026, 10, 1, 19, 0),
+            recordedCumMah = 100.0, recordedCompsText = "screen=50.0|fg=40.0", epochWindowStartTs = window,
+        )
+        var gSnap = BatterySnapshotEntity(
+            BatteryLedger.GLOBAL_SNAPSHOT_KEY, 200.0, "screen=90.0", ts(2026, 10, 1, 19, 0),
+            recordedCumMah = 200.0, recordedCompsText = "screen=90.0", epochWindowStartTs = window,
+        )
+        var gDurSnap = BatterySnapshotEntity(
+            BatteryLedger.GLOBAL_DUR_SNAPSHOT_KEY, 10_000_000.0, "screen=10000000.0", ts(2026, 10, 1, 19, 0),
+            recordedCumMah = 10_000_000.0, recordedCompsText = "screen=10000000.0", epochWindowStartTs = window,
+        )
+        var total = 0.0
+        var screen = 0.0
+        var fg = 0.0
+        var gMah = 0.0
+        var gDur = 0L
+
+        fun frame(
+            uidTotal: Double, uidScreen: Double, uidFg: Double,
+            gTotal: Double, gScreen: Double, gScreenDur: Long, at: Long,
+        ) {
+            val out = BatteryLedger.compute(
+                BatteryParsed(
+                    uids = listOf(UidPower("u0a1", uidTotal, uidFg, 0.0, 0.0, mapOf("screen" to uidScreen))),
+                    globals = linkedMapOf("screen" to (gScreen to gScreenDur)),
+                    computedDrain = gTotal, actualDrainLow = 0.0, windowStartTs = window,
+                ),
+                BatteryLedger.Existing(
+                    mapOf("u0a1" to snap, BatteryLedger.GLOBAL_SNAPSHOT_KEY to gSnap, BatteryLedger.GLOBAL_DUR_SNAPSHOT_KEY to gDurSnap),
+                    emptyMap(), emptyMap(),
+                ),
+                at, zone, prevWindowStartTs = window,
+            )
+            total += out.dailyRows.sumOf { it.totalMah }
+            screen += out.dailyRows.sumOf { it.screenMah }
+            fg += out.dailyRows.sumOf { it.fgMah }
+            gMah += out.globalRows.sumOf { it.mah }
+            gDur += out.globalRows.sumOf { it.durationMs }
+            snap = out.snapshots.first { it.uidKey == "u0a1" }
+            gSnap = out.snapshots.first { it.uidKey == BatteryLedger.GLOBAL_SNAPSHOT_KEY }
+            gDurSnap = out.snapshots.first { it.uidKey == BatteryLedger.GLOBAL_DUR_SNAPSHOT_KEY }
+        }
+
+        val base = ts(2026, 10, 1, 20, 0)
+        // 已入账：total 100 / screen 50 / fg 40 / global 200/90 / dur 10_000_000（基线快照本身）
+        frame(97.0, 48.0, 39.0, 195.0, 88.0, 9_800_000L, base + 60_000)          // 回落（模型回算）
+        assertEquals("回落帧零入账", 0.0, total, 1e-9)
+        frame(100.0, 50.0, 40.0, 200.0, 90.0, 10_000_000L, base + 120_000)      // 恢复到原值
+        assertEquals("恢复帧零入账（不二次累计）", 0.0, total, 1e-9)
+        assertEquals(0.0, screen, 1e-9)
+        assertEquals(0.0, fg, 1e-9)
+        assertEquals(0.0, gMah, 1e-9)
+        assertEquals(0L, gDur)
+        frame(105.0, 53.0, 42.0, 210.0, 95.0, 10_600_000L, base + 180_000)      // 真实增长
+        assertEquals("只新增 5 而非 8", 5.0, total, 1e-9)
+        assertEquals(3.0, screen, 1e-9)
+        assertEquals(2.0, fg, 1e-9)
+        assertEquals("global 组件 90→95 增量 5", 5.0, gMah, 1e-9)
+        assertEquals(600_000L, gDur)
+        // 多次振荡不增长
+        frame(101.0, 51.0, 41.0, 205.0, 93.0, 10_300_000L, base + 240_000)
+        frame(105.0, 53.0, 42.0, 210.0, 95.0, 10_600_000L, base + 300_000)
+        frame(102.0, 52.0, 41.5, 206.0, 94.0, 10_400_000L, base + 360_000)
+        frame(105.0, 53.0, 42.0, 210.0, 95.0, 10_600_000L, base + 420_000)
+        assertEquals("振荡不增长", 5.0, total, 1e-9)
+    }
+
+    @Test
+    fun componentChange_withZeroTotalDelta_stillRecorded() {
+        // 验收（P1-1）：total 无变化时，独立组件/时长应处理的变化不得丢弃
+        val window = ts(2026, 10, 1, 18, 5)
+        val lastTs = ts(2026, 10, 1, 20, 0)
+        val existing = BatteryLedger.Existing(
+            snapshots = mapOf(
+                "u0a1" to BatterySnapshotEntity("u0a1", 100.0, "cpu=20.0|screen=30.0", lastTs,
+                    recordedCumMah = 100.0, recordedCompsText = "cpu=20.0|screen=30.0", epochWindowStartTs = window),
+            ),
+            daily = emptyMap(), global = emptyMap(),
+        )
+        // total 仍 100（模型在组件间重归因），cpu +5 / screen 不变 → 组件增量必须入账
+        val out = BatteryLedger.compute(
+            parsedOf(uidOf("u0a1", 100.0, comps = mapOf("cpu" to 25.0, "screen" to 30.0)), windowStartTs = window),
+            existing, lastTs + 60_000, zone, prevWindowStartTs = window,
+        )
+        assertEquals(1, out.dailyRows.size)
+        assertEquals(0.0, out.dailyRows.single().totalMah, 1e-9)
+        assertEquals(5.0, out.dailyRows.single().cpuMah, 1e-9)
+    }
+
+    @Test
+    fun legacySnapshotWithoutRecordedColumns_fallsBackToRaw() {
+        // 迁移兜底：recordedCumMah=-1（未初始化）的历史快照按旧语义取原始观测做基线，
+        // 升级后第一帧差分与迁移前连续
+        val lastTs = ts(2026, 9, 18, 12, 0)
+        val existing = BatteryLedger.Existing(
+            snapshots = mapOf("u0a1" to BatterySnapshotEntity("u0a1", 100.0, "fg=50.0", lastTs)),
+            daily = mapOf(
+                BatteryLedger.dailyKey("u0a1", epochDay(2026, 9, 18)) to dailyRow("u0a1", epochDay(2026, 9, 18), 60.0, 30.0)
+            ),
+            global = emptyMap(),
+        )
+        val out = BatteryLedger.compute(parsedOf(uidOf("u0a1", 110.0, fg = 55.0)), existing, lastTs + 3_600_000, zone)
+        assertEquals(70.0, out.dailyRows.single().totalMah, 1e-9)
+        assertEquals(35.0, out.dailyRows.single().fgMah, 1e-9)
+        assertEquals("新高水位 = 110", 110.0, out.snapshots.single().recordedCumMah, 1e-9)
+    }
+
+    @Test
+    fun snapshotsCarryEpochMarker() {
+        // 验收（I）：快照记录所属 epoch；本帧窗口缺失时沿用既有标记
+        val window = ts(2026, 10, 1, 18, 5)
+        val out = BatteryLedger.compute(
+            parsedOf(uidOf("u0a1", 10.0), windowStartTs = window),
+            BatteryLedger.Existing(emptyMap(), emptyMap(), emptyMap()),
+            window + 60_000, zone, prevWindowStartTs = window,
+        )
+        assertEquals(window, out.snapshots.single().epochWindowStartTs)
+        // 本帧窗口起点缺失：沿用快照/标记既有 epoch
+        val out2 = BatteryLedger.compute(
+            parsedOf(uidOf("u0a1", 12.0), windowStartTs = null),
+            BatteryLedger.Existing(mapOf("u0a1" to out.snapshots.single()), emptyMap(), emptyMap()),
+            window + 120_000, zone, prevWindowStartTs = window,
+        )
+        assertEquals(window, out2.snapshots.single().epochWindowStartTs)
+    }
+
+    @Test
+    fun componentMapping_everyParsedFieldHasExactlyOneDestination() {
+        // 验收（I/P2-1）：每个已解析字段有且仅有一个存储目的地；bt 是 bluetooth 的别名；
+        // flashlight/ambient_display/idle/phone 有独立列（真机 UID1000 flashlight=1.34 曾丢失）
+        val window = ts(2026, 10, 1, 18, 5)
+        val comps = mapOf(
+            "screen" to 1.0, "cpu" to 1.0, "audio" to 1.0, "video" to 1.0, "camera" to 1.0,
+            "gnss" to 1.0, "wifi" to 1.0, "mobile_radio" to 1.0, "bluetooth" to 1.0, "bt" to 1.0,
+            "wakelock" to 1.0, "sensors" to 1.0, "flashlight" to 1.34, "ambient_display" to 1.0,
+            "idle" to 1.0, "phone" to 1.0, "mystery_comp" to 2.0,
+        )
+        val out = BatteryLedger.compute(
+            parsedOf(uidOf("u0a1", 13.34, comps = comps), windowStartTs = window),
+            BatteryLedger.Existing(emptyMap(), emptyMap(), emptyMap()),
+            window + 60_000, zone,
+        )
+        val r = out.dailyRows.single()
+        assertEquals(1.0, r.screenMah, 1e-9)
+        assertEquals(1.0, r.mobileMah, 1e-9)
+        assertEquals("bt+bluetooth 别名同列求和", 2.0, r.btMah, 1e-9)
+        assertEquals("flashlight 独立列", 1.34, r.flashlightMah, 1e-9)
+        assertEquals(1.0, r.ambientDisplayMah, 1e-9)
+        assertEquals(1.0, r.idleMah, 1e-9)
+        assertEquals(1.0, r.phoneMah, 1e-9)
+        assertEquals("未知字段唯一兜底 other", 2.0, r.otherMah, 1e-9)
     }
 
     @Test

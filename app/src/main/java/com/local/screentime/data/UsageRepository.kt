@@ -599,7 +599,9 @@ class UsageRepository(
                         put("screen", r.screenMah); put("cpu", r.cpuMah); put("audio", r.audioMah)
                         put("video", r.videoMah); put("camera", r.cameraMah); put("gnss", r.gnssMah)
                         put("wifi", r.wifiMah); put("mobile", r.mobileMah); put("bt", r.btMah)
-                        put("wakelock", r.wakelockMah); put("sensors", r.sensorsMah); put("other", r.otherMah)
+                        put("wakelock", r.wakelockMah); put("sensors", r.sensorsMah)
+                        put("flashlight", r.flashlightMah); put("ambient_display", r.ambientDisplayMah)
+                        put("idle", r.idleMah); put("phone", r.phoneMah); put("other", r.otherMah)
                     },
                 )
                 uidArr.put(o)

@@ -19,9 +19,10 @@ import java.time.ZoneId
  *  - 写库统一收口到 applyBatteryLedgerTx 的单一 Room 事务（快照推进放在事务最后，
  *    与 daily/global 原子提交），事务外只做 shell 与解析。
  *
- * 语义与旧实现逐条对齐（重置判据 = new < old×0.5、0.001 mAh 记录阈值、
- * other = 未知组件之和、fg/bg/fgs 存于快照 comps、全局 `_dur` 时长差分快照），
- * 行为等价性由 BatteryLedgerTest 钉死。
+ * 语义（v0.18 重写为高水位记账）：epoch 判定 = 持久化窗口起点（fallback 比例判据
+ * new < old×0.5）、增量相对「已入账高水位」计算（同 epoch 回落不二次入账、微量
+ * 增量不因阈值+快照推进而丢失）、组件按 COMPONENT_COLUMNS 全映射（未知字段唯一
+ * 兜底 other）、全局 `_dur` 时长差分快照。行为由 BatteryLedgerTest 钉死。
  */
 object BatteryLedger {
 
@@ -31,11 +32,62 @@ object BatteryLedger {
     /** 全局组件时长的差分基线主键（v0.16.14 引入） */
     const val GLOBAL_DUR_SNAPSHOT_KEY = "__global___dur"
 
-    /** UID 行括号内已知组件；其余组件并入 otherMah */
-    val KNOWN_COMPS = setOf(
-        "screen", "cpu", "audio", "video", "camera", "gnss", "wifi", "bluetooth", "bt",
-        "wakelock", "sensors", "mobile_radio", "ambient_display", "idle", "flashlight", "phone",
+    /**
+     * 组件字段 → 存储目的地的完整映射（v0.18，P2-1）。
+     * 每个已解析组件字段**有且仅有一个**存储目的地（列）；两个键映射到同一列
+     * （bluetooth/bt 是同一组件的 ROM 别名）视为一个目的地。未列出的字段进 otherMah
+     * ——唯一的、可审计的下兜底。fg/bg/fgs 是 UID 行括号外的前台/后台/前台服务标签，
+     * 各有专列（v0.16.7 曾因误从括号内取值恒得 0）。历史教训：KNOWN_COMPS 含
+     * mobile_radio/flashlight 等却既不落列也不进 other，组件明细被静默丢弃
+     * （真机 UID1000 flashlight=1.34）。
+     */
+    val COMPONENT_COLUMNS: Map<String, String> = mapOf(
+        "screen" to "screen",
+        "cpu" to "cpu",
+        "audio" to "audio",
+        "video" to "video",
+        "camera" to "camera",
+        "gnss" to "gnss",
+        "wifi" to "wifi",
+        "mobile_radio" to "mobile",
+        "bluetooth" to "bt",
+        "bt" to "bt",
+        "wakelock" to "wakelock",
+        "sensors" to "sensors",
+        "flashlight" to "flashlight",
+        "ambient_display" to "ambientDisplay",
+        "idle" to "idle",
+        "phone" to "phone",
+        // 括号外标签字段
+        "fg" to "fg",
+        "bg" to "bg",
+        "fgs" to "fgs",
     )
+
+    /** UID 行括号内已知组件（= 有明确存储目的地的字段）；其余组件并入 otherMah */
+    val KNOWN_COMPS = COMPONENT_COLUMNS.keys
+
+    /** 账本算法版本：记账语义变化时递增，随采集日志落盘 */
+    const val LEDGER_VERSION = 2
+
+    /** 快照里记录的已入账高水位（-1 = 未初始化的历史行/旧语义数据） */
+    private fun recordedCumOf(snap: BatterySnapshotEntity?): Double =
+        snap?.recordedCumMah?.takeIf { it >= 0 } ?: snap?.cumMah ?: 0.0
+
+    private fun recordedCompsOf(snap: BatterySnapshotEntity?): Map<String, Double> =
+        if (snap != null && snap.recordedCumMah >= 0) decodeComps(snap.recordedCompsText)
+        else decodeComps(snap?.compsText ?: "")
+
+    /** 快照所属 epoch 的窗口起点（优先本帧解析值；本帧缺失则沿用快照既有标记） */
+    private fun epochTsOf(
+        parsedWindowStartTs: Long?,
+        effLast: BatterySnapshotEntity?,
+        prevWindowStartTs: Long?,
+    ): Long = parsedWindowStartTs
+        ?: effLast?.epochWindowStartTs?.takeIf { it > 0 }
+        ?: prevWindowStartTs
+        ?: 0L
+
 
     /**
      * batterystats 统计 epoch 判定（v0.17.1，P0-1）。
@@ -170,6 +222,22 @@ object BatteryLedger {
      * epoch 语义（P0-1）：RESET 时**所有**旧快照（含本帧未出现的 UID，由事务层统一删除）
      * 视为不存在——差分按「首次同步」语义进行（totalDelta=全量、起点=新窗口起点）；
      * SAME 时禁止任何数值型 reset 判据；UNKNOWN（窗口起点缺失）才退回比例 heuristic。
+     *
+     * 记账语义（v0.18，P0-2/P1-1 重写）：**原始观测与已入账高水位分离**。
+     * 快照同时保存两类状态：cumMah/compsText = 上一帧原始观测（UNKNOWN 比例判据仍依赖
+     * 它）；recordedCumMah/recordedCompsText = 已经写入日账本的最高水位。每帧增量一律
+     * 相对高水位计算：max(0, 本帧观测 − 高水位)。
+     *  - 同 epoch 模型回算（100→97）不再推进高水位 → 恢复到 100 时增量为 0，
+     *    **不会二次入账**（旧实现 max(new-old,0) + 写回低快照会再记 3）；
+     *  - 记录阈值取消（旧 0.001/0.01 会随快照推进把微量增量永久吞掉——100 次
+     *    +0.0005 丢失 0.05 mAh）：存储层任何有限正增量都有去向，阈值只留给展示层；
+     *  - total 无变化但组件/时长有变化时照常入账（组件是独立高水位，不跟随 total）。
+     *
+     * 选择与局限（记录在案）：高水位记账对「模型永久下调且不再恢复」的极端情形会
+     * 高估（上限 = 回调幅度，实测 ~2% smear）；不做带符号回冲是因为负增量无法在
+     * dayWeights 的时间归属下无歧义地落到某一天，且会改写已提交的历史行。账本
+     * 不变量（ledgerInconsistencies）持续监督，历史 46 条 screen>total 行保留
+     * 诊断、不擅自用组件反推 total。
      */
     fun compute(
         parsed: BatteryParsed,
@@ -195,73 +263,86 @@ object BatteryLedger {
                 EpochState.SAME -> false
                 EpochState.UNKNOWN -> effLast != null && isReset(effLast.cumMah, u.totalMah)
             }
-            val prevComps = decodeComps(effLast?.compsText ?: "")
+            // 高水位基线：reset/首次观测按 0 处理（全量入账）；否则取已入账高水位
+            val recCumPrev = if (effLast == null || reset) 0.0 else recordedCumOf(effLast)
+            val recCompsPrev = if (effLast == null || reset) emptyMap() else recordedCompsOf(effLast)
 
-            fun compDelta(key: String): Double {
-                // fg/bg 在 dump 的 UID 行括号之外（“… fg: 25.1 bg: 1.04 (…)”），
-                // 不在 comps（括号内组件表）里 —— 此前误从 u.comps 取值恒得 0（v0.16.7 修复）
-                val nowV = when (key) {
-                    "fg" -> u.fg
-                    "bg" -> u.bg
-                    "fgs" -> u.fgs
-                    else -> u.comps[key] ?: 0.0
-                }
-                val prevV = if (effLast == null || reset) 0.0 else (prevComps[key] ?: 0.0)
-                return (nowV - prevV).coerceAtLeast(0.0)
+            // 本帧原始观测（fg/bg/fgs 在括号外，与括号内组件表合并保存）
+            val rawNow = HashMap<String, Double>(u.comps.size + 3)
+            rawNow.putAll(u.comps)
+            rawNow["fg"] = u.fg
+            rawNow["bg"] = u.bg
+            rawNow["fgs"] = u.fgs
+
+            // 增量 = max(0, 原始观测 − 已入账高水位)，逐键独立
+            val totalDelta = (u.totalMah - recCumPrev).coerceAtLeast(0.0)
+            val compDeltas = HashMap<String, Double>()
+            for ((k, v) in rawNow) {
+                val d = (v - (recCompsPrev[k] ?: 0.0)).coerceAtLeast(0.0)
+                if (d > 0.0) compDeltas[k] = d
             }
 
-            val totalDelta = if (effLast == null || reset) {
-                u.totalMah
-            } else {
-                (u.totalMah - effLast.cumMah).coerceAtLeast(0.0)
-            }
+            // 新快照：原始观测 + 高水位（max 合并，永不回退）+ epoch 标记
+            val recNew = HashMap<String, Double>(recCompsPrev)
+            for ((k, v) in rawNow) recNew[k] = maxOf(recNew[k] ?: 0.0, v)
             snapshots.add(
                 BatterySnapshotEntity(
                     uidKey = u.uidKey,
                     cumMah = u.totalMah,
-                    compsText = encodeComps(u.comps + mapOf("fg" to u.fg, "bg" to u.bg, "fgs" to u.fgs)),
+                    compsText = encodeComps(rawNow),
                     updatedTs = now,
+                    recordedCumMah = maxOf(recCumPrev, u.totalMah),
+                    recordedCompsText = encodeComps(recNew),
+                    epochWindowStartTs = epochTsOf(parsed.windowStartTs, effLast, prevWindowStartTs),
                 )
             )
-            // 阈值从 0.01 收紧到 0.001：视频类应用一次亮屏几分钟的估算耗电可能只有几十 mAh，
-            // 但被冰箱冻结后仅剩零星后台增量，0.01 会把整段使用期之间的微小增量整段丢弃（v0.16.7）。
-            // 注意：快照无论 delta 多小都要推进，否则低用量 UID 的差分永远追不上累计值。
-            if (totalDelta <= 0.001) continue
+
+            // 存储层守恒：任何有限正增量都落库（无阈值）。total 与组件是独立高水位，
+            // total 无变化时组件/fg-bg-fgs 的变化照常处理
+            if (totalDelta <= 0.0 && compDeltas.isEmpty()) continue
+            // 按存储目的地聚合组件增量（bluetooth/bt 同列求和；未知字段唯一兜底 other）
+            val colDeltas = HashMap<String, Double>()
+            for ((k, d) in compDeltas) {
+                val col = COMPONENT_COLUMNS[k] ?: "other"
+                colDeltas[col] = (colDeltas[col] ?: 0.0) + d
+            }
             val pkg = pkgOf(uidOf(u.uidKey))
             for ((day, w) in dayWeights(deltaFrom(effLast?.updatedTs, reset, parsed.windowStartTs, now), now, zone)) {
                 val ex = existing.daily[dailyKey(u.uidKey, day)]
+                fun acc(col: String): Double = (colDeltas[col] ?: 0.0) * w
                 dailyRows.add(
                     BatteryDailyEntity(
                         uidKey = u.uidKey,
                         day = day,
                         packageName = pkg,
                         totalMah = (ex?.totalMah ?: 0.0) + totalDelta * w,
-                        fgMah = (ex?.fgMah ?: 0.0) + compDelta("fg") * w,
-                        bgMah = (ex?.bgMah ?: 0.0) + compDelta("bg") * w,
-                        fgsMah = (ex?.fgsMah ?: 0.0) + compDelta("fgs") * w,
-                        screenMah = (ex?.screenMah ?: 0.0) + compDelta("screen") * w,
-                        cpuMah = (ex?.cpuMah ?: 0.0) + compDelta("cpu") * w,
-                        audioMah = (ex?.audioMah ?: 0.0) + compDelta("audio") * w,
-                        videoMah = (ex?.videoMah ?: 0.0) + compDelta("video") * w,
-                        cameraMah = (ex?.cameraMah ?: 0.0) + compDelta("camera") * w,
-                        gnssMah = (ex?.gnssMah ?: 0.0) + compDelta("gnss") * w,
-                        wifiMah = (ex?.wifiMah ?: 0.0) + compDelta("wifi") * w,
-                        btMah = (ex?.btMah ?: 0.0) + compDelta("bluetooth") * w,
-                        wakelockMah = (ex?.wakelockMah ?: 0.0) + compDelta("wakelock") * w,
-                        sensorsMah = (ex?.sensorsMah ?: 0.0) + compDelta("sensors") * w,
-                        // mobile_radio 组件进独立列（P1-6）：此前 KNOWN_COMPS 含 mobile_radio
-                        // 但实体无列，组件明细凭空丢失（不进 otherMah、也不进任何列）
-                        mobileMah = (ex?.mobileMah ?: 0.0) + compDelta("mobile_radio") * w,
-                        otherMah = (ex?.otherMah ?: 0.0) + u.comps.keys
-                            .filter { it !in KNOWN_COMPS }
-                            .sumOf { compDelta(it) } * w,
+                        fgMah = (ex?.fgMah ?: 0.0) + acc("fg"),
+                        bgMah = (ex?.bgMah ?: 0.0) + acc("bg"),
+                        fgsMah = (ex?.fgsMah ?: 0.0) + acc("fgs"),
+                        screenMah = (ex?.screenMah ?: 0.0) + acc("screen"),
+                        cpuMah = (ex?.cpuMah ?: 0.0) + acc("cpu"),
+                        audioMah = (ex?.audioMah ?: 0.0) + acc("audio"),
+                        videoMah = (ex?.videoMah ?: 0.0) + acc("video"),
+                        cameraMah = (ex?.cameraMah ?: 0.0) + acc("camera"),
+                        gnssMah = (ex?.gnssMah ?: 0.0) + acc("gnss"),
+                        wifiMah = (ex?.wifiMah ?: 0.0) + acc("wifi"),
+                        btMah = (ex?.btMah ?: 0.0) + acc("bt"),
+                        wakelockMah = (ex?.wakelockMah ?: 0.0) + acc("wakelock"),
+                        sensorsMah = (ex?.sensorsMah ?: 0.0) + acc("sensors"),
+                        mobileMah = (ex?.mobileMah ?: 0.0) + acc("mobile"),
+                        flashlightMah = (ex?.flashlightMah ?: 0.0) + acc("flashlight"),
+                        ambientDisplayMah = (ex?.ambientDisplayMah ?: 0.0) + acc("ambientDisplay"),
+                        idleMah = (ex?.idleMah ?: 0.0) + acc("idle"),
+                        phoneMah = (ex?.phoneMah ?: 0.0) + acc("phone"),
+                        otherMah = (ex?.otherMah ?: 0.0) + acc("other"),
                     )
                 )
             }
         }
 
         val globalRows = ArrayList<BatteryGlobalEntity>()
-        // 全局组件：与 UID 行同一 epoch 状态（P0-1：UID/GLOBAL/GLOBAL_DUR 必须共用同一 reset）
+        // 全局组件：与 UID 行同一 epoch 状态（P0-1：UID/GLOBAL/GLOBAL_DUR 必须共用同一 reset）；
+        // 记账与 UID 行同一高水位语义（功率与时长各自独立的高水位基线）
         if (parsed.computedDrain > 0) {
             val gLast = existing.snapshots[GLOBAL_SNAPSHOT_KEY]
             val effGLast = if (globalReset) null else gLast
@@ -271,37 +352,48 @@ object BatteryLedger {
                 EpochState.SAME -> false
                 EpochState.UNKNOWN -> effGLast != null && isReset(effGLast.cumMah, parsed.computedDrain)
             }
+            val gRecCumPrev = if (effGLast == null || reset) 0.0 else recordedCumOf(effGLast)
+            val gRecCompsPrev = if (effGLast == null || reset) emptyMap() else recordedCompsOf(effGLast)
+            val gRawComps = parsed.globals.mapValues { it.value.first }
+            val gRecNew = HashMap<String, Double>(gRecCompsPrev)
+            for ((k, v) in gRawComps) gRecNew[k] = maxOf(gRecNew[k] ?: 0.0, v)
             snapshots.add(
-                BatterySnapshotEntity(GLOBAL_SNAPSHOT_KEY, parsed.computedDrain, encodeComps(parsed.globals.mapValues { it.value.first }), now)
+                BatterySnapshotEntity(
+                    GLOBAL_SNAPSHOT_KEY, parsed.computedDrain, encodeComps(gRawComps), now,
+                    recordedCumMah = maxOf(gRecCumPrev, parsed.computedDrain),
+                    recordedCompsText = encodeComps(gRecNew),
+                    epochWindowStartTs = epochTsOf(parsed.windowStartTs, effGLast, prevWindowStartTs),
+                )
             )
             val gLastDur = existing.snapshots[GLOBAL_DUR_SNAPSHOT_KEY]
             val effGDur = if (globalReset) null else gLastDur
+            val gDurRecCompsPrev = if (effGDur == null || reset) emptyMap() else recordedCompsOf(effGDur)
+            val gRawDurs = parsed.globals.mapValues { it.value.second.toDouble() }
+            val gDurRecNew = HashMap<String, Double>(gDurRecCompsPrev)
+            for ((k, v) in gRawDurs) gDurRecNew[k] = maxOf(gDurRecNew[k] ?: 0.0, v)
             snapshots.add(
                 BatterySnapshotEntity(
                     GLOBAL_DUR_SNAPSHOT_KEY,
                     parsed.globals.values.sumOf { it.second.toDouble() },
-                    encodeComps(parsed.globals.mapValues { it.value.second.toDouble() }),
+                    encodeComps(gRawDurs),
                     now,
+                    recordedCumMah = maxOf(recordedCumOf(effGDur), parsed.globals.values.sumOf { it.second.toDouble() }),
+                    recordedCompsText = encodeComps(gDurRecNew),
+                    epochWindowStartTs = epochTsOf(parsed.windowStartTs, effGDur, prevWindowStartTs),
                 )
             )
-            val prevComps = decodeComps(effGLast?.compsText ?: "")
-            val prevDurComps = decodeComps(effGDur?.compsText ?: "")
             val weights = dayWeights(deltaFrom(effGLast?.updatedTs, reset, parsed.windowStartTs, now), now, zone)
             for ((comp, pair) in parsed.globals) {
-                val nowV = pair.first
-                val prevV = if (effGLast == null || reset) 0.0 else (prevComps[comp] ?: 0.0)
-                val delta = (nowV - prevV).coerceAtLeast(0.0)
-                val nowDur = pair.second
-                val prevDur = if (effGDur == null || reset) 0L else (prevDurComps[comp]?.toLong() ?: 0L)
-                val durDelta = (nowDur - prevDur).coerceAtLeast(0L)
-                if (delta <= 0.01 && durDelta <= 0L) continue
+                val mahDelta = (pair.first - (gRecCompsPrev[comp] ?: 0.0)).coerceAtLeast(0.0)
+                val durDelta = (pair.second - (gDurRecCompsPrev[comp] ?: 0.0).toLong()).coerceAtLeast(0L)
+                if (mahDelta <= 0.0 && durDelta <= 0L) continue
                 for ((day, w) in weights) {
                     val ex = existing.global[globalKey(comp, day)]
                     globalRows.add(
                         BatteryGlobalEntity(
                             component = comp,
                             day = day,
-                            mah = (ex?.mah ?: 0.0) + delta * w,
+                            mah = (ex?.mah ?: 0.0) + mahDelta * w,
                             durationMs = (ex?.durationMs ?: 0L) + (durDelta * w).toLong(),
                         )
                     )
