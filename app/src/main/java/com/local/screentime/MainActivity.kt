@@ -212,27 +212,44 @@ private fun formatMinutes(ms: Long): String {
     return if (h > 0) "${h}小时${m}分钟" else "${m}分钟"
 }
 
+/** 一次「使用轮次」：span = 首段开始到末段结束的跨度；activeMs = 轮次内真实使用时长
+ *  （会话区间并集求和）。轮次合并（间隔 ≤90s 计一次打开）只影响“打开 N 次”计数，
+ *  绝不改写真实使用时长（v0.18，D：2026-09-15 QQ 65分19秒的真实使用曾被跨度显示成
+ *  95分35秒——空档 30分16秒 被当成了使用）。 */
+data class SessionRound(val start: Long, val end: Long, val activeMs: Long)
+
 /** 把碎片化会话折叠成“使用轮次”：相邻会话间隔 ≤ gapMs 视为同一次打开。
  *  事件流会把一次使用拆成几十段（推送/切 Activity），直接数段数会严重虚高
  *  “打开 N 次”（实测知乎 19.9 分钟被拆成 321 段）（v0.16.7）。 */
-private fun mergeSessionRounds(sessions: List<UsageSession>, gapMs: Long = 90_000L): List<Pair<Long, Long>> {
+internal fun mergeSessionRounds(sessions: List<UsageSession>, gapMs: Long = 90_000L): List<SessionRound> {
     if (sessions.isEmpty()) return emptyList()
     val sorted = sessions.sortedBy { it.startTs }
-    val out = ArrayList<Pair<Long, Long>>()
-    var cs = sorted[0].startTs
-    var ce = sorted[0].endTs
+    // 按间隔分组（组内任意相邻会话间隔 ≤ gapMs）
+    val groups = ArrayList<MutableList<UsageSession>>()
+    var cur = mutableListOf(sorted[0])
     for (i in 1 until sorted.size) {
         val s = sorted[i]
-        if (s.startTs - ce <= gapMs) {
-            ce = maxOf(ce, s.endTs)
-        } else {
-            out.add(cs to ce)
-            cs = s.startTs
-            ce = s.endTs
-        }
+        if (s.startTs - cur.last().endTs <= gapMs) cur.add(s)
+        else { groups.add(cur); cur = mutableListOf(s) }
     }
-    out.add(cs to ce)
-    return out
+    groups.add(cur)
+    // 每组：跨度 = min(start)..max(end)；active = 会话区间并集（ROOT 会话互不重叠，
+    // 并集防御 ROOT+API fallback 罕见重叠，绝不把空档计入使用）
+    return groups.map { g ->
+        val start = g.minOf { it.startTs }
+        val end = g.maxOf { it.endTs }
+        val iv = g.map { it.startTs to it.endTs }.sortedBy { it.first }
+        var active = 0L
+        var cs = iv[0].first
+        var ce = iv[0].second
+        for (i in 1 until iv.size) {
+            val (s, e) = iv[i]
+            if (s > ce) { active += ce - cs; cs = s; ce = e }
+            else ce = maxOf(ce, e)
+        }
+        active += ce - cs
+        SessionRound(start, end, active)
+    }
 }
 
 class MainActivity : ComponentActivity() {
@@ -634,7 +651,7 @@ fun UsageApp(
             item(key = "module_$id") {
                 Spacer(Modifier.height(12.dp))
                 when (id) {
-                    "hourly" -> HourlyModule(sessions, categories, textMeasurer, dark, zone)
+                    "hourly" -> HourlyModule(sessions, categories, textMeasurer, dark, zone, dayTotal)
                     "pickup" -> PickupModule(dayStats, unlockTop3, displays)
                     "battery" -> BatteryModule(batteryGlobal)
                     "apps" -> AppsModule(rows, hasPermission, displays, dayTotal)
@@ -953,11 +970,17 @@ fun UsageApp(
                                 .heightIn(max = 320.dp)
                                 .verticalScroll(rememberScrollState())
                         ) {
-                            rounds.forEach { (rs, re) ->
-                                val st = Instant.ofEpochMilli(rs).atZone(ZoneId.systemDefault()).format(timeFmt)
-                                val en = Instant.ofEpochMilli(re).atZone(ZoneId.systemDefault()).format(timeFmt)
+                            rounds.forEach { r ->
+                                val st = Instant.ofEpochMilli(r.start).atZone(ZoneId.systemDefault()).format(timeFmt)
+                                val en = Instant.ofEpochMilli(r.end).atZone(ZoneId.systemDefault()).format(timeFmt)
+                                val span = r.end - r.start
+                                // 主值永远是真实使用时长（activeMs）；跨度仅在明显大于使用时展示，
+                                // 用于解释「轮次含空档」（v0.18，D：QQ 65分19秒使用 ≠ 95分35秒跨度）
+                                val durationText = if (span - r.activeMs > 60_000) {
+                                    "${formatShort(r.activeMs)}（跨度 ${formatShort(span)}）"
+                                } else formatShort(r.activeMs)
                                 Text(
-                                    "$st – $en · ${formatShort(re - rs)}",
+                                    "$st – $en · $durationText",
                                     fontSize = 11.sp,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.padding(vertical = 2.dp)
@@ -978,12 +1001,34 @@ private fun HourlyModule(
     textMeasurer: androidx.compose.ui.text.TextMeasurer,
     dark: Boolean,
     zone: ZoneId,
+    dayTotalMs: Long,
 ) {
     UsageCard {
+        // D（v0.18）：回补总量无法定位到小时的部分如实单列，绝不合成虚假会话填图
+        val locatedMs = sessions.sumOf { it.endTs - it.startTs }
+        val unlocated = dayTotalMs - locatedMs
         if (sessions.isEmpty()) {
-            Text("暂无数据", fontSize = 12.sp, modifier = Modifier.padding(vertical = 20.dp))
+            if (unlocated > 60_000) {
+                Text(
+                    "本日 ${formatMinutes(dayTotalMs)} 全部来自系统总量回补，" +
+                        "事件明细缺失、无法按小时定位",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(vertical = 6.dp)
+                )
+            } else {
+                Text("暂无数据", fontSize = 12.sp, modifier = Modifier.padding(vertical = 20.dp))
+            }
         } else {
             HourlyChart(sessions, zone, categories, textMeasurer, dark)
+            if (unlocated > 60_000) {
+                Text(
+                    "另有 ${formatMinutes(unlocated)} 为系统总量回补，无法定位到小时（未计入上图）",
+                    fontSize = 10.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 4.dp)
+                )
+            }
         }
     }
 }
