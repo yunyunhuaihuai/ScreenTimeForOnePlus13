@@ -19,8 +19,10 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         DayStatsEntity::class,
         UnlockStatsEntity::class,
         ReportEntity::class,
+        UidPackageEntity::class,
+        CaptureLogEntity::class,
     ],
-    version = 8,
+    version = 9,
     // 导出 schema：今后每次升版本都有历史 schema 可依据，能写真正的增量迁移；
     // 配合下面的注释，destructive fallback 只保留给 4 之前的存量老库
     exportSchema = true,
@@ -61,6 +63,49 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_8_9 = object : Migration(8, 9) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // —— B（P0-2/P1-1）快照分离「原始观测」与「已入账高水位」：同 epoch 模型回算
+                //    （100→97→100）不再二次入账；微量增量不再因阈值+快照推进而永久丢失。
+                //    历史行先令高水位 = 原始观测，保证升级后第一帧的差分与旧语义连续。
+                db.execSQL("ALTER TABLE battery_snapshot ADD COLUMN recordedCumMah REAL NOT NULL DEFAULT -1.0")
+                db.execSQL("ALTER TABLE battery_snapshot ADD COLUMN recordedCompsText TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE battery_snapshot ADD COLUMN epochWindowStartTs INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("UPDATE battery_snapshot SET recordedCumMah = cumMah, recordedCompsText = compsText")
+                // —— I（P2-1）组件明细完整：KNOWN_COMPS 已含却无处落库的四个组件
+                //    （真机 UID1000 flashlight=1.34 曾被静默丢弃；修组件完整性，非 total 少记）
+                db.execSQL("ALTER TABLE battery_daily ADD COLUMN flashlightMah REAL NOT NULL DEFAULT 0.0")
+                db.execSQL("ALTER TABLE battery_daily ADD COLUMN ambientDisplayMah REAL NOT NULL DEFAULT 0.0")
+                db.execSQL("ALTER TABLE battery_daily ADD COLUMN idleMah REAL NOT NULL DEFAULT 0.0")
+                db.execSQL("ALTER TABLE battery_daily ADD COLUMN phoneMah REAL NOT NULL DEFAULT 0.0")
+                // —— F（P1-3）事件统计来源：API 残缺流不得覆盖 ROOT 完整日计数
+                db.execSQL("ALTER TABLE day_stats ADD COLUMN source INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE unlock_stats ADD COLUMN source INTEGER NOT NULL DEFAULT 0")
+                // —— G（P1-4）报告数据修订版本 + 文本格式版本
+                db.execSQL("ALTER TABLE reports ADD COLUMN dataRevision INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE reports ADD COLUMN formatVersion INTEGER NOT NULL DEFAULT 1")
+                // —— H（P1-5）UID 成员历史存档：采集时持久化归属，历史数据不随当前安装状态漂移
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `uid_packages` (" +
+                        "`uidKey` TEXT NOT NULL, `packageName` TEXT NOT NULL, " +
+                        "`firstSeenTs` INTEGER NOT NULL, `lastSeenTs` INTEGER NOT NULL, " +
+                        "PRIMARY KEY(`uidKey`, `packageName`))"
+                )
+                // —— C（P2-2）有界采集日志：区分 attempt/command/observed 时刻与时区/epoch 证据
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `capture_log` (" +
+                        "`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
+                        "`ts` INTEGER NOT NULL, `attemptTs` INTEGER NOT NULL, " +
+                        "`commandStartTs` INTEGER NOT NULL, `commandEndTs` INTEGER NOT NULL, " +
+                        "`zoneId` TEXT NOT NULL, `source` INTEGER NOT NULL, `outcome` TEXT NOT NULL, " +
+                        "`epochWindowStartTs` INTEGER, `uidCount` INTEGER NOT NULL, `globalCount` INTEGER NOT NULL, " +
+                        "`computedDrainMah` REAL NOT NULL, `actualDrainLowMah` REAL, `actualDrainHighMah` REAL, " +
+                        "`sumUidTotalMah` REAL NOT NULL, `detail` TEXT NOT NULL)"
+                )
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_capture_log_ts` ON `capture_log` (`ts`)")
+            }
+        }
+
         fun get(context: Context): AppDatabase =
             instance ?: synchronized(this) {
                 instance ?: Room.databaseBuilder(
@@ -68,7 +113,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "screentime.db",
                 )
-                    .addMigrations(MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8)
+                    .addMigrations(MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9)
                     // v0.17.0（P0-5）：移除全局 fallbackToDestructiveMigration——
                     // 对长期历史记录应用，缺迁移就该显式失败，而不是静默清库。
                     // 仅 v1-3 例外：它们是早期开发版本、schema 未归档（schemas/ 只有 4.json 起，

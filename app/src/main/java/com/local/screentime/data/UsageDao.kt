@@ -161,4 +161,32 @@ interface UsageDao {
 
     @Query("SELECT COALESCE(SUM(totalMah), 0) FROM battery_daily WHERE day BETWEEN :from AND :to")
     suspend fun batteryBetween(from: Long, to: Long): Double
+
+    // —— UID 成员历史（v9，P1-5）：采集时持久化，读取时按有效期解析历史归属 ——
+
+    @Upsert
+    suspend fun upsertUidPackages(rows: List<UidPackageEntity>)
+
+    @Query("SELECT * FROM uid_packages WHERE uidKey IN (:uidKeys)")
+    suspend fun uidPackagesForKeys(uidKeys: List<String>): List<UidPackageEntity>
+
+    @Query("SELECT * FROM uid_packages WHERE uidKey = :uidKey")
+    suspend fun uidPackagesFor(uidKey: String): List<UidPackageEntity>
+
+    // —— 有界采集日志（v9，P2-2） ——
+
+    @Insert
+    suspend fun insertCaptureLog(row: CaptureLogEntity)
+
+    /** 只保留最近 limit 条（有界，控制磁盘占用） */
+    @Query("DELETE FROM capture_log WHERE id NOT IN (SELECT id FROM capture_log ORDER BY id DESC LIMIT :limit)")
+    suspend fun pruneCaptureLog(limit: Int)
+
+    @Query("SELECT * FROM capture_log ORDER BY id DESC LIMIT :limit")
+    suspend fun recentCaptureLogs(limit: Int): List<CaptureLogEntity>
+
+    // —— 诊断 / 审计 ——
+
+    @Query("SELECT * FROM battery_daily")
+    suspend fun allBatteryDaily(): List<BatteryDailyEntity>
 }

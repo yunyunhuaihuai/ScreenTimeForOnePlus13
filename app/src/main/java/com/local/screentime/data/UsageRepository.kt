@@ -1051,6 +1051,10 @@ class UsageRepository(
                 wakelockMah = rows.sumOf { it.wakelockMah },
                 sensorsMah = rows.sumOf { it.sensorsMah },
                 mobileMah = rows.sumOf { it.mobileMah },
+                flashlightMah = rows.sumOf { it.flashlightMah },
+                ambientDisplayMah = rows.sumOf { it.ambientDisplayMah },
+                idleMah = rows.sumOf { it.idleMah },
+                phoneMah = rows.sumOf { it.phoneMah },
                 otherMah = rows.sumOf { it.otherMah },
             )
         }

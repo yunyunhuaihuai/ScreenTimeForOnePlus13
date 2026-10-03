@@ -96,6 +96,7 @@ class RoomMigrationTest {
             .addMigrations(
                 AppDatabase.MIGRATION_4_5, AppDatabase.MIGRATION_5_6,
                 AppDatabase.MIGRATION_6_7, AppDatabase.MIGRATION_7_8,
+                AppDatabase.MIGRATION_8_9,
             )
             .allowMainThreadQueries()
             .build()
@@ -172,5 +173,82 @@ class RoomMigrationTest {
         )
         assertEquals(false, dao.getReport("WEEKLY", "W:2026-09-21")!!.finalized)
         assertTrue(true)
+    }
+
+    /** v8 建表语句 = v4 结构 + 4→5(fgsMah)/5→6(finalized)/6→7(mobileMah)/7→8(sessions.source) 四列 */
+    private fun createLegacyV8Db(): SQLiteDatabase {
+        context.deleteDatabase(dbName)
+        val path = context.getDatabasePath(dbName).absolutePath
+        val db = SQLiteDatabase.openOrCreateDatabase(path, null)
+        v4Sql.forEach(db::execSQL)
+        db.execSQL("ALTER TABLE battery_daily ADD COLUMN fgsMah REAL NOT NULL DEFAULT 0.0")
+        db.execSQL("ALTER TABLE reports ADD COLUMN finalized INTEGER NOT NULL DEFAULT 1")
+        db.execSQL("ALTER TABLE battery_daily ADD COLUMN mobileMah REAL NOT NULL DEFAULT 0.0")
+        db.execSQL("ALTER TABLE sessions ADD COLUMN source INTEGER NOT NULL DEFAULT 0")
+        db.version = 8
+        return db
+    }
+
+    @Test
+    fun migrate8To9_currentDeviceState_valuePreservedAndHighWaterSeeded() = runBlocking {
+        // 真机当前存量形态：v8（0.17.1）。本轮所有新列/新表都以「值级保全」为验收。
+        createLegacyV8Db().use { db ->
+            seedAllTables(db)
+            // 模拟真机实际数据形态：共享 UID 行 packageName=null、fgs/mobile 已有值
+            db.execSQL("INSERT INTO battery_daily (uidKey, day, packageName, totalMah, fgMah, bgMah, fgsMah, " +
+                "screenMah, cpuMah, audioMah, videoMah, cameraMah, gnssMah, wifiMah, btMah, wakelockMah, " +
+                "sensorsMah, mobileMah, otherMah) VALUES " +
+                "('u0a398', 20657, NULL, 3.5, 0,0, 1.2, 0,0,0,0,0,0,0,0,0,0, 0.4, 0.1)")
+            db.execSQL("INSERT INTO battery_snapshot (uidKey, cumMah, compsText, updatedTs) " +
+                "VALUES ('u0a398', 3.5, 'screen=1.2|fg=0.5', 2000)")
+            db.execSQL("INSERT INTO reports (type, periodKey, generatedTs, text, finalized) " +
+                "VALUES ('MONTHLY', 'M:2026-9', 1790000000000, '9月月报', 1)")
+        }
+
+        val dao = buildRoom().usageDao()  // 触发 8→9 + Room schema 校验
+
+        // 既有行值级保全
+        val bili = dao.getBatteryDaily("u0a334", 20656)!!
+        assertEquals(247.5, bili.totalMah, 1e-9)
+        assertEquals(28.8, bili.fgMah, 1e-9)
+        val shared = dao.getBatteryDaily("u0a398", 20657)!!
+        assertNull("共享 UID 行 packageName=null 保留", shared.packageName)
+        assertEquals(3.5, shared.totalMah, 1e-9)
+        assertEquals(1.2, shared.fgsMah, 1e-9)
+        // 新组件列默认 0
+        assertEquals(0.0, shared.flashlightMah, 1e-9)
+        assertEquals(0.0, shared.ambientDisplayMah, 1e-9)
+        assertEquals(0.0, shared.idleMah, 1e-9)
+        assertEquals(0.0, shared.phoneMah, 1e-9)
+        // 快照：原始观测保全 + 高水位种子 = 原始观测（升级后第一帧差分与旧语义连续）
+        val snap = dao.getBatterySnapshot("u0a334")!!
+        assertEquals(247.5, snap.cumMah, 1e-9)
+        assertEquals("recordedCumMah 迁移种子 = cumMah", 247.5, snap.recordedCumMah, 1e-9)
+        assertEquals("recordedCompsText 迁移种子 = compsText", "fg=28.8", snap.recordedCompsText)
+        assertEquals("历史快照 epoch 标记 = 0（未知）", 0L, snap.epochWindowStartTs)
+        val snap2 = dao.getBatterySnapshot("u0a398")!!
+        assertEquals(3.5, snap2.recordedCumMah, 1e-9)
+        assertEquals("screen=1.2|fg=0.5", snap2.recordedCompsText)
+        // 统计表 source 默认 LEGACY(0)
+        assertEquals(0, dao.getDayStats(20656)!!.source)
+        assertEquals(0, dao.unlockTop(20656, 10)[0].source)
+        // 报告：文本与 finalized 保全，修订/格式版本默认旧值（后续由重建逻辑刷新）
+        val report = dao.getReport("MONTHLY", "M:2026-9")!!
+        assertEquals("9月月报", report.text)
+        assertEquals(true, report.finalized)
+        assertEquals(0L, report.dataRevision)
+        assertEquals(1, report.formatVersion)
+        // 新表可写可查
+        dao.upsertUidPackages(listOf(com.local.screentime.data.UidPackageEntity("u0a398", "com.a", 100, 200)))
+        assertEquals(1, dao.uidPackagesFor("u0a398").size)
+        dao.insertCaptureLog(
+            com.local.screentime.data.CaptureLogEntity(
+                ts = 1, attemptTs = 1, commandStartTs = 1, commandEndTs = 1, zoneId = "Asia/Shanghai",
+                source = 1, outcome = "SUCCESS", epochWindowStartTs = null, uidCount = 0, globalCount = 0,
+                computedDrainMah = 0.0, actualDrainLowMah = null, actualDrainHighMah = null,
+                sumUidTotalMah = 0.0, detail = "",
+            )
+        )
+        assertEquals(1, dao.recentCaptureLogs(10).size)
     }
 }
