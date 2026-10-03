@@ -7,9 +7,9 @@
 一台一加 13（ColorOS 15）上用"冰箱"冻结应用后，**系统自带屏幕使用时间不再显示这些应用的时长**（展示层过滤）。本项目自建记录器：跨三层混合数据源重建完整的使用时长 + 耗电统计，**冻结应用照样显示**，并逐步加入 iOS 屏幕时间风格的可视化。
 
 - 目标设备：OnePlus 13（PJZ110），ColorOS 15 / Android 15（API 35），KernelSU root，屏幕 1440×3168
-- 包名：`com.local.screentime`，应用名“屏幕时间”，当前 v0.17.1（versionCode 33）
+- 包名：`com.local.screentime`，应用名“屏幕时间”，当前 v0.18.0（versionCode 34）
 - 工程：本仓库根目录；技术栈 Kotlin + Compose(M3) + Room + WorkManager + libsu，无 NDK
-- minSdk/targetSdk/compileSdk = 35；数据库 Room v8（显式迁移 MIGRATION_4_5/5_6/6_7/7_8，schema JSON 已入库 schemas/，**已移除全局销毁式迁移**——v4+ 升级必须写显式 Migration，缺迁移会显式失败而不是清库）
+- minSdk/targetSdk/compileSdk = 35；数据库 Room v9（显式迁移 MIGRATION_4_5/5_6/6_7/7_8/8_9，schema JSON 已入库 schemas/，**已移除全局销毁式迁移**——v4+ 升级必须写显式 Migration，缺迁移会显式失败而不是清库）
 
 ## 2. 构建与部署
 
@@ -42,14 +42,17 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/release/app-release.apk
 展示策略：**事件重建值与聚合值逐包取 max**（`dailyRows()`）。
 耗时统计写入 `sessions` 表 + `usage_daily` 聚合表；耗电写入 `battery_daily` / `battery_global`（快照差分，充满清零自动检测：新值<旧值-0.5 即重置）。
 
-### 表结构（Room v6）
-- `sessions(pkg, startTs, endTs, day)` —— 会话（RESUMED/PAUSED 配对，跨午夜切分，<2s 碎片丢弃；重建时按 startTs >= windowStart 清除，保留跨左边界的历史会话）
+### 表结构（Room v9）
+- `sessions(pkg, startTs, endTs, day, source[0LEGACY/1ROOT/2API])` —— 会话（RESUMED/PAUSED 配对，跨午夜切分，<2s 碎片丢弃但同包 ≤2s 短段先合并；缺关闭事件时尾段延伸到可信采集上界；重建时按 startTs >= windowStart 清除，保留跨左边界的历史会话）
 - `usage_daily(pkg, day, totalMs, source[0事件/1聚合API/2root])` —— 每日每包时长
-- `battery_daily(uidKey, day, total/fg/bg/fgs/screen/cpu/audio/video/camera/gnss/wifi/bt/wakelock/sensors/other mAh)` —— 每日每 UID 耗电（v0.16.14 扩展 fgsMah 前台服务耗电；**v0.17.0 起共享 UID（多包同 UID）的行 packageName=null，不归属给任意单个包**）
+- `battery_daily(uidKey, day, total/fg/bg/fgs/screen/cpu/audio/video/camera/gnss/wifi/bt/wakelock/sensors/mobile/flashlight/ambientDisplay/idle/phone/other mAh)` —— 每日每 UID 耗电（v0.16.14 fgsMah；v0.17 mobileMah；**v0.18 补 flashlight/ambientDisplay/idle/phone 四列**，组件字段全映射；**v0.17.0 起共享 UID 行 packageName=null**）
 - `battery_global(component, day, mah, durationMs)` —— 整机组件耗电（屏幕/CPU/蓝牙/音频/GNSS/息屏显示…；durationMs 持续差分累加）
-- `battery_snapshot(uidKey, cumMah, compsText, ts)` —— 差分基线（含 `__global__` 与 `__global___dur`）
-- `app_info`（label/图标快照，冻结后仍可显示）、`sync_state`（事件水位线 + **v0.17.0 起的同步/采样诊断状态**：last_usage_source、last_battery_source、last_sync_success_ts、cap_* 采样健康）
-- `reports(type, periodKey, generatedTs, text, finalized)` —— v6 新增 finalized（1=正式，0=当前周期预览；列默认 1，既有报告按正式历史保留）
+- `battery_snapshot(uidKey, cumMah, compsText, ts, recordedCumMah, recordedCompsText, epochWindowStartTs)` —— 差分基线（含 `__global__`/`__global___dur`）；**v0.18 起原始观测(cumMah/compsText)与已入账高水位(recorded*)分离**，epochWindowStartTs 记录所属 epoch
+- `uid_packages(uidKey, packageName, firstSeenTs, lastSeenTs)` —— **v0.18 新增**：采集时 UID→包名成员存档，历史归属按有效期解析（不随当前安装状态漂移）
+- `capture_log(id, ts, attemptTs, commandStartTs, commandEndTs, zoneId, source, parserVersion, ledgerVersion, outcome, epochWindowStartTs, uidCount, ...)` —— **v0.18 新增**：有界（64 条）结构化采集日志，区分 attempt/command/observed 时刻
+- `app_info`（label/图标快照，冻结后仍可显示）、`sync_state`（事件水位线 + 同步/采样诊断状态：last_usage_source、last_battery_source、last_usage/battery_success/fail_ts、cap_* 采样健康、battery_window_start_ts epoch 标记、battery_lost_tail_* 不可恢复尾段、data_revision 数据修订版本、parser_baseline_uid_count 解析基线）
+- `day_stats(day, pickups, source)`、`unlock_stats(day, packageName, count, source)` —— **v0.18 加 source**：ROOT 权威可整日原子替换，API 残缺流不覆盖 ROOT 完整日
+- `reports(type, periodKey, generatedTs, text, finalized, dataRevision, formatVersion)` —— v6 finalized；**v0.18 加 dataRevision/formatVersion**：数据修订或文案格式落后时静默重建
 
 ### 展示与报告的唯一口径（v0.17.0）
 `effective usage = 逐包逐日 max(会话聚合, usage_daily 回补值)`，实现在 `UsageDao.effectiveUsageDay/effectiveUsageBetween`；首页 `dailyRows`、周报/月报/年报的总量/Top/环比共用同一查询——UI 与报告不再各自维护一套逻辑，历史回补日（2026-09-04～09-12）数据计入报告。
@@ -72,6 +75,162 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/release/app-release.apk
 - 每 6h WorkManager 后台对账；打开即先读本地库秒出、再后台同步（同步已去掉无用的 --checkin 解析，~1-2s）；Doze 白名单（root 自动添加）
 - ~~诊断导出（菜单）~~：**实际不可达**——`UsageRepository.diagnosticJson(day)` 实现完整（当天会话+聚合+root/权限状态 JSON），但标题栏 ⋮ 按钮没有任何弹窗入口，属死代码。详见 4.0.7。
 - 应用名"屏幕时间"，自适应图标（蓝底白时钟+黄色弧）
+
+## 4.0.18 v0.18.0 变更（数据准确性与采集可靠性专项：agent/v017-data-integrity 分支续）
+
+基线 = 上一轮 HEAD ca1c973（v0.17.1/vc33，Room v8）。本轮针对 2026-10-03 本机取证审查
+（`analysis/2026-10-03-data-integrity/accuracy-review.txt`）列出的 9 组准确性/可靠性问题
+（A–I）逐项闭环：历史不丢、增量不重复、采集缺口可见、不同展示口径可解释。数据库
+Room v8→v9（MIGRATION_8_9，值级保全测试覆盖真机存量形态）。**所有修复先写能证明真实
+问题的回归测试再改**；JVM/Robolectric 171 tests 全过；assembleDebug/Release 产物复核
+versionCode=34/versionName=0.18.0。手机未连接，真机回归项明确标注「待验证」。
+
+### A（P0-1 复审）诊断基线按 epoch 隔离
+- **问题**：`CaptureDiagnostics` 对所有帧先应用 `parsed < baseline*0.5` 再谈 epoch——旧
+  142 UID 基线遇到新充电窗口合法的 20 UID 帧会被拒绝，epoch 标记与健康基线永远无法推进；
+  且 `computed=0` 被一概当作解析失败（刚充满的合法帧 drain 就是 0）。
+- **修复**：`detectAnomalies` 增加 epoch 参数，`uid_count_drop` 只对 SAME/UNKNOWN 生效，
+  RESET 帧不继承旧窗口 UID 下限；`BatteryParsed.computedDrainPresent` 区分「drain 行存在
+  但值为 0」（合法零耗电）与「整行缺失」（结构截断）；解析健康基线（UID 数/有无窗口）从
+  syncBattery 预提交点挪进 `applyBatteryLedgerTx`，与 epoch 标记/快照/日账本**同事务**推进，
+  门控拒绝或事务失败都不推进已接受基线。PARSER_VERSION 3→4。
+- **测试**：BatteryCaptureEntryTest 穿过真实 syncBattery 入口+诊断门控+Room 事务（旧142→
+  新20→同新30 全成功 / 同epoch截断拒绝且基线不动 / 重试入账 / 重复帧零增量 / UID 延迟重现
+  不与旧基线做差）。
+
+### B（P0-2/P1-1）账本高水位记账——回落不二次累计、微量增量守恒
+- **问题**：`max(new-old,0)` 后写回更低快照，100→97→100 会再记 3（二次入账）；`delta<=0.001`
+  跳过落库但快照已推进，100 次各 +0.0005 永久丢失 0.05 mAh。
+- **修复（原始观测与已入账高水位分离）**：battery_snapshot 新增 `recordedCumMah`/
+  `recordedCompsText`（已入账高水位）与原始观测 `cumMah`/`compsText` 并存；每帧增量一律
+  `max(0, 观测−高水位)`——同 epoch 模型回算不推进高水位，恢复时增量为 0（不二次入账）；
+  **取消记录阈值**，存储层任何有限正增量都落库（阈值只留给展示层）；total 无变化时组件/
+  fg-bg-fgs/global功率/global时长的独立变化照常入账（各自高水位）。
+- **选择与局限（记录在案）**：高水位对「模型永久下调且不再恢复」的极端情形会高估（上限=
+  回调幅度，实测 ~2% smear）；不做带符号回冲——负增量无法在 dayWeights 时间归属下无歧义
+  落到某一天，且会改写已提交历史行。账本不变量 `ledgerInconsistencies` 持续监督；历史 46 条
+  screen>total 行保留诊断、**不擅自用 maxComponent 反推真实 total**（无原始采集帧证据）。
+- **测试**：dip/recover 全序列（total/组件/fg-bg-fgs/global/global时长）、100×+0.0005 累计
+  0.05、total=0 组件变化、迁移兜底（recorded* 未初始化按旧语义取原始观测）、epoch 标记。
+
+### C（P2-2）采集健康与数据覆盖成为可核验状态
+- **时间语义**：attempt/commandStart/commandEnd(=观测时刻) 全部在**拿到进程锁之后**取值；
+  差分日归属与成功时间戳用观测时刻（commandEnd），不再复用拿锁前的 now（跨午夜会记错日）；
+  `UsageRepository.nowMs` 可注入时钟供测试。健康状态持锁**重新从 sync_state 读取**（删除
+  实例缓存），多实例交替写入不再互相覆盖。
+- **syncNow 诚实记录**：battery 分支与 captureBatteryNow 共用同一健康状态机（此前 syncNow
+  不更新 cap_*）；只有真正观测到数据（root 事件或 API 事件非空）才写 last_usage_success 并
+  清错误，否则记 last_usage_fail_ts + 原因——此前 source 错误/空 API/捕获异常后仍无条件写成功。
+- **有界采集日志 capture_log（64 条）**：每次尝试一行，区分 attempt/command/observed 时刻、
+  时区、epoch 证据、parser/ledger 版本、解析画像与失败原因（结构化可审计观测）。
+- **不可恢复尾段**：epoch RESET 成功提交时记录 `[上次成功采集, 新窗口起点]`——充电重置丢弃
+  的估算耗电有明确覆盖缺口证据（diagnosticJson `battery.lostTail`）。
+- **首页紧凑状态行**：大数字下方「数据更新至 / 耗电采集(通道) / 采样实际最大间隔」；超 12h
+  无成功观测提示可能中断（**Android 15 强停后应用自身无法后台运行，需用户打开一次恢复**，
+  不做自动运行承诺）。报告对无观测日不输出成可信 0（见 G）。
+- **采集健康诊断与账本现存异常分开**：diagnosticJson `captureHealth`/`captureLog` 与
+  `ledgerAudit`（全库现存违反行扫描，历史告警是否已解除可查）分段呈现。
+
+### D（P1-4）轮次与真实使用时长分离
+- **问题**：明细把合并区间**跨度**当使用时长——9/15 QQ 真实 65分19秒显示成跨度 95分35秒
+  （空档 30分16秒 被计入）；9/24 微信一轮真实 16分17秒显示 26 分钟（跨度 26分37秒）。
+- **修复**：`mergeSessionRounds` 返回 `SessionRound(start,end,activeMs)`，activeMs = 轮次内
+  会话区间**并集**（对 ROOT+API 罕见重叠防御性取并集，绝不把空档计入使用）；明细主值显示
+  真实使用时长，跨度仅在明显大于使用时附加「（跨度 X）」。小时图对总量回补日无法定位到小时
+  的部分如实单列「另有 N 分钟为系统总量回补，无法定位到小时」，**不合成虚假会话填图**。
+- **测试**：SessionRoundsTest（10:00-10:01+10:02-10:03 → 1轮/使用2分/跨度3分、QQ 样例
+  active=会话合计、重叠取并集、间隔分组边界）。
+
+### E（P1-2）ROOT 未闭合尾段与短会话
+- **问题**：`syncViaRoot` 用「最后事件时间」当窗口结束——最后事件是 RESUMED、其后无关闭
+  事件时仍前台会话尾段被截断；同帧多 Activity 三连把一次使用拆成多个 1 秒段被逐段丢弃。
+- **修复**：`buildSessions(events, windowStart, trustedEnd, source)` 第三参数改为「可信采集
+  上界」=本次采集实际时刻；缺关闭事件时按**暂定尾段**延伸到 trustedEnd，root 每次全量重建
+  窗口后续事件自然纠正（**不宣称长尾精准**——缺关闭事件与真实仍前台在单帧内不可区分，已写入
+  注释）；同包相邻会话间隔 ≤2s（dump 秒级精度）先合并再套 2 秒最小阈值，Activity 切换碎片
+  不再无差别丢弃，独立秒级噪声（前后大空档）仍过滤。滑动窗口左边界/跨午夜/息屏不计前台保持。
+- **真机量化（本机取证 usagestats.txt，4746 事件，脱敏不入测试）**：旧算法 776 会话/16,806s，
+  新算法 422 会话/16,993s——净回收约 187s（其中 ~60s 尾段上界修正、~127s Activity 切换碎片
+  回收），其余片段属独立噪声保持过滤。**与审查「376 段/376 秒」一致，不夸大为全部真实漏记**。
+- **测试**：SessionBuildTest 9 场景（末帧 RESUMED 尾段/正常关闭/息屏/跨午夜/多 Activity 同戳
+  合并/独立噪声过滤/同帧重复/双开同包/API 路径上界一致）。
+
+### F（P1-3）拿起/首开统计按来源与覆盖原子替换
+- **问题**：API fallback 保护只覆盖 sessions，拿起/首开仍是整行 REPLACE 且无来源——多日残缺
+  API 流可把完整 ROOT 日统计覆盖偏小；首日跳过仅防左边界不防数据源降级；REPLACE 不清除已
+  消失包的首开旧行。
+- **修复**：day_stats/unlock_stats 落库来源（v9 source 列）；写入经 `planDayEventStatsWrites`
+  纯函数计划——可写日 = 窗口从本地零点完整覆盖 或 该日是「今天」（已过时段被窗口完整覆盖）；
+  窗口首日部分覆盖不替换；API 来源只写「无任何已存行」或「已是 API」的日期，ROOT/LEGACY 权威
+  日一律保护；ROOT 可写任何可写日（**可纠错，不以 max 锁死历史过计数**）；替换在单事务内先删
+  该日全部行再插入（已消失包首开旧行随之清除）；ROOT 纠错实际改变值时 bumpDataRevision。
+- **测试**：DayStatsSourceTest（计划器 4 场景 + 入口级 2 场景：整日替换清除消失包 /
+  ROOT完整→API残缺→ROOT恢复）。
+
+### G（P1-4）正式报告与数据修订一致
+- **问题**：环比按「本期天数向前平移」（30 天月比较到上月中间、闰年不正确）；9/12 提前生成、
+  finalized=1 的 Y:2026 旧年度报告仍冒充正式结论；存量月报仍是旧「总耗电」文案；ROOT 修正/
+  回补后报告不自动失效；9/25~9/28 无观测日被当成可信 0 参与日均与环比。
+- **修复**：`ReportPeriods.previousPeriod` 环比按上一自然周/月（28/30/31 与闰年自动对齐）/年；
+  预览对照上一周期同期天数；`periodFromKey` 重建周期，启动时 `demotePrematureFinalizedReports`
+  把「周期未结束却 finalized=1」的存量报告降级为预览（周期已结束的过早报告由正式化重生成处理）；
+  `needsFinalizedGeneration` 扩展数据修订版本/文本格式版本落后也触发**静默重建**（通知仅限最新
+  周期「新正式化」，不重复打扰）；报告新增「数据覆盖：X/Y 天」，未观测日明确不计为使用，上一
+  周期完全无观测时不输出「（新增）」改「（上一周期无数据）」。REPORT_FORMAT_VERSION=2。
+- **定向验证（P2-2）**：usage_daily 清理挪到回补导入**之前**——两标志均缺失的新库先导入后清理
+  不再删掉刚导入的回补（该路径当前手机未触发，存量未受影响）。
+- **测试**：ReportRevisionTest 7 场景 + ReportPeriodsTest 既有 18 场景保持通过。
+
+### H（P1-5）历史 UID 归属不被当前安装状态重写
+- **问题**：读历史耗电用当前 `getPackagesForUid()`，忽略采集时归属——共享 A+B 后 B 卸载旧记录
+  可能全归 A；卸载唯一包历史消失；UID 复用把旧耗电挂给新包。
+- **修复**：新表 uid_packages（v9），采集成功时 `persistUidPackages` 持久化每个 UID 当时的包
+  成员及有效期 [firstSeenTs,lastSeenTs]；`historicalOwnerOf` 按「该日有效」存档解析（唯一→归属；
+  多包→共享不拆分；有存档但该日无覆盖→不确定不猜；从未存档的旧行→回退 current pm 现状兼容）；
+  batteryForPackages 归属优先级 = **行上冻结的 packageName（采集时归属，v9 前历史行唯一可靠
+  证据，卸载后 current pm 查不到也不丢历史）** → 成员存档按日解析 → current pm；sharedUidLabel
+  支持按日用存档展示。**旧行来源无法追溯则保留不确定，不盲目回填**。
+- **测试**：UidPackagesTest 7 场景（A+B共享→B卸载不拆分 / 唯一→卸载保留历史 / UID复用按区间
+  解析 / 唯一→后续共享按日 / 分身 user0+user999 聚合求和不双计 / 无存档旧行回退 / 冻结
+  packageName 优先于 current pm）。
+
+### I（P2-1/P2-2）组件明细完整、估算语义、证据保存
+- **组件映射表 COMPONENT_COLUMNS**：每个已解析字段**有且仅有一个**存储目的地；battery_daily
+  新增 flashlight/ambient_display/idle/phone 四列（KNOWN_COMPS 已含却无处落库，真机 UID1000
+  flashlight=1.34 曾被静默丢弃——修组件完整性，非 total 少记）；bluetooth/bt 别名同列求和；
+  未知字段唯一兜底 otherMah。**真机取证 dump 验证：163 UID 全部组件字段 unmappedComps=[]，
+  UID1000 flashlight=1.34 已入列**。
+- **快照记录 epoch**（epochWindowStartTs）+ 有界采集日志（parser/ledger 版本随帧落盘）。
+- **估算语义**：保留 actual 区间/computed/UID 归因不同口径，禁止将重叠 UID/global 相加；报告
+  「应用归因耗电（UID 模型估算，非整机实际耗电）」；跨日累计按 dayWeights 墙钟均摊标估计。
+
+### 数据库 v8→v9（MIGRATION_8_9，schema 9.json 入库）
+- battery_snapshot +recordedCumMah/recordedCompsText/epochWindowStartTs（高水位与原始观测分离）；
+  battery_daily +flashlight/ambientDisplay/idle/phoneMah；day_stats/unlock_stats +source；
+  reports +dataRevision/formatVersion；新表 uid_packages、capture_log。
+- 迁移测试覆盖 v8（真机当前形态）→9 全表值级保全 + 高水位种子=cumMah（升级后首帧差分与旧
+  语义连续）；旧迁移链 4→8 测试保持通过；RoomMigrationTest 全链。
+
+### 真机取证 dump 离线验证（本机 analysis/ 只读副本，脱敏数值入测试）
+- `batterystats-charged.txt`：parseBatteryPower 得 **163 UID / 12 global / computedDrain=2094 /
+  windowStart=2026-10-02 18:05:44**，与审查基线逐项吻合；`unmappedComps=[]`、`UID1000
+  flashlight=1.34` 已映射；新账本对真实帧首同步 `LEDGER_INCONSISTENT=0`（46 条历史异常不复现）。
+- `usagestats.txt`：4746 事件，新旧会话算法对比见 E（净回收 ~187s）。
+
+### 待真机验证（手机未连接，不得标注通过）
+1. **自然充电 epoch 切换**（模拟插电 unplug→set ac 不触发该 ROM 窗口重置）：观察 epoch 标记
+   更新、旧快照全清、当帧 UID 全量入账（抖音式 148→15 吞量不再发生）；epoch 首帧缺席 UID
+   延迟重现不与旧基线做差。
+2. **高水位记账**：同 epoch 连续采集回落→恢复不二次入账；微量增量累计入库；多次振荡不增长。
+3. **采集健康**：强停后打开应用，首页状态行从「中断」恢复到「数据更新至」；diagnosticJson
+   captureLog/lostTail/ledgerAudit 与实际一致；syncNow 无观测时不写假成功。
+4. **事件统计来源**：root 失效降级期 API 残缺流不覆盖 ROOT 完整日拿起/首开；root 恢复可纠错。
+5. **报告**：周一/次月 1 日上一周期补生成；旧进行中 Y:2026 降级为预览；数据修订后相关报告
+   静默重建且文案更新为「应用归因耗电」；无观测日报告显示覆盖天数不误报下降。
+6. **归属**：卸载应用后历史耗电仍在（不消失）；UID 复用后旧/新耗电按日各归其主；分身双 UID
+   聚合展示；共享 UID 不拆分。
+- **严禁**：`dumpsys batterystats --reset`/`--reset-all`；给 UID 功率乘经验系数；把 Actual−
+  Computed 缺口按比例摊给 App；为迁移清库；用 maxComponent 反推真实 total。
 
 ## 4.0.16 v0.17.0 变更（数据正确性与可靠性专项：agent/v017-data-integrity 分支）
 
@@ -472,11 +631,12 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/release/app-release.apk
 2. **正式数据导出**：SQLite backup / JSON / CSV / diagnostic bundle（Storage Access Framework），导出 schema 必须带 version 字段；不得把设备敏感信息、本机绝对路径、ADB serial、密钥写入仓库。
 3. **Shizuku 后端**：基于 P1-3 的 PrivilegedCommandRunner 接口实现 ShizukuCommandRunner，独立 PR。
 4. **checkin batterystats 真机对账（P1-4 收尾）**：拿 OnePlus 13 真机 `dumpsys batterystats -c` 原始样本逐行对账（注意 `-c` 与 `--checkin` 语义不同），对账通过前 CheckinBatteryParser 不接入生产。**严禁运行 `dumpsys batterystats --reset` / `--reset-all`。**
-5. **shared UID 展示优化（可选）**：uid_packages 持久化映射（当前为显示时动态解析，卸载后历史行退化为「共享 UID（u0aX）」）。
+5. ~~**shared UID 展示优化**~~：✅ v0.18.0 已实现 uid_packages 持久化成员存档（采集时落库、按日解析历史归属，卸载保留历史/UID 复用不错挂）。详见 4.0.18 H。
 6. **速览插件专项** —— 需欢太账号 + 个人开发者认证申请 Card 权限。
 7. **release 签名**：当前仍用 debug signingConfig（个人测试用，勿当正式发行签名发布）。
 
 ### 近期已解决项
+- ✅ **数据准确性与采集可靠性专项（v0.18.0，本分支）**：诊断基线按 epoch 隔离（A/P0-1复审）、账本高水位记账回落不二次入账+微量增量守恒（B/P0-2/P1-1）、采集健康统一+有界采集日志+丢失尾段（C/P2-2）、轮次真实时长与跨度分离（D/P1-4）、ROOT 可信采集上界+同包短段合并（E/P1-2）、拿起/首开按来源覆盖原子替换（F/P1-3）、报告自然周期环比+修订/格式版本重建+覆盖天数（G/P1-4）、历史 UID 归属持久化（H/P1-5）、组件明细完整映射（I/P2-1）。Room v8→v9。详见 4.0.18。
 - ✅ **数据正确性专项（v0.17.0，本分支）**：进程级同步互斥（P0-1）、差分原子事务（P0-2）、周期 resolver 重设计（P0-3）、effective usage 唯一口径（P0-4）、停止销毁式迁移（P0-5）、采集健康监控/共享 UID/持久化诊断来源（P1-1/2/5）、命令执行抽象（P1-3）、checkin 脚手架（P1-4）。详见 4.0.16。
 - ✅ **手势重组卡顿**（v0.16.13）：移除 `dragTotal` Compose State，改为 `pointerInput` 内部局部变量累加。
 - ✅ **切日异步竞态**（v0.16.13）：`loadDayAsync()` 增加 Job 取消机制与目标日期双向核验。
