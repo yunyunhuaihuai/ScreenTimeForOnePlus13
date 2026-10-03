@@ -232,6 +232,42 @@ versionCode=34/versionName=0.18.0。手机未连接，真机回归项明确标�
 - **严禁**：`dumpsys batterystats --reset`/`--reset-all`；给 UID 功率乘经验系数；把 Actual−
   Computed 缺口按比例摊给 App；为迁移清库；用 maxComponent 反推真实 total。
 
+### 4.0.18.1 真机验证记录（2026-10-03 中午，OnePlus 13 e4e1b43e，v0.18.0 debug 构建）
+
+方法同 4.0.16.1/4.0.17.1：装机前 `run-as` 拉 db/-wal/-shm 三件套作基线（pre，user_version=8、
+integrity ok），装 v0.18.0 触发 v8→v9 迁移 + 首次同步后拉 post，本机 Node `node:sqlite` 逐位对比。
+截图 `analysis/2026-10-03-v018-verify/home_v018.png` 确认 UI。
+
+- ✅ **迁移 v8→v9 值级保全**：历史行（day<今天）battery_daily 2765 行/28797.46507972709、
+  battery_global 242 行/29580.87509819、day_stats 23 行/2259、usage_daily 153837128 **逐位一致**；
+  reports 17/app_info 140 不变；post integrity ok、user_version=9。总量增长（battery_daily
+  30600→31651）全部来自装后真实同步的新数据，非迁移丢失。
+- ✅ **新 schema 落地**：battery_snapshot.recordedCumMah/recordedCompsText/epochWindowStartTs、
+  battery_daily.flashlight/ambientDisplay/idle/phoneMah、day_stats.source、reports.dataRevision/
+  formatVersion、新表 uid_packages（134 UID）/capture_log 全部存在并有数据。
+- ✅ **首次同步生效**：last_usage/battery_success_ts 推进、battery_window_start_ts=1790935544000
+  （=2026-10-02 18:05:44，与取证窗口一致）、data_revision=1、capture_log 记
+  parserVersion=4/ledgerVersion=2/uidCount=170/computedDrain=4152。
+- ✅ **A 诊断门控**：170 UID 帧被接受（旧 142 基线不再误拒新窗口小样本）；parserVersion=4 在跑。
+- ✅ **B 高水位**：7 个快照 recorded≠cum（模型回算 dip 被拦截、未二次入账）；**今天 0 条新
+  LEDGER_INCONSISTENT**（46 条历史行保留为诊断，新版不再产生）。
+- ✅ **C 采集健康**：capture_log 四时刻真实可区分（attempt<commandStart<commandEnd=observed）、
+  zoneId=Asia/Shanghai、epoch 标记一致；首页状态行真机渲染「数据更新至 10-3 12:55 · 耗电采集
+  10-3 12:55（ROOT）· 采样最大间隔 14小时32分钟」——14h32m 即审查发现的停采间隔，如实呈现。
+- ✅ **F 统计来源**：day_stats 历史 24 行 source=0(LEGACY)、今天 1 行 source=1(ROOT)。
+- ✅ **G 报告**：Y:2026 过早「正式」报告降级 finalized=0（预览）；Y:2025/Y:2024 完整年报保持
+  finalized=1 且 dataRevision=1/formatVersion=2（文案已更新）。
+- ✅ **H 归属**：QQ 分身 u0a351+u999a351 均归档 com.tencent.mobileqq；共享 UID u0a141/u0a64
+  （各 5 包）等多包成员完整存档。
+- ⚠️→待自然发生 **epoch 切换**：battery_window_start_ts 当前稳定在 10-02 18:05:44；模拟插电不
+  触发该 ROM 窗口重置，须等真实充电后观察 RESET 全清+全量入账。
+- ⚠️ **强停恢复/状态行中断提示**：需用户强停后打开验证（本轮未强停）。
+- ⚠️ **root 降级期 API 不覆盖 ROOT 统计**：需撤 KernelSU 授权模拟（本轮未做，行为由
+  DayStatsSourceTest 钉死）。
+- 冒烟：装机后 MainActivity 前台存活（topResumedActivity）、无 FATAL；小时图/拿起/首开/电量
+  去向渲染正常。新组件列今日为 0 属预期（delta 语义，该窗口无新增 flashlight 等耗电；本机
+  UID mobile_radio=0）。
+
 ## 4.0.16 v0.17.0 变更（数据正确性与可靠性专项：agent/v017-data-integrity 分支）
 
 本版不新增功能，只修数据正确性。分析基线 main=ea9cd53（v0.16.13），实际基于最新「千问」分支（v0.16.15，vc31）开发——真机数据库已是 Room v5，从 main（v4）重建会回退。开发前对照代码核验了 HANDOFF 旧结论，其中两条与实际不符：
