@@ -2,6 +2,7 @@ package com.local.screentime
 
 import android.app.Application
 import android.content.Context
+import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
@@ -18,6 +19,8 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import org.json.JSONObject
+import java.io.File
 
 /**
  * P0-5 Room 迁移测试（Robolectric + 真实迁移路径）。
@@ -29,8 +32,8 @@ import org.robolectric.annotation.Config
  * 随后断言全部历史数据原样保留。
  *
  * 覆盖路径：
- *  - 4→5→6 完整链（v0.16.14 的 fgsMah 列 + 本轮 reports.finalized 列）；
- *  - 5→6（当前真机上的存量库形态）。
+ *  - 4/5/8→10 完整迁移链；
+ *  - 9→10 全部旧表值级保全，以及持久化电量缺口的迁移种子。
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35], application = Application::class)
@@ -60,15 +63,18 @@ class RoomMigrationTest {
     )
 
     /** 给全部 10 张表各插样本行，模拟真实用户的历史数据 */
-    private fun seedAllTables(db: SQLiteDatabase) {
+    private fun seedAllTables(db: SQLiteDatabase, freshV9: Boolean = false) {
         db.execSQL("INSERT INTO sessions (packageName, startTs, endTs, day) VALUES ('com.tencent.mm', 1000, 61000, 20656)")
         db.execSQL("INSERT INTO app_info (packageName, label, firstSeenTs) VALUES ('com.tencent.mm', '微信', 1)")
         db.execSQL("INSERT INTO sync_state (`key`, value) VALUES ('event_watermark', 42)")
         db.execSQL("INSERT INTO usage_daily (packageName, day, totalMs, source) VALUES ('com.tencent.mm', 20656, 60000, 2)")
+        // 迁移得到的 v5+ fgsMah 带 SQL DEFAULT，归档 v9 直接建库的该列则没有 DEFAULT。
+        val fgsColumn = if (freshV9) ", fgsMah" else ""
+        val fgsValue = if (freshV9) ", 0.0" else ""
         db.execSQL(
             "INSERT INTO battery_daily (uidKey, day, packageName, totalMah, fgMah, bgMah, screenMah, cpuMah, " +
-                "audioMah, videoMah, cameraMah, gnssMah, wifiMah, btMah, wakelockMah, sensorsMah, otherMah) " +
-                "VALUES ('u0a334', 20656, 'tv.danmaku.bili', 247.5, 28.8, 132.0, 5.0, 90.0, 0,0,0,0,0,0,0,0,0)"
+                "audioMah, videoMah, cameraMah, gnssMah, wifiMah, btMah, wakelockMah, sensorsMah, otherMah$fgsColumn) " +
+                "VALUES ('u0a334', 20656, 'tv.danmaku.bili', 247.5, 28.8, 132.0, 5.0, 90.0, 0,0,0,0,0,0,0,0,0$fgsValue)"
         )
         db.execSQL("INSERT INTO battery_global (component, day, mah, durationMs) VALUES ('screen', 20656, 988.0, 3161912)")
         db.execSQL("INSERT INTO battery_snapshot (uidKey, cumMah, compsText, updatedTs) VALUES ('u0a334', 247.5, 'fg=28.8', 1000)")
@@ -96,10 +102,19 @@ class RoomMigrationTest {
             .addMigrations(
                 AppDatabase.MIGRATION_4_5, AppDatabase.MIGRATION_5_6,
                 AppDatabase.MIGRATION_6_7, AppDatabase.MIGRATION_7_8,
-                AppDatabase.MIGRATION_8_9,
+                AppDatabase.MIGRATION_8_9, AppDatabase.MIGRATION_9_10,
             )
             .allowMainThreadQueries()
             .build()
+
+    private inline fun <T> withRoom(block: (AppDatabase) -> T): T {
+        val room = buildRoom()
+        return try {
+            block(room)
+        } finally {
+            room.close()
+        }
+    }
 
     @Before
     fun setup() {
@@ -115,7 +130,7 @@ class RoomMigrationTest {
     fun migrate4ToLatest_allTenTablesDataPreserved() = runBlocking {
         createLegacyDb(4, atV5 = false).use { seedAllTables(it) }
 
-        val dao = buildRoom().usageDao()  // 首次访问触发 4→5→6→7→8 迁移 + Room schema 校验
+        val dao = buildRoom().usageDao()  // 首次访问触发 4→10 迁移 + Room schema 校验
 
         assertEquals(1, dao.sessionsOfDay(20656).size)
         assertEquals(60000L, dao.sessionsOfDay(20656)[0].endTs - dao.sessionsOfDay(20656)[0].startTs)
@@ -143,8 +158,8 @@ class RoomMigrationTest {
     }
 
     @Test
-    fun migrate5To6_currentDeviceState_preserved() = runBlocking {
-        // 真机当前存量形态：v5（已有 fgsMah），走 5→6
+    fun migrate5ToLatest_existingFgsValuePreserved() = runBlocking {
+        // 历史 v5（已有 fgsMah），走 5→10
         createLegacyDb(5, atV5 = true).use { db ->
             seedAllTables(db)
             db.execSQL(
@@ -152,7 +167,7 @@ class RoomMigrationTest {
             )
         }
 
-        val dao = buildRoom().usageDao()  // 触发 5→6
+        val dao = buildRoom().usageDao()  // 触发 5→10
 
         val battery = dao.getBatteryDaily("u0a334", 20656)
         assertEquals(16.9, battery!!.fgsMah, 1e-9)  // v5 已有列的数据不受 5→6 影响
@@ -163,16 +178,20 @@ class RoomMigrationTest {
     }
 
     @Test
-    fun freshDatabase_v6_startsEmptyWithFinalizedDefault() = runBlocking {
-        // 新装用户直接以 v6 建库：不触发迁移，finalized 默认 true（与实体默认一致）
+    fun freshDatabase_v10_startsEmptyWithFinalizedDefault() = runBlocking {
+        // 新装用户直接以 v10 建库，不触发迁移。
         context.deleteDatabase(dbName)
-        val dao = buildRoom().usageDao()
-        assertNull(dao.getReport("WEEKLY", "W:2026-09-21"))
-        dao.putReport(
-            com.local.screentime.data.ReportEntity("WEEKLY", "W:2026-09-21", 1L, "text", finalized = false)
-        )
-        assertEquals(false, dao.getReport("WEEKLY", "W:2026-09-21")!!.finalized)
-        assertTrue(true)
+        withRoom { room ->
+            val dao = room.usageDao()
+            assertEquals(10, room.openHelper.writableDatabase.version)
+            assertNull(dao.getReport("WEEKLY", "W:2026-09-21"))
+            assertTrue(dao.allUsageCoverage().isEmpty())
+            assertTrue(dao.collectionGaps("battery").isEmpty())
+            dao.putReport(
+                com.local.screentime.data.ReportEntity("WEEKLY", "W:2026-09-21", 1L, "text", finalized = false)
+            )
+            assertEquals(false, dao.getReport("WEEKLY", "W:2026-09-21")!!.finalized)
+        }
     }
 
     /** v8 建表语句 = v4 结构 + 4→5(fgsMah)/5→6(finalized)/6→7(mobileMah)/7→8(sessions.source) 四列 */
@@ -205,7 +224,7 @@ class RoomMigrationTest {
                 "VALUES ('MONTHLY', 'M:2026-9', 1790000000000, '9月月报', 1)")
         }
 
-        val dao = buildRoom().usageDao()  // 触发 8→9 + Room schema 校验
+        val dao = buildRoom().usageDao()  // 触发 8→9→10 + Room schema 校验
 
         // 既有行值级保全
         val bili = dao.getBatteryDaily("u0a334", 20656)!!
@@ -251,5 +270,97 @@ class RoomMigrationTest {
             )
         )
         assertEquals(1, dao.recentCaptureLogs(10).size)
+    }
+
+    /** 直接使用已归档的 v9 schema，避免手写旧结构与正式档案逐渐分叉。 */
+    private fun createLegacyV9Db(): Pair<SQLiteDatabase, List<String>> {
+        val relative = "schemas/com.local.screentime.data.AppDatabase/9.json"
+        val archive = listOf(File(relative), File("app/$relative")).firstOrNull { it.isFile }
+            ?: error("Missing archived v9 schema: $relative")
+        val entities = JSONObject(archive.readText()).getJSONObject("database").getJSONArray("entities")
+        context.deleteDatabase(dbName)
+        val db = SQLiteDatabase.openOrCreateDatabase(context.getDatabasePath(dbName).absolutePath, null)
+        val tables = buildList {
+            for (index in 0 until entities.length()) {
+                val entity = entities.getJSONObject(index)
+                val table = entity.getString("tableName")
+                add(table)
+                db.execSQL(entity.getString("createSql").replace("\${TABLE_NAME}", table))
+                val indices = entity.getJSONArray("indices")
+                for (i in 0 until indices.length()) {
+                    db.execSQL(indices.getJSONObject(i).getString("createSql").replace("\${TABLE_NAME}", table))
+                }
+            }
+        }
+        db.version = 9
+        return db to tables
+    }
+
+    private fun readRows(cursor: Cursor): List<Map<String, Any?>> = cursor.use {
+        buildList {
+            while (cursor.moveToNext()) {
+                add(cursor.columnNames.mapIndexed { index, name ->
+                    name to when (cursor.getType(index)) {
+                        Cursor.FIELD_TYPE_NULL -> null
+                        Cursor.FIELD_TYPE_INTEGER -> cursor.getLong(index)
+                        Cursor.FIELD_TYPE_FLOAT -> cursor.getDouble(index)
+                        else -> cursor.getString(index)
+                    }
+                }.toMap())
+            }
+        }.sortedBy { it.toString() }
+    }
+
+    @Test
+    fun migrate9To10_allOldTableValuesPreservedAndBatteryGapSeeded() = runBlocking {
+        val (legacy, tables) = createLegacyV9Db()
+        val before = legacy.use { db ->
+            seedAllTables(db, freshV9 = true)
+            // v9 已存在的新增字段也设非默认值，确保 9→10 不重写旧行。
+            db.execSQL("UPDATE sessions SET source=1")
+            db.execSQL("UPDATE battery_daily SET fgsMah=1.2, mobileMah=0.4, flashlightMah=0.3, ambientDisplayMah=0.2, idleMah=0.1, phoneMah=0.05")
+            db.execSQL("UPDATE battery_snapshot SET recordedCumMah=250.0, recordedCompsText='fg=30.0', epochWindowStartTs=900")
+            db.execSQL("UPDATE day_stats SET source=1")
+            db.execSQL("UPDATE unlock_stats SET source=1")
+            db.execSQL("UPDATE reports SET finalized=0, dataRevision=18, formatVersion=3")
+            db.execSQL("INSERT INTO uid_packages VALUES ('u0a334','tv.danmaku.bili',100,200)")
+            db.execSQL("INSERT INTO capture_log VALUES (7,2000,1900,1950,2000,'Asia/Shanghai',1,4,2,'SUCCESS',900,12,3,250.5,NULL,270.0,247.5,'kept sample')")
+            db.execSQL("INSERT INTO sync_state VALUES ('battery_lost_tail_from_ts',1792200671770)")
+            db.execSQL("INSERT INTO sync_state VALUES ('battery_lost_tail_to_ts',1792490705000)")
+            tables.associateWith { readRows(db.rawQuery("SELECT * FROM `$it`", null)) }
+        }
+        assertEquals("覆盖 v9 全部 12 张业务表", 12, before.size)
+        assertTrue("每张旧表均须有值级保全样本", before.values.all { it.isNotEmpty() })
+
+        withRoom { room ->
+            val migrated = room.openHelper.writableDatabase
+            assertEquals(10, migrated.version)
+            tables.forEach { table ->
+                assertEquals("$table 的全部历史字段值须原样保留", before[table], readRows(migrated.query("SELECT * FROM `$table`")))
+            }
+            val dao = room.usageDao()
+            val gap = dao.collectionGaps("battery").single()
+            assertEquals(1792200671770L, gap.fromTs)
+            assertEquals(1792490705000L, gap.toTs)
+            assertEquals(1792490705000L, gap.detectedTs)
+            assertTrue("旧时长数据不能凭迁移标成已验证完整", dao.allUsageCoverage().isEmpty())
+            assertTrue(dao.collectionGaps("usage").isEmpty())
+            // 新表可独立持久化，后续健康时间更新不得删除迁移保留的缺口。
+            dao.upsertUsageCoverage(listOf(com.local.screentime.data.UsageCoverageEntity(20747, 1000, 2000, 1, 2100, "root")))
+            dao.putState(com.local.screentime.data.SyncStateEntity("last_battery_success_ts", 1792557356513L))
+            assertEquals(1, dao.allUsageCoverage().size)
+            assertEquals(gap, dao.collectionGaps("battery").single())
+        }
+    }
+
+    @Test
+    fun migrate9To10_invalidBatteryTailDoesNotCreateGap() = runBlocking {
+        createLegacyV9Db().first.use { db ->
+            db.execSQL("INSERT INTO sync_state VALUES ('battery_lost_tail_from_ts',2000)")
+            db.execSQL("INSERT INTO sync_state VALUES ('battery_lost_tail_to_ts',1000)")
+        }
+        withRoom { room ->
+            assertTrue(room.usageDao().collectionGaps("battery").isEmpty())
+        }
     }
 }

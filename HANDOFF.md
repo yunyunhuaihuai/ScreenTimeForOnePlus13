@@ -4,12 +4,27 @@
 
 ## 1. 项目是什么
 
-一台一加 13（ColorOS 15）上用"冰箱"冻结应用后，**系统自带屏幕使用时间不再显示这些应用的时长**（展示层过滤）。本项目自建记录器：跨三层混合数据源重建完整的使用时长 + 耗电统计，**冻结应用照样显示**，并逐步加入 iOS 屏幕时间风格的可视化。
+一台一加 13（ColorOS 15）上用"冰箱"冻结应用后，**系统自带屏幕使用时间不再显示这些应用的时长**（展示层过滤）。本项目结合系统历史文件、实时事件、独立root耗电快照和API兜底重建使用时长与耗电统计，**冻结应用照样显示**，并明确呈现尚未恢复的覆盖缺口。
 
 - 目标设备：OnePlus 13（PJZ110），ColorOS 15 / Android 15（API 35），KernelSU root，屏幕 1440×3168
-- 包名：`com.local.screentime`，应用名“屏幕时间”，当前 v0.18.0（versionCode 34）
+- 包名：`com.local.screentime`，应用名“屏幕时间”，当前 v0.19.0（versionCode 35）
 - 工程：本仓库根目录；技术栈 Kotlin + Compose(M3) + Room + WorkManager + libsu，无 NDK
-- minSdk/targetSdk/compileSdk = 35；数据库 Room v9（显式迁移 MIGRATION_4_5/5_6/6_7/7_8/8_9，schema JSON 已入库 schemas/，**已移除全局销毁式迁移**——v4+ 升级必须写显式 Migration，缺迁移会显式失败而不是清库）
+- minSdk/targetSdk/compileSdk = 35；数据库 Room v10（显式迁移 MIGRATION_4_5/5_6/6_7/7_8/8_9/9_10，schema JSON 已入库 schemas/，**已移除全局销毁式迁移**——v4+ 升级必须写显式 Migration，缺迁移会显式失败而不是清库）
+
+## 2026-10-21 v0.19.0：后台中断、历史回补与独立采集
+
+17日上午至20日深夜曾出现约86小时停采，恢复后旧路径仅读最近24小时dump，导致17/18/19日会话严重缺失。系统原始daily仍保留事件，现已由App自动回补；不是按滚动桶分摊。
+
+- 新增`UsageHistoryReader`：严格有界解析v5 obfuscated protobuf，支持主用户及999分身、数字和`-c`文件名；验证版本、映射、事件范围、前后清单及SHA。归档中的daily始终绑定该代mappings。重复桶选最新有效观测，冲突/回退明确失败。
+- `UsageSourceWindow`将历史已认证范围与当前dump窗口按用户拼接，历史毫秒事件优先，实时尾段不重复。`UsageRecovery`在单一事务中替换已认证范围、保留两侧会话、写覆盖/缺口/水位/修订；整日拿起与首开仅在完整覆盖时替换。
+- Room 9→10只新增`usage_coverage`和`collection_gaps`，迁移旧耗电尾段为持久缺口，旧12张表值级保留。缺数据不再隐含为零。
+- `RootCollector`安装到固定root目录，由KernelSU `service.d`开机启动；supervisor与worker不写Room。带观测时间、时区、UID成员、SHA的gzip快照先原子发布，App依序事务入账并推进sequence后才ack，重投不会重复记账。App已经切到独立账本后，root暂不可用时不另启DUMP写入者。
+- 每6小时独立保存稳定的daily/mappings/version归档（目标30天，128代/128MiB），未导入耗电帧目标8天（4096帧/512MiB）；硬上限优先并留丢弃证据。单代/单文件/命令耗时均有界。
+- 时长、耗电、心跳各自计算过期，保留历史缺口；Worker按真实结果有限重试；设置可停用/启用独立采集。独立worker尽力发本地限频告警。进程自身全停、深睡或权限失效时仍可能延迟，不能承诺零丢失。
+- 真机发现并修复三项环境问题：Android mksh会使持久fd对外部flock不可见，采集器统一用KernelSU BusyBox ash；libsu持久shell会被协议脚本的顶层`exit`终止，命令在子shell执行以隔离退出、环境和函数；ash临时关闭锁FD时可能将原FD保存为10，长命子进程改为在子shell内永久关闭锁FD再`exec`，避免owner死亡后仍被子进程拖住锁。最终BusyBox FD spawn两项实机probe退出码均为0；强杀worker后6,048ms恢复新PID并生成新帧，`workerRestarts=3`，无采集/归档失败或丢弃。
+- 最终218项JVM测试（25 suites，0失败、0错误、0跳过）、完整构建与真机v0.19.0/vc35升级已通过；没有启动模拟器。实机已验证9→10、实际缺日回补、App强停后自动采样、积压导入、同sequence重投、设置停用/启用、重启自启动与真实batterystats epoch变化。最终验证记录见机主本机`ScreenTimeForOnePlus13_Data/analysis/2026-10-21-reliability/`，原始隐私数据不入Git。
+
+恢复后的17/18/19/20日时长分别为299.53695 / 317.94503 / 315.90942 / 410.86305分钟，拿起128 / 129 / 132 / 178次。旧耗电窗口已丢失部分继续显示缺口，未猜数回填。独立采集协议、停止及清理方法见[ROOT_COLLECTOR.md](ROOT_COLLECTOR.md)。
 
 ## 2. 构建与部署
 
@@ -29,33 +44,43 @@ adb -s "$ADB_SERIAL" install -r app/build/outputs/apk/release/app-release.apk
 - ColorOS 安装需要"USB 安装"开关（已开）；`adb shell appops set` 被 ColorOS 拒绝（shell 无 MANAGE_APP_OPS_MODES）
 - ⚠️ **升完版本号必须重新构建 + 复核产物版本**：产物版本只以 `output-metadata.json`（或 `adb shell dumpsys package com.local.screentime`）为准，`build.gradle.kts` 改完不重建就会打出旧版本号的包（曾踩，详见 4.0.7）
 
-## 3. 架构：三层数据源（核心设计）
+## 3. 架构：四类来源（v0.19 当前行为）
 
-应用内 `UsageRepository.syncNow()` 每次按序执行：
+使用时长与耗电分别采集、分别判断健康，数据源如下：
 
-| 层 | 来源 | 用途 | ColorOS 实测情况 |
-|---|---|---|---|
-| 1. API 事件流 | `UsageStatsManager.queryEvents` | 会话时间线（每次起止） | **被裁剪**：请求窗口内 137 条只返回 12 条；时多时少不可靠 |
-| 2. API 聚合 | `queryUsageStats(INTERVAL_DAILY)` | 每包每日总时长 | 基本完整，但"今天"可能偏小 |
-| 3. root 直读 | libsu 跑 `dumpsys usagestats` / `batterystats --charged` | 全量事件（~6000 条/天）+ 每UID耗电 | 完整；**这是 root 的核心价值** |
+| 来源 | 读取路径 | 用途与边界 |
+|---|---|---|
+| 系统使用历史及独立归档 | `UsageHistoryReader` 校验主用户0和分身999的v5 daily、mappings、version | 毫秒级历史事件，自动回补仍有可验证原始证据的范围；读失败、映射缺失或截断不能当作零使用 |
+| root实时事件 | `dumpsys usagestats` 与 `UsageSourceWindow` | 认证最近24小时窗口，补历史尚未落盘的尾段；已落盘范围优先使用历史事件，避免重复 |
+| 独立root耗电采集 | `RootCollector` 的supervisor/worker发布带时间、时区、UID成员和SHA的gzip帧 | APK被清理时仍可留存；App/Worker顺序事务导入并ACK，不另开root直采写入同一账本 |
+| API事件兜底 | `UsageStatsManager.queryEvents` | root时长未获得观测时使用；ColorOS会裁剪事件，只能补权威会话缺席的区间，不能覆盖ROOT/LEGACY历史 |
 
-展示策略：**事件重建值与聚合值逐包取 max**（`dailyRows()`）。
-耗时统计写入 `sessions` 表 + `usage_daily` 聚合表；耗电写入 `battery_daily` / `battery_global`（快照差分，充满清零自动检测：新值<旧值-0.5 即重置）。
+`syncNow()`先尝试历史与实时root时长，再消费独立耗电帧，必要时使用API时长兜底。历史读取和shell命令均在Room写事务外执行。`queryUsageStats(INTERVAL_DAILY)`不再作为新数据的日聚合采集路径；`usage_daily`保留既有历史回补值，与新事件重建分开存放。
 
-### 表结构（Room v9）
-- `sessions(pkg, startTs, endTs, day, source[0LEGACY/1ROOT/2API])` —— 会话（RESUMED/PAUSED 配对，跨午夜切分，<2s 碎片丢弃但同包 ≤2s 短段先合并；缺关闭事件时尾段延伸到可信采集上界；重建时按 startTs >= windowStart 清除，保留跨左边界的历史会话）
-- `usage_daily(pkg, day, totalMs, source[0事件/1聚合API/2root])` —— 每日每包时长
-- `battery_daily(uidKey, day, total/fg/bg/fgs/screen/cpu/audio/video/camera/gnss/wifi/bt/wakelock/sensors/mobile/flashlight/ambientDisplay/idle/phone/other mAh)` —— 每日每 UID 耗电（v0.16.14 fgsMah；v0.17 mobileMah；**v0.18 补 flashlight/ambientDisplay/idle/phone 四列**，组件字段全映射；**v0.17.0 起共享 UID 行 packageName=null**）
-- `battery_global(component, day, mah, durationMs)` —— 整机组件耗电（屏幕/CPU/蓝牙/音频/GNSS/息屏显示…；durationMs 持续差分累加）
-- `battery_snapshot(uidKey, cumMah, compsText, ts, recordedCumMah, recordedCompsText, epochWindowStartTs)` —— 差分基线（含 `__global__`/`__global___dur`）；**v0.18 起原始观测(cumMah/compsText)与已入账高水位(recorded*)分离**，epochWindowStartTs 记录所属 epoch
-- `uid_packages(uidKey, packageName, firstSeenTs, lastSeenTs)` —— **v0.18 新增**：采集时 UID→包名成员存档，历史归属按有效期解析（不随当前安装状态漂移）
-- `capture_log(id, ts, attemptTs, commandStartTs, commandEndTs, zoneId, source, parserVersion, ledgerVersion, outcome, epochWindowStartTs, uidCount, ...)` —— **v0.18 新增**：有界（64 条）结构化采集日志，区分 attempt/command/observed 时刻
-- `app_info`（label/图标快照，冻结后仍可显示）、`sync_state`（事件水位线 + 同步/采样诊断状态：last_usage_source、last_battery_source、last_usage/battery_success/fail_ts、cap_* 采样健康、battery_window_start_ts epoch 标记、battery_lost_tail_* 不可恢复尾段、data_revision 数据修订版本、parser_baseline_uid_count 解析基线）
-- `day_stats(day, pickups, source)`、`unlock_stats(day, packageName, count, source)` —— **v0.18 加 source**：ROOT 权威可整日原子替换，API 残缺流不覆盖 ROOT 完整日
-- `reports(type, periodKey, generatedTs, text, finalized, dataRevision, formatVersion)` —— v6 finalized；**v0.18 加 dataRevision/formatVersion**：数据修订或文案格式落后时静默重建
+时长按已认证的半开时间范围更新。`UsageRecovery`先排序事件，只重建有明确前台/息屏边界的安全会话范围；跨窗口左右两侧的旧会话保留，左侧未知的前台延续段不猜数。会话替换、整日统计、覆盖、缺口、水位和数据修订在一个事务中提交。只有来源完整覆盖自然日（今天为零点至观测时刻）时，才整日替换拿起/首开并清理旧过计数；部分窗口不覆盖整日统计。已回补范围从时长缺口中扣除，不删除耗电缺口。
 
-### 展示与报告的唯一口径（v0.17.0）
-`effective usage = 逐包逐日 max(会话聚合, usage_daily 回补值)`，实现在 `UsageDao.effectiveUsageDay/effectiveUsageBetween`；首页 `dailyRows`、周报/月报/年报的总量/Top/环比共用同一查询——UI 与报告不再各自维护一套逻辑，历史回补日（2026-09-04～09-12）数据计入报告。
+当前按认证连续范围重建，今日尾段变化可能导致整个范围删除后重插，存在写放大。自增会话ID不是稳定业务标识；保全验证比较**会话业务字段（包名、起止、日期、来源）、时长和拿起**，不以ID是否变化判断历史是否丢失。
+
+耗电增量相对已入账高水位计算，窗口起点变化触发整个epoch重建；窗口起点缺失时才退回比例判据。帧自身时区用于解析和跨日归属，UID成员档案、日账本、快照及已导入sequence同事务提交。数据库提交后才ACK，重复sequence不重复入账，坏帧不能被越过；旧观测时间的新sequence会被拒绝并保留。已经导入独立账本后，root暂不可用时不另启DUMP写入者，切换约束见[ROOT_COLLECTOR.md](ROOT_COLLECTOR.md)。
+
+### 表结构（Room v10）
+
+- `sessions(id, packageName, startTs, endTs, day, source[0LEGACY/1ROOT/2API])` —— 会话明细；RESUMED/PAUSED配对，跨午夜切分，同包≤2秒短段先合并，再过滤<2秒碎片；缺关闭事件时暂延伸至可信采集上界，后续认证重建可纠正。
+- `usage_daily(packageName, day, totalMs, source)` —— 既有每日每包历史回补值，供兼容展示与报告使用。
+- `usage_coverage(day, fromTs, toTs, status, updatedTs, source)` —— v10新增，记录已认证时长范围；status=1部分覆盖，status=2自然日连续覆盖（今天为截至观测时刻）。
+- `collection_gaps(kind, fromTs, toTs, detectedTs)` —— v10新增，按usage/battery保存每段已知缺口；9→10迁移保留旧耗电尾段，近期成功不抹掉旧证据。
+- `battery_daily(uidKey, day, packageName, total/fg/bg/fgs/screen/cpu/audio/video/camera/gnss/wifi/bt/wakelock/sensors/mobile/flashlight/ambientDisplay/idle/phone/other mAh)` —— 每日每UID模型归因耗电；系统及共享UID不挂给任意单包。
+- `battery_global(component, day, mah, durationMs)` —— 整机组件模型耗电与持续时长，与UID口径重叠，不能相加当整机实际耗电。
+- `battery_snapshot(uidKey, cumMah, compsText, updatedTs, recordedCumMah, recordedCompsText, epochWindowStartTs)` —— 原始观测与已入账高水位分离，含全局组件和持续时长基线。
+- `uid_packages(uidKey, packageName, firstSeenTs, lastSeenTs)` —— 帧采集时的UID成员档案；历史归属按有效期解析，不用导入时的安装状态覆盖。
+- `capture_log(id, ts, attemptTs, commandStartTs, commandEndTs, zoneId, source, parserVersion, ledgerVersion, outcome, epochWindowStartTs, uidCount, ...)` —— 最近64条结构化采集日志，保留观测时刻、来源和失败原因；长期原始帧保留由独立采集器管理。
+- `app_info` —— 应用label等快照；`sync_state` —— 水位、时长/耗电各自成功与失败时间、采样健康、解析基线、epoch、数据修订，以及collector心跳/状态/已导入sequence等持久状态。
+- `day_stats(day, pickups, source)`、`unlock_stats(day, packageName, count, source)` —— 按日来源保护；ROOT只在认证完整日替换，API残缺流不覆盖已有权威日统计。
+- `reports(type, periodKey, generatedTs, text, finalized, dataRevision, formatVersion)` —— 正式/预览报告及其数据修订、文案格式版本。
+
+### 展示与报告的唯一口径
+
+`effective usage = 逐包逐日 max(会话聚合, usage_daily历史回补值)`，实现在 `UsageDao.effectiveUsageDay/effectiveUsageBetween`；首页`dailyRows`与周报/月报/年报的总量、Top及环比共用同一查询。覆盖状态独立展示：会话为空不能据此宣称全天零使用；时长、耗电和后台心跳分别计算超时，已知历史缺口保留至对应证据得到处理。
 
 ### 分类
 `repo.categoryOf(pkg)`：手动覆盖（SharedPreferences `cat_overrides` JSON）→ 系统 `ApplicationInfo.category` → 内置中国应用字典（`categoryDict`，微信/QQ→通讯社交、抖音/B站→影音娱乐、DeepSeek/豆包→AI 助手…）→ 兜底"其他"。修改入口：应用明细弹窗"修改"。

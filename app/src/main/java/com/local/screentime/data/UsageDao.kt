@@ -11,6 +11,33 @@ data class DailyRow(val packageName: String, val day: Long, val totalMs: Long)
 @Dao
 interface UsageDao {
 
+    @Query("DELETE FROM sessions WHERE day = :day")
+    suspend fun deleteSessionsForDay(day: Long)
+
+    @Query("SELECT * FROM sessions WHERE endTs > :fromTs AND startTs < :toTs ORDER BY startTs, endTs")
+    suspend fun sessionsOverlapping(fromTs: Long, toTs: Long): List<UsageSession>
+
+    @Query("DELETE FROM sessions WHERE endTs > :fromTs AND startTs < :toTs")
+    suspend fun deleteSessionsOverlapping(fromTs: Long, toTs: Long)
+
+    @Upsert
+    suspend fun upsertUsageCoverage(rows: List<UsageCoverageEntity>)
+
+    @Query("SELECT * FROM usage_coverage ORDER BY day")
+    suspend fun allUsageCoverage(): List<UsageCoverageEntity>
+
+    @Query("SELECT * FROM usage_coverage WHERE day = :day")
+    suspend fun coverageOfDay(day: Long): UsageCoverageEntity?
+
+    @Upsert
+    suspend fun upsertCollectionGaps(rows: List<CollectionGapEntity>)
+
+    @Query("SELECT * FROM collection_gaps WHERE kind = :kind ORDER BY fromTs")
+    suspend fun collectionGaps(kind: String): List<CollectionGapEntity>
+
+    @Query("DELETE FROM collection_gaps WHERE kind = :kind")
+    suspend fun clearCollectionGaps(kind: String)
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertSessions(sessions: List<UsageSession>)
 

@@ -62,7 +62,7 @@ class DayStatsSourceTest {
         val context = ApplicationProvider.getApplicationContext<Context>()
         db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
             .allowMainThreadQueries().build()
-        repo = UsageRepository(context, RootCommandRunner(), db)
+        repo = UsageRepository(context, RootCommandRunner(), db, useRootCollector = false)
     }
 
     private fun dao() = db.usageDao()
@@ -133,6 +133,17 @@ class DayStatsSourceTest {
     }
 
     // ---------- 入口级行为（真实 Room） ----------
+
+    @Test
+    fun entry_apiCanCreateUnobservedDay_withoutInventingLegacyAuthority() = runBlocking {
+        val events = listOf(
+            ev(d2, 9, 0, KEYGUARD, "x"),
+            ev(d2, 9, 1, RESUMED, "com.new"),
+        )
+        repo.syncDayEventStats(events, zone, SESSION_SOURCE_API, observedAt)
+        assertEquals(1L, dao().getDayStats(d2)!!.pickups)
+        assertEquals(SESSION_SOURCE_API, dao().getDayStats(d2)!!.source)
+    }
 
     @Test
     fun entry_rootReplaceClearsVanishedPackage_andCorrectsCount() = runBlocking {

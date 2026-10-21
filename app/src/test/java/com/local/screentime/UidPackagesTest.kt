@@ -48,7 +48,7 @@ class UidPackagesTest {
         val context = ApplicationProvider.getApplicationContext<Context>()
         db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
             .allowMainThreadQueries().build()
-        repo = UsageRepository(context, RootCommandRunner(), db)
+        repo = UsageRepository(context, RootCommandRunner(), db, useRootCollector = false)
     }
 
     @After

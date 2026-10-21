@@ -1,0 +1,871 @@
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 10,
+    "identityHash": "b371e2b1f238e5320f80555809ff9330",
+    "entities": [
+      {
+        "tableName": "sessions",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `packageName` TEXT NOT NULL, `startTs` INTEGER NOT NULL, `endTs` INTEGER NOT NULL, `day` INTEGER NOT NULL, `source` INTEGER NOT NULL DEFAULT 0)",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "packageName",
+            "columnName": "packageName",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "startTs",
+            "columnName": "startTs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "endTs",
+            "columnName": "endTs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "day",
+            "columnName": "day",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "source",
+            "columnName": "source",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "0"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_sessions_startTs",
+            "unique": false,
+            "columnNames": [
+              "startTs"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_sessions_startTs` ON `${TABLE_NAME}` (`startTs`)"
+          },
+          {
+            "name": "index_sessions_day",
+            "unique": false,
+            "columnNames": [
+              "day"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_sessions_day` ON `${TABLE_NAME}` (`day`)"
+          },
+          {
+            "name": "index_sessions_day_packageName",
+            "unique": false,
+            "columnNames": [
+              "day",
+              "packageName"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_sessions_day_packageName` ON `${TABLE_NAME}` (`day`, `packageName`)"
+          }
+        ],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "app_info",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`packageName` TEXT NOT NULL, `label` TEXT NOT NULL, `firstSeenTs` INTEGER NOT NULL, PRIMARY KEY(`packageName`))",
+        "fields": [
+          {
+            "fieldPath": "packageName",
+            "columnName": "packageName",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "label",
+            "columnName": "label",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "firstSeenTs",
+            "columnName": "firstSeenTs",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "packageName"
+          ]
+        },
+        "indices": [],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "sync_state",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`key` TEXT NOT NULL, `value` INTEGER NOT NULL, PRIMARY KEY(`key`))",
+        "fields": [
+          {
+            "fieldPath": "key",
+            "columnName": "key",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "value",
+            "columnName": "value",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "key"
+          ]
+        },
+        "indices": [],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "usage_daily",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`packageName` TEXT NOT NULL, `day` INTEGER NOT NULL, `totalMs` INTEGER NOT NULL, `source` INTEGER NOT NULL, PRIMARY KEY(`packageName`, `day`))",
+        "fields": [
+          {
+            "fieldPath": "packageName",
+            "columnName": "packageName",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "day",
+            "columnName": "day",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "totalMs",
+            "columnName": "totalMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "source",
+            "columnName": "source",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "packageName",
+            "day"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_usage_daily_day",
+            "unique": false,
+            "columnNames": [
+              "day"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_usage_daily_day` ON `${TABLE_NAME}` (`day`)"
+          }
+        ],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "battery_daily",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`uidKey` TEXT NOT NULL, `day` INTEGER NOT NULL, `packageName` TEXT, `totalMah` REAL NOT NULL, `fgMah` REAL NOT NULL, `bgMah` REAL NOT NULL, `fgsMah` REAL NOT NULL, `screenMah` REAL NOT NULL, `cpuMah` REAL NOT NULL, `audioMah` REAL NOT NULL, `videoMah` REAL NOT NULL, `cameraMah` REAL NOT NULL, `gnssMah` REAL NOT NULL, `wifiMah` REAL NOT NULL, `btMah` REAL NOT NULL, `wakelockMah` REAL NOT NULL, `sensorsMah` REAL NOT NULL, `mobileMah` REAL NOT NULL DEFAULT 0.0, `flashlightMah` REAL NOT NULL DEFAULT 0.0, `ambientDisplayMah` REAL NOT NULL DEFAULT 0.0, `idleMah` REAL NOT NULL DEFAULT 0.0, `phoneMah` REAL NOT NULL DEFAULT 0.0, `otherMah` REAL NOT NULL, PRIMARY KEY(`uidKey`, `day`))",
+        "fields": [
+          {
+            "fieldPath": "uidKey",
+            "columnName": "uidKey",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "day",
+            "columnName": "day",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "packageName",
+            "columnName": "packageName",
+            "affinity": "TEXT",
+            "notNull": false
+          },
+          {
+            "fieldPath": "totalMah",
+            "columnName": "totalMah",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "fgMah",
+            "columnName": "fgMah",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "bgMah",
+            "columnName": "bgMah",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "fgsMah",
+            "columnName": "fgsMah",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "screenMah",
+            "columnName": "screenMah",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "cpuMah",
+            "columnName": "cpuMah",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "audioMah",
+            "columnName": "audioMah",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "videoMah",
+            "columnName": "videoMah",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "cameraMah",
+            "columnName": "cameraMah",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "gnssMah",
+            "columnName": "gnssMah",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "wifiMah",
+            "columnName": "wifiMah",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "btMah",
+            "columnName": "btMah",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "wakelockMah",
+            "columnName": "wakelockMah",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sensorsMah",
+            "columnName": "sensorsMah",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "mobileMah",
+            "columnName": "mobileMah",
+            "affinity": "REAL",
+            "notNull": true,
+            "defaultValue": "0.0"
+          },
+          {
+            "fieldPath": "flashlightMah",
+            "columnName": "flashlightMah",
+            "affinity": "REAL",
+            "notNull": true,
+            "defaultValue": "0.0"
+          },
+          {
+            "fieldPath": "ambientDisplayMah",
+            "columnName": "ambientDisplayMah",
+            "affinity": "REAL",
+            "notNull": true,
+            "defaultValue": "0.0"
+          },
+          {
+            "fieldPath": "idleMah",
+            "columnName": "idleMah",
+            "affinity": "REAL",
+            "notNull": true,
+            "defaultValue": "0.0"
+          },
+          {
+            "fieldPath": "phoneMah",
+            "columnName": "phoneMah",
+            "affinity": "REAL",
+            "notNull": true,
+            "defaultValue": "0.0"
+          },
+          {
+            "fieldPath": "otherMah",
+            "columnName": "otherMah",
+            "affinity": "REAL",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "uidKey",
+            "day"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_battery_daily_day",
+            "unique": false,
+            "columnNames": [
+              "day"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_battery_daily_day` ON `${TABLE_NAME}` (`day`)"
+          }
+        ],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "battery_global",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`component` TEXT NOT NULL, `day` INTEGER NOT NULL, `mah` REAL NOT NULL, `durationMs` INTEGER NOT NULL, PRIMARY KEY(`component`, `day`))",
+        "fields": [
+          {
+            "fieldPath": "component",
+            "columnName": "component",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "day",
+            "columnName": "day",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "mah",
+            "columnName": "mah",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "durationMs",
+            "columnName": "durationMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "component",
+            "day"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_battery_global_day",
+            "unique": false,
+            "columnNames": [
+              "day"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_battery_global_day` ON `${TABLE_NAME}` (`day`)"
+          }
+        ],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "battery_snapshot",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`uidKey` TEXT NOT NULL, `cumMah` REAL NOT NULL, `compsText` TEXT NOT NULL, `updatedTs` INTEGER NOT NULL, `recordedCumMah` REAL NOT NULL DEFAULT -1.0, `recordedCompsText` TEXT NOT NULL DEFAULT '', `epochWindowStartTs` INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(`uidKey`))",
+        "fields": [
+          {
+            "fieldPath": "uidKey",
+            "columnName": "uidKey",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "cumMah",
+            "columnName": "cumMah",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "compsText",
+            "columnName": "compsText",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "updatedTs",
+            "columnName": "updatedTs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "recordedCumMah",
+            "columnName": "recordedCumMah",
+            "affinity": "REAL",
+            "notNull": true,
+            "defaultValue": "-1.0"
+          },
+          {
+            "fieldPath": "recordedCompsText",
+            "columnName": "recordedCompsText",
+            "affinity": "TEXT",
+            "notNull": true,
+            "defaultValue": "''"
+          },
+          {
+            "fieldPath": "epochWindowStartTs",
+            "columnName": "epochWindowStartTs",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "0"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "uidKey"
+          ]
+        },
+        "indices": [],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "day_stats",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`day` INTEGER NOT NULL, `pickups` INTEGER NOT NULL, `source` INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(`day`))",
+        "fields": [
+          {
+            "fieldPath": "day",
+            "columnName": "day",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pickups",
+            "columnName": "pickups",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "source",
+            "columnName": "source",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "0"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "day"
+          ]
+        },
+        "indices": [],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "unlock_stats",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`day` INTEGER NOT NULL, `packageName` TEXT NOT NULL, `count` INTEGER NOT NULL, `source` INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(`day`, `packageName`))",
+        "fields": [
+          {
+            "fieldPath": "day",
+            "columnName": "day",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "packageName",
+            "columnName": "packageName",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "count",
+            "columnName": "count",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "source",
+            "columnName": "source",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "0"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "day",
+            "packageName"
+          ]
+        },
+        "indices": [],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "reports",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`type` TEXT NOT NULL, `periodKey` TEXT NOT NULL, `generatedTs` INTEGER NOT NULL, `text` TEXT NOT NULL, `finalized` INTEGER NOT NULL DEFAULT 1, `dataRevision` INTEGER NOT NULL DEFAULT 0, `formatVersion` INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(`type`, `periodKey`))",
+        "fields": [
+          {
+            "fieldPath": "type",
+            "columnName": "type",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "periodKey",
+            "columnName": "periodKey",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "generatedTs",
+            "columnName": "generatedTs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "text",
+            "columnName": "text",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "finalized",
+            "columnName": "finalized",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "1"
+          },
+          {
+            "fieldPath": "dataRevision",
+            "columnName": "dataRevision",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "0"
+          },
+          {
+            "fieldPath": "formatVersion",
+            "columnName": "formatVersion",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "1"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "type",
+            "periodKey"
+          ]
+        },
+        "indices": [],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "uid_packages",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`uidKey` TEXT NOT NULL, `packageName` TEXT NOT NULL, `firstSeenTs` INTEGER NOT NULL, `lastSeenTs` INTEGER NOT NULL, PRIMARY KEY(`uidKey`, `packageName`))",
+        "fields": [
+          {
+            "fieldPath": "uidKey",
+            "columnName": "uidKey",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "packageName",
+            "columnName": "packageName",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "firstSeenTs",
+            "columnName": "firstSeenTs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastSeenTs",
+            "columnName": "lastSeenTs",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "uidKey",
+            "packageName"
+          ]
+        },
+        "indices": [],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "capture_log",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `ts` INTEGER NOT NULL, `attemptTs` INTEGER NOT NULL, `commandStartTs` INTEGER NOT NULL, `commandEndTs` INTEGER NOT NULL, `zoneId` TEXT NOT NULL, `source` INTEGER NOT NULL, `parserVersion` INTEGER NOT NULL, `ledgerVersion` INTEGER NOT NULL, `outcome` TEXT NOT NULL, `epochWindowStartTs` INTEGER, `uidCount` INTEGER NOT NULL, `globalCount` INTEGER NOT NULL, `computedDrainMah` REAL NOT NULL, `actualDrainLowMah` REAL, `actualDrainHighMah` REAL, `sumUidTotalMah` REAL NOT NULL, `detail` TEXT NOT NULL)",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "ts",
+            "columnName": "ts",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "attemptTs",
+            "columnName": "attemptTs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "commandStartTs",
+            "columnName": "commandStartTs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "commandEndTs",
+            "columnName": "commandEndTs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "zoneId",
+            "columnName": "zoneId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "source",
+            "columnName": "source",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "parserVersion",
+            "columnName": "parserVersion",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "ledgerVersion",
+            "columnName": "ledgerVersion",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "outcome",
+            "columnName": "outcome",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "epochWindowStartTs",
+            "columnName": "epochWindowStartTs",
+            "affinity": "INTEGER",
+            "notNull": false
+          },
+          {
+            "fieldPath": "uidCount",
+            "columnName": "uidCount",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "globalCount",
+            "columnName": "globalCount",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "computedDrainMah",
+            "columnName": "computedDrainMah",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "actualDrainLowMah",
+            "columnName": "actualDrainLowMah",
+            "affinity": "REAL",
+            "notNull": false
+          },
+          {
+            "fieldPath": "actualDrainHighMah",
+            "columnName": "actualDrainHighMah",
+            "affinity": "REAL",
+            "notNull": false
+          },
+          {
+            "fieldPath": "sumUidTotalMah",
+            "columnName": "sumUidTotalMah",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "detail",
+            "columnName": "detail",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_capture_log_ts",
+            "unique": false,
+            "columnNames": [
+              "ts"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_capture_log_ts` ON `${TABLE_NAME}` (`ts`)"
+          }
+        ],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "usage_coverage",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`day` INTEGER NOT NULL, `fromTs` INTEGER NOT NULL, `toTs` INTEGER NOT NULL, `status` INTEGER NOT NULL, `updatedTs` INTEGER NOT NULL, `source` TEXT NOT NULL, PRIMARY KEY(`day`))",
+        "fields": [
+          {
+            "fieldPath": "day",
+            "columnName": "day",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "fromTs",
+            "columnName": "fromTs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "toTs",
+            "columnName": "toTs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "status",
+            "columnName": "status",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "updatedTs",
+            "columnName": "updatedTs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "source",
+            "columnName": "source",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "day"
+          ]
+        },
+        "indices": [],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "collection_gaps",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`kind` TEXT NOT NULL, `fromTs` INTEGER NOT NULL, `toTs` INTEGER NOT NULL, `detectedTs` INTEGER NOT NULL, PRIMARY KEY(`kind`, `fromTs`, `toTs`))",
+        "fields": [
+          {
+            "fieldPath": "kind",
+            "columnName": "kind",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "fromTs",
+            "columnName": "fromTs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "toTs",
+            "columnName": "toTs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "detectedTs",
+            "columnName": "detectedTs",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "kind",
+            "fromTs",
+            "toTs"
+          ]
+        },
+        "indices": [],
+        "foreignKeys": []
+      }
+    ],
+    "views": [],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'b371e2b1f238e5320f80555809ff9330')"
+    ]
+  }
+}

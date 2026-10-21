@@ -40,7 +40,9 @@ class RootCommandRunner : PrivilegedCommandRunner {
     }
 
     override suspend fun exec(cmd: String): CommandResult {
-        val r = Shell.cmd(cmd).exec()
+        // libsu reuses a persistent shell. A script's `exit`, exported locale or
+        // helper functions must not terminate/pollute later observations.
+        val r = Shell.cmd("(\n$cmd\n)").exec()
         return CommandResult(stdout = r.out, stderr = r.err, exitCode = r.code)
     }
 }

@@ -223,3 +223,24 @@ data class CaptureLogEntity(
     /** 失败原因 / 异常明细（人类可读） */
     val detail: String,
 )
+
+/** 已验证的自然日事件覆盖。没有行代表未知，不能把没有会话解释为零使用。 */
+@Entity(tableName = "usage_coverage")
+data class UsageCoverageEntity(
+    @PrimaryKey val day: Long,
+    val fromTs: Long,
+    val toTs: Long,
+    /** 1=已验证的部分覆盖；2=自然日（今天为截至观测时刻）连续覆盖 */
+    val status: Int,
+    val updatedTs: Long,
+    val source: String,
+)
+
+/** 持久化每一段已知缺口；新一次成功不能抹掉旧缺口。 */
+@Entity(tableName = "collection_gaps", primaryKeys = ["kind", "fromTs", "toTs"])
+data class CollectionGapEntity(
+    val kind: String,
+    val fromTs: Long,
+    val toTs: Long,
+    val detectedTs: Long,
+)

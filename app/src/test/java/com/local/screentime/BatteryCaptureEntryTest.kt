@@ -6,6 +6,7 @@ import androidx.test.core.app.ApplicationProvider
 import com.local.screentime.data.AppDatabase
 import com.local.screentime.data.BatteryCaptureOutcome
 import com.local.screentime.data.BatteryLedger
+import com.local.screentime.data.CoverageGap
 import com.local.screentime.data.UsageRepository
 import com.local.screentime.privileged.CommandResult
 import com.local.screentime.privileged.PrivilegedCommandRunner
@@ -89,7 +90,7 @@ class BatteryCaptureEntryTest {
             .build()
         // 旧 epoch 状态：142 UID 健康基线（真机 2026-10-02 形态）
         runner = FakeRunner(dump(window1, (0 until 142).map { 1.0 }))
-        repo = UsageRepository(context, runner, db)
+        repo = UsageRepository(context, runner, db, useRootCollector = false)
         val dao = db.usageDao()
         dao.putState(com.local.screentime.data.SyncStateEntity(UsageRepository.KEY_PARSER_BASELINE_UIDS, 142))
         dao.putState(com.local.screentime.data.SyncStateEntity(UsageRepository.KEY_PARSER_HAD_WINDOW, 1))
@@ -226,37 +227,63 @@ class BatteryCaptureEntryTest {
         assertTrue(capture(ts(2026, 10, 2, 18, 6)) is BatteryCaptureOutcome.Success)
         assertEquals(ts(2026, 10, 1, 19, 0), dao().getState(UsageRepository.KEY_BATTERY_LOST_TAIL_FROM))
         assertEquals(window2, dao().getState(UsageRepository.KEY_BATTERY_LOST_TAIL_TO))
+        val persistentGap = dao().collectionGaps("battery").single()
+        assertEquals(ts(2026, 10, 1, 19, 0), persistentGap.fromTs)
+        assertEquals(window2, persistentGap.toTs)
         // 同 epoch 后续成功不清掉尾段记录（它描述的是最近一次 RESET 的损失范围）
         runner.batteryLines = dump(window2, (0 until 20).map { 2.0 })
         assertTrue(capture(ts(2026, 10, 2, 18, 21)) is BatteryCaptureOutcome.Success)
         assertEquals(window2, dao().getState(UsageRepository.KEY_BATTERY_LOST_TAIL_TO))
+        assertEquals("新成功不抹掉持久化历史缺口", listOf(persistentGap), dao().collectionGaps("battery"))
     }
 
     @Test
     fun dataHealthLine_variousStates() {
-        // C：首页状态行纯函数
-        val zone = ZoneId.systemDefault()
+        // 时长、耗电、后台心跳各自计时，不能用最新的一项掩盖另一项中断。
         val now = ts(2026, 10, 2, 15, 0)
         val healthy = UsageRepository.DataHealthSummary(
             lastUsageSuccessTs = ts(2026, 10, 2, 9, 16), lastUsageFailTs = null,
-            lastBatterySuccessTs = ts(2026, 10, 2, 10, 23), lastBatteryFailTs = null,
+            lastBatterySuccessTs = ts(2026, 10, 2, 14, 35), lastBatteryFailTs = null,
             maxCaptureGapMs = null, lastUsageSource = "ROOT", lastBatterySource = "ROOT",
             lostTailFromTs = null, lostTailToTs = null,
+            collectorHeartbeatTs = now,
         )
         val line = UsageRepository.dataHealthLine(healthy, now, zone)
-        assertTrue(line.contains("数据更新至 10-2 10:23"))
-        assertTrue(line.contains("耗电采集"))
-        assertTrue("新鲜状态不提示中断", !line.contains("中断"))
+        assertTrue(line.contains("时长最后成功：10-02 09:16"))
+        assertTrue(line.contains("耗电最后观测：10-02 14:35"))
+        assertTrue(line.contains("后台采集心跳："))
+        assertTrue("三条线均新鲜时不提示超时", !line.contains("已超时"))
 
-        val staleLine = UsageRepository.dataHealthLine(healthy, now + 13 * 3600_000L, zone)
-        assertTrue("超 12h 无成功观测必须提示", staleLine.contains("采集可能已中断"))
+        val staleBattery = UsageRepository.dataHealthLine(
+            healthy.copy(lastUsageSuccessTs = now, lastBatterySuccessTs = now - 46 * 60_000L), now, zone,
+        )
+        assertTrue("最近时长成功不能盖住耗电超时", staleBattery.lineSequence().first { it.startsWith("耗电最后观测") }.contains("已超时"))
+        assertTrue(staleBattery.lineSequence().first { it.startsWith("时长最后成功") }.contains("刚刚"))
+        val later = now + 13 * 3600_000L
+        val staleUsage = UsageRepository.dataHealthLine(
+            healthy.copy(lastBatterySuccessTs = later, collectorHeartbeatTs = later), later, zone,
+        )
+        assertTrue("最近耗电成功不能盖住时长超时", staleUsage.lineSequence().first { it.startsWith("时长最后成功") }.contains("已超时"))
+        assertTrue(!staleUsage.lineSequence().first { it.startsWith("耗电最后观测") }.contains("已超时"))
 
         val noData = healthy.copy(lastUsageSuccessTs = null, lastBatterySuccessTs = null)
-        assertTrue(UsageRepository.dataHealthLine(noData, now, zone).contains("尚无采集记录"))
+        val noDataLine = UsageRepository.dataHealthLine(noData, now, zone)
+        assertTrue(noDataLine.contains("时长最后成功：尚未记录"))
+        assertTrue(noDataLine.contains("耗电最后观测：尚未记录"))
 
         val gappy = healthy.copy(maxCaptureGapMs = 4 * 3600_000L)
         assertTrue("实际观测最大间隔超 1h 才显示", UsageRepository.dataHealthLine(gappy, now, zone).contains("采样最大间隔"))
         val tiny = healthy.copy(maxCaptureGapMs = 15 * 60_000L)
         assertTrue("名义间隔不显示", !UsageRepository.dataHealthLine(tiny, now, zone).contains("采样最大间隔"))
+
+        val historical = healthy.copy(
+            usageGaps = listOf(CoverageGap(ts(2026, 10, 1, 9, 0), ts(2026, 10, 1, 18, 0))),
+            batteryGaps = listOf(CoverageGap(ts(2026, 10, 1, 19, 0), ts(2026, 10, 2, 8, 0))),
+            collectorError = "root采集器未启动",
+        )
+        val historicalLine = UsageRepository.dataHealthLine(historical, now, zone)
+        assertTrue("最近观测不能抹掉历史时长缺口", historicalLine.contains("历史时长缺口：10-01 09:00 ～ 10-01 18:00"))
+        assertTrue("最近观测不能抹掉历史耗电丢失", historicalLine.contains("历史耗电丢失：10-01 19:00 ～ 10-02 08:00"))
+        assertTrue(historicalLine.contains("后台采集降级：root采集器未启动"))
     }
 }

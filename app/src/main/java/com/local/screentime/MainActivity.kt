@@ -49,6 +49,7 @@ import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -379,6 +380,13 @@ fun UsageApp(
     var detailFor by remember { mutableStateOf<UiRowInfo?>(null) }
     var showNotifs by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
+    var independentCollectionEnabled by remember { mutableStateOf(true) }
+    var changingCollection by remember { mutableStateOf(false) }
+    LaunchedEffect(showSettings) {
+        if (showSettings) independentCollectionEnabled = withContext(Dispatchers.IO) {
+            repo.independentCollectionEnabled()
+        }
+    }
     var menuOpen by remember { mutableStateOf(false) }
     // 初值直接查 AppOps：此前固定 false，首帧会闪一下“缺少权限”文案
     var hasPermission by remember { mutableStateOf(repo.hasPermission()) }
@@ -423,7 +431,7 @@ fun UsageApp(
                     dayStats = repo.dayStats(targetDay),
                     unlockTop = repo.unlockTop(targetDay, 100),
                     reports = repo.latestReports(),
-                    health = runCatching { repo.dataHealthSummary() }.getOrNull(),
+                    health = runCatching { repo.dataHealthSummary(targetDay) }.getOrNull(),
                 )
             }
             if (selectedDay.toEpochDay() == targetDay) {
@@ -454,8 +462,9 @@ fun UsageApp(
                     is SyncResult.Ok ->
                         "上次同步 " + LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm")) +
                             " · " + result.sessionCount + " 段会话" +
-                            (if (result.rootUsed) " · root 全量" else "") +
-                            (if (!result.batteryOk) " · 耗电未更新" else "")
+                            (if (!result.usageObserved) " · 时长无有效观测" else "") +
+                            (if (!result.batteryOk) " · 耗电未更新" else "") +
+                            (if (result.retryableFailure) " · 部分采集失败，待重试" else "")
                     SyncResult.NoPermission -> "缺少“使用情况访问”权限"
                 }
                 loadDayAsync()
@@ -726,7 +735,29 @@ fun UsageApp(
             },
             title = { Text("设置") },
             text = {
-                Column {
+                Column(Modifier.verticalScroll(rememberScrollState())) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("独立后台采集", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                            Text("关闭后停止留存耗电快照与使用历史", fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Switch(checked = independentCollectionEnabled, enabled = !changingCollection,
+                            onCheckedChange = { enabled ->
+                                scope.launch {
+                                    changingCollection = true
+                                    try {
+                                        val applied = withContext(Dispatchers.IO) {
+                                            repo.setIndependentCollectionEnabled(enabled)
+                                        }
+                                        if (applied) independentCollectionEnabled = enabled
+                                        else Toast.makeText(context, "未能更改采集状态，请检查 Root 授权", Toast.LENGTH_LONG).show()
+                                        loadDayAsync()
+                                    } finally { changingCollection = false }
+                                }
+                            })
+                    }
+                    Spacer(Modifier.height(12.dp))
                     Text("外观", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Spacer(Modifier.height(6.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {

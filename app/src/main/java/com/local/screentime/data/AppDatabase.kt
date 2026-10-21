@@ -21,8 +21,10 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         ReportEntity::class,
         UidPackageEntity::class,
         CaptureLogEntity::class,
+        UsageCoverageEntity::class,
+        CollectionGapEntity::class,
     ],
-    version = 9,
+    version = 10,
     // 导出 schema：今后每次升版本都有历史 schema 可依据，能写真正的增量迁移；
     // 配合下面的注释，destructive fallback 只保留给 4 之前的存量老库
     exportSchema = true,
@@ -108,6 +110,15 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_9_10 = object : Migration(9, 10) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("CREATE TABLE IF NOT EXISTS `usage_coverage` (`day` INTEGER NOT NULL, `fromTs` INTEGER NOT NULL, `toTs` INTEGER NOT NULL, `status` INTEGER NOT NULL, `updatedTs` INTEGER NOT NULL, `source` TEXT NOT NULL, PRIMARY KEY(`day`))")
+                db.execSQL("CREATE TABLE IF NOT EXISTS `collection_gaps` (`kind` TEXT NOT NULL, `fromTs` INTEGER NOT NULL, `toTs` INTEGER NOT NULL, `detectedTs` INTEGER NOT NULL, PRIMARY KEY(`kind`, `fromTs`, `toTs`))")
+                // 保留升级前已确认的耗电丢失尾段，不能由升级后的成功采样清掉。
+                db.execSQL("INSERT OR IGNORE INTO collection_gaps SELECT 'battery', a.value, b.value, b.value FROM sync_state a, sync_state b WHERE a.`key`='battery_lost_tail_from_ts' AND b.`key`='battery_lost_tail_to_ts' AND b.value>a.value")
+            }
+        }
+
         fun get(context: Context): AppDatabase =
             instance ?: synchronized(this) {
                 instance ?: Room.databaseBuilder(
@@ -115,7 +126,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "screentime.db",
                 )
-                    .addMigrations(MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9)
+                    .addMigrations(MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10)
                     // v0.17.0（P0-5）：移除全局 fallbackToDestructiveMigration——
                     // 对长期历史记录应用，缺迁移就该显式失败，而不是静默清库。
                     // 仅 v1-3 例外：它们是早期开发版本、schema 未归档（schemas/ 只有 4.json 起，

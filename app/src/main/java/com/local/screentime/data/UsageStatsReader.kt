@@ -6,7 +6,7 @@ import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.os.Process
 
-data class RawEvent(val ts: Long, val eventType: Int, val packageName: String)
+data class RawEvent(val ts: Long, val eventType: Int, val packageName: String, val userId: Int = 0)
 
 class UsageStatsReader(private val context: Context) {
 
